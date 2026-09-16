@@ -1,12 +1,22 @@
-"""O que o leitor pode baixar pela rede, e nada alem disso.
+"""O que sai na rede sem ninguem perguntar quem esta pedindo.
 
-O servidor escuta em 0.0.0.0 para o celular alcancar, e a raiz do projeto guarda
-o .env com a chave da Anthropic. Servir a raiz inteira publica essa chave para
-qualquer um no mesmo Wi-Fi, e a listagem de diretorio da raiz denuncia o arquivo
-antes mesmo de alguem adivinhar o nome.
+Duas pastas, e as duas sao publicas por natureza: `reader/`, que e a PWA, e
+`public/`, que e a vitrine que o dono escolheu publicar. Para elas, uma lista de
+pastas permitidas e a ferramenta certa, porque a resposta para "quem pode ver
+isto?" e de fato "qualquer um".
 
-Sem dependencia fora da stdlib de proposito: o `scripts/serve.py` roda no python
-do Windows, que nao enxerga o venv do projeto.
+`library/` e `output/` ja estiveram nesta lista e sairam quando o servidor passou
+a ter contas. A pergunta deixou de ser "esta pasta pode sair na rede" e virou
+"esta pasta pode sair para VOCE", e lista de pasta nao sabe responder isso. Quem
+responde sao as rotas `/u/` do `panel.py`, que conferem a sessao antes de mandar
+um byte.
+
+Poe-se uma tela de login na frente disto e nada fica protegido: a senha e pedida
+na tela e os arquivos continuam saindo por URL direta. Era esse o centro de
+gravidade do problema todo.
+
+Sem dependencia fora da stdlib de proposito: este modulo e o unico que o servidor
+de arquivos precisa, e um import pesado aqui derrubaria quem so quer servir a PWA.
 """
 
 from __future__ import annotations
@@ -16,8 +26,8 @@ from http import HTTPStatus
 from pathlib import Path
 from urllib.parse import unquote
 
-SERVABLE_ROOTS = ("reader", "output", "library")
-"""A PWA, os JSONs e as imagens das paginas - tudo que o leitor busca."""
+SERVABLE_ROOTS = ("reader", "public")
+"""A PWA e a vitrine. Nada mais sai por caminho."""
 
 
 def _segments(request_path: str) -> list[str]:
@@ -32,7 +42,7 @@ def _segments(request_path: str) -> list[str]:
 
 
 def is_servable(request_path: str) -> bool:
-    """Se os bytes desse caminho podem sair na rede.
+    """Se os bytes desse caminho podem sair na rede para qualquer um.
 
     A raiz responde False por nao ter nada para servir: ela lista o .env. Quem
     chama redireciona para /reader/ antes de perguntar.
@@ -90,12 +100,3 @@ def serve_handler(handler: type[http.server.BaseHTTPRequestHandler], port: int) 
     """Bloqueia servindo com `handler` na porta, ate KeyboardInterrupt."""
     with _Server(("0.0.0.0", port), handler) as httpd:
         httpd.serve_forever()
-
-
-def serve_reader(root: Path, port: int) -> None:
-    """Bloqueia servindo `root` na porta, ate KeyboardInterrupt.
-
-    Somente leitura: e o que o `scripts/serve.py` sobe no python do Windows, sem
-    venv. O painel entra por outro caminho, em `panel.py`.
-    """
-    serve_handler(make_handler(root), port)

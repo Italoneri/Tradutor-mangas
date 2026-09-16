@@ -22,6 +22,12 @@ class Frozen(BaseModel):
 class PathsConfig(Frozen):
     library: str = "library"
     output: str = "output"
+    data: str = "data"
+    """Banco, areas dos usuarios e tudo que so o servidor escreve.
+
+    Separado de `library`/`output` porque e o unico diretorio que precisa de
+    backup depois que o acervo se muda para dentro dele - e o unico que um
+    contêiner precisa montar como volume."""
 
 
 class TranslationConfig(Frozen):
@@ -117,13 +123,31 @@ class Config(Frozen):
     slicing: SlicingConfig = SlicingConfig()
     reading_order: ReadingOrderConfig = ReadingOrderConfig()
 
+    content_root: Path | None = None
+    """Onde `library/` e `output/` moram, quando nao e na raiz do projeto.
+
+    E a unica coisa que separa a area de um usuario da de outro, e o resto do
+    pipeline nao sabe que ela existe: continua recebendo um `Config` e lendo
+    `library_dir`. Quem deriva o `Config` por usuario e `accounts.config_for_user`.
+
+    None significa "a raiz do projeto", que e o modo local de sempre - o
+    `mangatl process` na sua maquina nao precisa de conta nenhuma."""
+
+    @property
+    def data_dir(self) -> Path:
+        """Sempre relativo a raiz do projeto, nunca a area de um usuario.
+
+        O banco e as areas de todos moram aqui; derivar isto por usuario daria a
+        cada um o proprio banco."""
+        return self.root / self.paths.data
+
     @property
     def library_dir(self) -> Path:
-        return self.root / self.paths.library
+        return (self.content_root or self.root) / self.paths.library
 
     @property
     def output_dir(self) -> Path:
-        return self.root / self.paths.output
+        return (self.content_root or self.root) / self.paths.output
 
     def pricing_for(self, model: str) -> ModelPricing | None:
         return self.pricing.get(model)

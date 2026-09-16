@@ -18,7 +18,6 @@ from .panel import (
     next_chapter_name,
     safe_archive_entries,
     image_suffix,
-    is_local_client,
     json_body,
     make_panel_handler,
     match_route,
@@ -29,23 +28,6 @@ from .panel import (
     validate_glossary,
 )
 from .serving import _Server
-
-
-@pytest.mark.parametrize(
-    ("name", "address", "expected"),
-    [
-        ("loopback ipv4", "127.0.0.1", True),
-        ("loopback ipv6", "::1", True),
-        ("loopback ipv4 mapeado em ipv6", "::ffff:127.0.0.1", True),
-        ("vizinho de wi-fi", "192.168.0.10", False),
-        ("outra faixa privada", "10.0.0.5", False),
-        ("endereco publico", "8.8.8.8", False),
-        ("sem endereco", "", False),
-        ("nome que so parece loopback", "127.0.0.1.evil.com", False),
-    ],
-)
-def test_lets_in_only_the_machine_that_runs_the_server(name: str, address: str, expected: bool):
-    assert is_local_client(address) is expected, name
 
 
 @pytest.mark.parametrize(

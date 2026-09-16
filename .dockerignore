@@ -1,0 +1,20 @@
+# A chave da Anthropic nunca entra numa camada da imagem. Ela chega por variavel
+# de ambiente, em tempo de execucao, e o `docker history` precisa continuar limpo.
+.env
+.env.*
+!.env.example
+
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.impeccable
+
+# Montados por volume, nao copiados: sao o acervo, e um deles pesa GB.
+data
+library
+output
+fixtures
+
+PLANO-*.md

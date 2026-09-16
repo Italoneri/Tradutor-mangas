@@ -12,9 +12,13 @@
    Rede primeiro custa uma revalidacao de ~50KB por abertura e, offline, cai no
    cache exatamente como antes - o ganho de ler sem rede esta nas imagens, que
    sao o volume.
+
+   Uma terceira regra entrou quando o leitor passou a ser hospedado: nada sob
+   `/u/` ou `/api/` passa por aqui. Aquilo e conteudo de uma conta, o cache e da
+   origem, e guardar um sai servindo para o outro.
 */
 
-const VERSION = "mangatl-v4";
+const VERSION = "mangatl-v5";
 const SHELL = ["./", "./index.html", "./app.js", "./overlay.js", "./style.css", "./manifest.webmanifest", "./icon.svg"];
 /* `admin.html` e `admin.js` ficam de fora: o painel so funciona com o servidor de
    pe, e guarda-lo offline criaria uma tela que abre e nao faz nada. */
@@ -37,11 +41,37 @@ self.addEventListener("activate", (event) => {
   );
 });
 
+/* Conteudo que so existe depois de uma sessao ser conferida.
+ *
+ * Nada disto entra em cache, e nem passa pelo service worker. Cache e por
+ * origem, nao por conta: duas pessoas no mesmo navegador dividem o mesmo
+ * armazenamento, e uma pagina guardada na sessao de uma sairia servida na da
+ * outra. Isso custa o modo offline do leitor hospedado, e e o preco do
+ * isolamento - o leitor local, que serve `library/` por caminho, mantem o cache.
+ */
+function isPrivate(url) {
+  return url.pathname.startsWith("/u/") || url.pathname.startsWith("/api/");
+}
+
 function isImmutable(url) {
   // Trocar a arte de uma pagina sem trocar o nome do arquivo e o unico jeito de
   // furar isto; nesse caso subir o VERSION acima e a saida.
   return /\.(jpe?g|png|webp|bmp)$/i.test(url.pathname);
 }
+
+/* Apaga tudo. Chamado pelo leitor no logout e na primeira carga em que o id da
+   sessao muda - trocar de conta no mesmo navegador nao pode servir pagina da
+   conta anterior. */
+async function purge() {
+  const names = await caches.keys();
+  await Promise.all(names.map((name) => caches.delete(name)));
+}
+
+self.addEventListener("message", (event) => {
+  if (event.data && event.data.type === "purge") {
+    event.waitUntil(purge());
+  }
+});
 
 async function cacheFirst(request) {
   const cached = await caches.match(request);
@@ -80,9 +110,7 @@ self.addEventListener("fetch", (event) => {
 
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
-  // O painel nunca passa pelo cache: `/api/` e estado vivo, e progresso cacheado
-  // e barra que nao anda.
-  if (url.pathname.startsWith("/api/")) return;
+  if (isPrivate(url)) return;
 
   event.respondWith(isImmutable(url) ? cacheFirst(request) : networkFirst(request));
 });
