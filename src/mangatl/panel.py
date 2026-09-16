@@ -1,18 +1,25 @@
-"""Painel: o que so a propria maquina pode fazer com a biblioteca.
+"""Painel e conteudo do usuario: quem esta pedindo decide o que sai.
 
-O leitor escuta em 0.0.0.0 porque o celular precisa alcanca-lo. O painel escreve
-em disco e dispara o pipeline, entao toda rota sob `/api/` responde 403 para quem
-nao vem de 127.0.0.1.
+A regra antiga era o endereco de origem - `/api/` so respondia para 127.0.0.1.
+Ela era autenticacao disfarcada e morreu ao ser hospedada: atras de um proxy
+reverso todo cliente chega com o IP do proxy, e a regra ou tranca todo mundo para
+fora ou deixa todo mundo entrar como dono. No lugar dela ha papel de usuario, e
+IP so vale para contar tentativa de senha.
 
-Isso nao e autenticacao e nao finge ser: quem tem shell nesta maquina ja tinha
-tudo. O que a checagem impede e o vizinho de Wi-Fi - estar na mesma LAN nao e
-credencial nenhuma, e o disco que este modulo escreve e o mesmo que guarda o .env.
+Tres niveis de acesso, declarados rota a rota em vez de deduzidos do caminho:
+
+    publico   vitrine e login, respondem sem sessao
+    sessao    o proprio acervo: o id do usuario vem do cookie, nunca da URL
+    dono      o que destroi ou custa dinheiro: apagar, editar serie, glossario
+
+As rotas `/u/` sao o outro lado do mesmo assunto: `library/` e `output/` deixaram
+de ser servidos por caminho, porque uma lista de pastas permitidas responde "esta
+pasta pode sair na rede" e a pergunta virou "esta pasta pode sair para VOCE".
 
 Este modulo depende do venv inteiro: pydantic, o store, o pipeline. O
-`scripts/serve.py` roda no python do Windows, que nao tem venv, e importa so o
-`serving.py`. Manter essa fronteira e o que impede um import pesado de derrubar o
-servidor que o celular usa - e o Smart App Control do Windows e justamente o
-motivo de aquele processo existir.
+`serving.py` continua sendo stdlib pura porque o `scripts/serve.py` roda no python
+do Windows, sem venv. Manter essa fronteira e o que impede um import pesado de
+derrubar o servidor que o celular usa.
 
 Ponto de extensao anotado e nao implementado: baixar capitulo de URL pediria uma
 `import_from_url(url) -> list[Path]`. Qualquer site serio precisa de navegador
@@ -23,27 +30,53 @@ from __future__ import annotations
 
 import io
 import json
+import mimetypes
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import zipfile
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from pathlib import Path, PurePosixPath
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 from urllib.parse import unquote
 
+from .accounts import User, area_config, create_user, find_owner, password_hash_of
 from .config import Config
+from .db import connect
 from .engines.base import available_engines
 from .jobs import Busy, JobRegistry
 from .models import SeriesMeta
 from .serving import ReaderHandler, serve_handler
+from .sessions import (
+    REQUESTED_WITH,
+    Session,
+    TESTER_SESSION_HOURS,
+    clear_login_attempts,
+    clearing_cookie_header,
+    cookie_header,
+    csrf_is_valid,
+    hours_for,
+    issue,
+    login_is_throttled,
+    record_login_attempt,
+    resolve,
+    revoke,
+    token_from_cookies,
+    verify_password,
+)
 from .store import (
     COVER_STEM,
     IMAGE_SUFFIXES,
     INCOMING_SUFFIX,
+    LIBRARY_FILENAME,
     _natural_key,
+    build_library,
+    chapter_filename,
+    chapter_output_dir,
     discover_series,
     list_page_images,
     load_glossary,
@@ -53,8 +86,21 @@ from .store import (
 )
 
 API_PREFIX = "/api/"
+USER_PREFIX = "/u/"
+"""Onde o conteudo do usuario e servido, depois de autorizado.
 
-LOCAL_CLIENTS = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
+Nenhuma rota daqui recebe id de usuario. Ele vem da sessao, e so de la: um id na
+URL e convite para trocar o numero e ler o acervo do vizinho."""
+
+INTERNAL_REDIRECT_ENV = "INTERNAL_REDIRECT_PREFIX"
+"""Prefixo interno que o proxy serve e que nao e alcancavel de fora.
+
+Definido, o handler autoriza e devolve `X-Accel-Redirect` com o caminho; o proxy
+le do disco e transmite, e o worker Python volta a atender na hora. Um capitulo
+sao 155 JPEGs - com quatro leitores baixando, cada imagem segurando um worker
+durante o download derruba o servidor.
+
+Ausente, o Python transmite em pedacos. Funciona, e e divida anotada."""
 
 MAX_COMPONENT_CHARS = 120
 """Nome de pasta mais longo que isso e engano ou ataque; o NTFS para em 255 e o
@@ -77,21 +123,35 @@ sinal de que veio coisa errada pelo cano."""
 MAX_GLOSSARY_ENTRIES = 500
 """Acima disso nao e glossario de serie, e despejo de dicionario."""
 
+# ---------- cota do testador ----------
+#
+# Todas juntas, num lugar so, cada uma com o numero justificado. Espalhar estes
+# valores pelas rotas e como nao te-los: ninguem consegue responder "o que um
+# testador pode fazer aqui?" sem ler o servidor inteiro.
+
+TESTER_MAX_PAGES_PER_CHAPTER = 12
+"""Doze paginas mostram a qualidade da traducao tao bem quanto 155 e custam 1/13
+do CPU. O capitulo medido aqui levou 216s para 155 fatias; doze levam ~17s."""
+
+TESTER_MAX_CHAPTERS = 2
+"""Dois bastam para comparar uma pagina facil com uma dificil. Mais que isso e
+acervo, e acervo e o que este servidor nao e."""
+
+TESTER_MAX_UPLOAD_BYTES = 40 * 1024 * 1024
+"""Doze paginas de manhwa em jpeg nao passam de alguns MB; 40MB cobre PNG sem
+perda e ainda e um teto que um disco pequeno aguenta vezes muitos testadores."""
+
+TESTER_ENGINES: tuple[str, ...] = ("free",)
+"""Sem `claude`: a chave da API e do dono, e a conta chega para ele.
+
+E a trava de custo mais importante deste projeto. Ela vale na interface, que nao
+oferece a opcao, e na API, que recusa - a interface sozinha e sugestao."""
+
 MAX_ARCHIVE_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
 """Teto do descompactado, conferido somando `ZipInfo.file_size` ANTES de extrair.
 
 Um zip de 1MB pode declarar 100GB. Somar o declarado nao e garantia contra zip que
 mente, entao o laco de extracao tambem conta os bytes realmente escritos."""
-
-
-def is_local_client(address: str) -> bool:
-    """Se o pedido veio da propria maquina.
-
-    O leitor escuta em 0.0.0.0 para o celular alcancar, e o painel escreve em disco
-    e dispara o pipeline. Um `192.168.x` que chegue aqui e alguem do mesmo Wi-Fi,
-    nao o dono - e a lista da LAN nao e credencial nenhuma.
-    """
-    return address in LOCAL_CLIENTS
 
 
 # ---------- nomes vindos da rede ----------
@@ -235,8 +295,28 @@ def image_suffix(data: bytes) -> str | None:
 
 # ---------- roteador ----------
 
+class Raw(NamedTuple):
+    """Resposta que e um arquivo, e nao JSON.
+
+    Existe porque as rotas de conteudo do usuario devolvem imagem: o handler
+    autoriza e diz qual arquivo sai, e quem transmite decide entre entregar pelo
+    proxy ou pelo Python. A rota nunca escreve no socket - assim ela continua
+    testavel sem subir servidor.
+    """
+
+    path: Path
+    content_type: str
+
+
 class Context(NamedTuple):
     """O que uma rota precisa alem do proprio pedido.
+
+    `cfg` ja vem apontado para a area de quem esta pedindo, e `base` e o projeto
+    inteiro - o banco mora la, e uma rota que confunde os dois grava o banco
+    dentro da pasta de um usuario.
+
+    `connection` e aberta por requisicao e fechada no fim dela: conexao do sqlite3
+    nao atravessa thread com seguranca, e o servidor e uma thread por conexao.
 
     O registro de jobs entra aqui e nao num modulo: ele guarda estado vivo, e
     estado vivo em variavel de modulo vaza entre servidores - inclusive entre dois
@@ -244,10 +324,30 @@ class Context(NamedTuple):
     """
 
     cfg: Config
+    base: Config
     jobs: JobRegistry
+    connection: sqlite3.Connection
+    session: Session | None
+    token: str | None = None
+    client_ip: str = ""
+    """So para contar tentativa de senha, nunca para autorizar.
+
+    Atras de um proxy reverso este valor e o IP do proxy, a menos que alguem
+    confie explicitamente no `X-Forwarded-For` - e confiar num cabecalho que o
+    cliente escreve e o mesmo que nao ter regra nenhuma."""
+
+    @property
+    def user(self) -> User | None:
+        return self.session.user if self.session else None
+
+    @property
+    def is_owner(self) -> bool:
+        return self.session is not None and self.session.is_owner
 
 
 Handler = Callable[[Context, tuple[str, ...], bytes], tuple[int, object]]
+
+Access = Literal["public", "session", "owner"]
 
 
 class Route(NamedTuple):
@@ -256,6 +356,21 @@ class Route(NamedTuple):
     handler: Handler
     max_body: int = MAX_JSON_BYTES
     """Teto do corpo, conferido pelo `Content-Length` antes de ler um byte."""
+
+    access: Access = "session"
+    """Quem pode chamar. O default e o lado seguro de errar: uma rota nova que
+    esqueca a marca exige sessao, em vez de responder para qualquer um.
+
+    `owner` esta nas que destroem ou custam dinheiro. `public` esta em login e em
+    health, que precisam responder antes de existir sessao."""
+
+    writes: bool = False
+    """Se a rota muda o disco.
+
+    Duas consequencias: ela exige CSRF, e ela e onde a sessao anonima nasce. A
+    sessao nao nasce em `GET` de proposito - a home e uma pagina publica que robo
+    de busca visita, e criar usuario a cada visita daria area em disco para cada
+    um deles."""
 
     body_required: bool = False
     """Se a rota recusa pedido sem `Content-Length` declarado.
@@ -286,13 +401,98 @@ class RouteMatch(NamedTuple):
 def _health(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
     return HTTPStatus.OK, {
         "ok": True,
-        "root": str(ctx.cfg.root),
         "engines": available_engines(),
         "detector": ctx.cfg.detect.backend,
         # Booleano, nunca o valor: a chave nao sai desta maquina por resposta nenhuma.
         "has_api_key": bool(os.environ.get("ANTHROPIC_API_KEY")),
         "python": sys.version.split()[0],
     }
+    # `root` saiu da resposta: e caminho absoluto do servidor, e uma rota publica
+    # nao tem por que contar a quem pergunta como o disco dela esta organizado.
+
+
+# ---------- sessao ----------
+
+
+class _Issued(NamedTuple):
+    """Resposta que vem com um cookie de sessao novo."""
+
+    payload: object
+    token: str
+    hours: int
+
+
+class _Cleared(NamedTuple):
+    """Resposta que apaga o cookie de sessao."""
+
+    payload: object
+
+
+def _session_payload(session: Session | None) -> dict:
+    if session is None:
+        return {"authenticated": False, "kind": None, "engines": []}
+    return {
+        "authenticated": True,
+        "kind": session.user.kind,
+        "expires_at": session.expires_at,
+        # O testador nunca ve `claude` na lista: a chave da API e do dono, e a
+        # conta chega para ele. A interface esconde e a API recusa - as duas.
+        "engines": available_engines() if session.is_owner else list(TESTER_ENGINES),
+    }
+
+
+def _session(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Quem sou eu. Responde para quem nao tem sessao tambem, dizendo que nao tem."""
+    return HTTPStatus.OK, _session_payload(ctx.session)
+
+
+def _login(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Entra como dono. Unica rota que aceita senha, e a unica que pode ser varrida.
+
+    A resposta e a mesma para e-mail que nao existe e para senha errada. Distinguir
+    as duas entrega uma lista de quem tem conta aqui, de graca.
+    """
+    payload = json_body(body)
+    if not isinstance(payload, dict):
+        raise Invalid("esperava um objeto com email e password")
+
+    email = str(payload.get("email", "")).strip()
+    password = str(payload.get("password", ""))
+    if not email or not password:
+        raise Invalid("mande email e password")
+
+    subjects = (f"ip:{ctx.client_ip}", f"email:{email}")
+    if login_is_throttled(ctx.connection, subjects):
+        return HTTPStatus.TOO_MANY_REQUESTS, {
+            "error": "tentativas demais; espere alguns minutos"
+        }
+
+    owner = find_owner(ctx.connection, email)
+    stored = password_hash_of(ctx.connection, owner.id) if owner else None
+    if owner is None or not verify_password(password, stored):
+        record_login_attempt(ctx.connection, subjects[0])
+        record_login_attempt(ctx.connection, subjects[1])
+        return HTTPStatus.UNAUTHORIZED, {"error": "e-mail ou senha nao conferem"}
+
+    clear_login_attempts(ctx.connection, subjects)
+    hours = hours_for(owner.kind)
+    token, expires_at = issue(ctx.connection, owner.id, hours=hours)
+    return HTTPStatus.OK, _Issued(
+        payload={"authenticated": True, "kind": owner.kind, "expires_at": expires_at,
+                 "engines": available_engines()},
+        token=token,
+        hours=hours,
+    )
+
+
+def _logout(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Sai. Apaga a sessao do banco, e nao so o cookie do navegador.
+
+    Cookie apagado sem a linha correspondente deixa um token vivo que continua
+    valendo para quem o tiver copiado - sair tem que significar sair.
+    """
+    revoke(ctx.connection, ctx.token)
+    return HTTPStatus.OK, _Cleared({"authenticated": False, "kind": None, "engines": []})
 
 
 def _series(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
@@ -647,17 +847,143 @@ def _get_job(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, o
     return HTTPStatus.OK, job.snapshot()
 
 
+# ---------- conteudo do usuario ----------
+
+
+USER_PAGES_BASE = "u/pages"
+USER_CHAPTERS_BASE = "u/chapters"
+"""Os prefixos que o indice de `/u/library` devolve no lugar de `library/` e
+`output/`.
+
+O leitor monta `<base>/<serie>/<cap>/<arquivo>` e nao sabe de onde a base veio: a
+vitrine manda `public/demo`, o acervo manda estes dois, e a tela de leitura e a
+mesma. Um caminho de renderizacao proprio para a vitrine faria a vitrine deixar de
+demonstrar o produto."""
+
+
+def _inside(base: Path, *parts: str) -> Path | None:
+    """O caminho sob `base`, ou None se escapar dela.
+
+    Duas trancas, e as duas importam. `safe_component` recusa `..`, barra e
+    caractere de controle antes de qualquer `Path` existir. A resolucao confere
+    que o resultado continua sob a base - e o que pega symlink, juncao com
+    caminho absoluto e normalizacao do sistema de arquivos.
+    """
+    for part in parts:
+        if safe_component(part) is None:
+            return None
+    try:
+        root = base.resolve()
+        resolved = base.joinpath(*parts).resolve()
+    except (OSError, ValueError):
+        return None
+    return resolved if root in resolved.parents else None
+
+
+NOT_FOUND_BODY = {"error": "nao existe"}
+"""Uma resposta so para "nao existe" e "nao e seu".
+
+403 confirmaria que o arquivo existe, e a diferenca entre as duas respostas e um
+indice do acervo alheio para quem souber varrer nomes."""
+
+
+def _content_type(path: Path) -> str:
+    guessed, _ = mimetypes.guess_type(path.name)
+    return guessed or "application/octet-stream"
+
+
+def _user_page(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Uma imagem de pagina do acervo de quem esta pedindo."""
+    series, chapter, filename = groups
+    if safe_page_name(filename) is None:
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+
+    path = _inside(ctx.cfg.library_dir, series, chapter, filename)
+    if path is None or not path.is_file():
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+    return HTTPStatus.OK, Raw(path, _content_type(path))
+
+
+def _user_chapter(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """A traducao de um capitulo do acervo de quem esta pedindo.
+
+    O nome do arquivo entra inteiro na URL, e nao so o motor, para o leitor montar
+    o endereco com o mesmo codigo que usa na vitrine - onde o arquivo se chama
+    exatamente assim em disco.
+    """
+    series, chapter, engine = groups
+    if engine not in available_engines():
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+
+    path = _inside(ctx.cfg.output_dir, series, chapter, chapter_filename(engine))
+    if path is None or not path.is_file():
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+    return HTTPStatus.OK, Raw(path, "application/json; charset=utf-8")
+
+
+def _user_library(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """O indice do acervo de quem esta pedindo.
+
+    Montado na hora, e nao lido de `library.json`: aquele arquivo guarda caminhos
+    com o prefixo `library/`, que deixou de ser alcancavel por caminho. O indice
+    que sai daqui ja vem com as bases de `/u/`, e nenhuma delas leva id de usuario.
+    """
+    payload = build_library(ctx.cfg).model_dump(mode="json")
+    payload["library_base"] = USER_PAGES_BASE
+    payload["output_base"] = USER_CHAPTERS_BASE
+    for entry in payload["series"]:
+        entry["cover"] = _rebased_cover(entry["cover"], ctx.cfg)
+        for chapter in entry["chapters"]:
+            chapter["cover"] = _rebased_cover(chapter["cover"], ctx.cfg)
+    return HTTPStatus.OK, payload
+
+
+def _rebased_cover(cover: str | None, cfg: Config) -> str | None:
+    """A capa apontando para `/u/pages/`, e nao para `library/`.
+
+    `build_library` grava a capa com o prefixo do disco porque e assim que o leitor
+    local a busca. Deixa-la assim aqui daria uma estante de capas quebradas: o
+    unico caminho que responde na instancia hospedada e o autorizado.
+    """
+    if cover is None:
+        return None
+    prefix = f"{cfg.paths.library}/"
+    return f"{USER_PAGES_BASE}/{cover[len(prefix):]}" if cover.startswith(prefix) else None
+
+
 _SLUG = r"([^/]+)"
 
 ROUTES: tuple[Route, ...] = (
-    Route("GET", re.compile(r"^/api/health$"), _health),
+    # Publicas: precisam responder antes de existir sessao.
+    Route("GET", re.compile(r"^/api/health$"), _health, access="public"),
+    Route("GET", re.compile(r"^/api/session$"), _session, access="public"),
+    Route(
+        "POST",
+        re.compile(r"^/api/login$"),
+        _login,
+        access="public",
+        writes=True,
+        body_required=True,
+    ),
+    Route("POST", re.compile(r"^/api/logout$"), _logout, access="public", writes=True),
+    # O conteudo do usuario. Nenhuma recebe id: ele vem da sessao.
+    Route("GET", re.compile(r"^/u/library$"), _user_library),
+    Route("GET", re.compile(rf"^/u/pages/{_SLUG}/{_SLUG}/{_SLUG}$"), _user_page),
+    Route(
+        "GET",
+        re.compile(rf"^/u/chapters/{_SLUG}/{_SLUG}/chapter\.{_SLUG}\.json$"),
+        _user_chapter,
+    ),
+    # O painel do proprio acervo.
     Route("GET", re.compile(r"^/api/series$"), _series),
-    Route("POST", re.compile(r"^/api/series$"), _create_series, body_required=True),
+    Route("POST", re.compile(r"^/api/series$"), _create_series, writes=True, body_required=True),
     Route("GET", re.compile(rf"^/api/series/{_SLUG}/series\.json$"), _get_series_meta),
     Route(
         "PUT",
         re.compile(rf"^/api/series/{_SLUG}/series\.json$"),
         _put_series_meta,
+        access="owner",
+        writes=True,
         body_required=True,
     ),
     Route(
@@ -665,6 +991,8 @@ ROUTES: tuple[Route, ...] = (
         re.compile(rf"^/api/series/{_SLUG}/cover$"),
         _put_cover,
         MAX_PAGE_BYTES,
+        access="owner",
+        writes=True,
         body_required=True,
     ),
     Route("GET", re.compile(rf"^/api/series/{_SLUG}/glossary$"), _get_glossary),
@@ -672,18 +1000,17 @@ ROUTES: tuple[Route, ...] = (
         "PUT",
         re.compile(rf"^/api/series/{_SLUG}/glossary$"),
         _put_glossary,
+        access="owner",
+        writes=True,
         body_required=True,
     ),
-    Route(
-        "POST",
-        re.compile(rf"^/api/series/{_SLUG}/chapters$"),
-        _create_chapter,
-    ),
+    Route("POST", re.compile(rf"^/api/series/{_SLUG}/chapters$"), _create_chapter, writes=True),
     Route(
         "PUT",
         re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/files/{_SLUG}$"),
         _put_page,
         MAX_PAGE_BYTES,
+        writes=True,
         body_required=True,
     ),
     Route(
@@ -691,23 +1018,33 @@ ROUTES: tuple[Route, ...] = (
         re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/archive$"),
         _put_archive,
         MAX_ARCHIVE_BYTES,
+        writes=True,
         body_required=True,
     ),
     Route(
         "POST",
         re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/commit$"),
         _commit_chapter,
+        writes=True,
     ),
     Route("GET", re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/incoming$"), _get_incoming),
     Route("GET", re.compile(r"^/api/jobs$"), _list_jobs),
-    Route("POST", re.compile(r"^/api/jobs$"), _create_job, body_required=True),
+    Route("POST", re.compile(r"^/api/jobs$"), _create_job, writes=True, body_required=True),
     Route("GET", re.compile(rf"^/api/jobs/{_SLUG}$"), _get_job),
     Route(
         "DELETE",
         re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/incoming$"),
         _delete_incoming,
+        access="owner",
+        writes=True,
     ),
 )
+"""Toda rota diz quem pode chama-la e se ela escreve.
+
+As `owner` sao as que destroem ou mudam o que vale para o acervo inteiro: apagar
+a area de espera, reescrever `series.json`, trocar a capa e editar o glossario.
+Um testador nao precisa de nenhuma delas para ver a ferramenta funcionando, e dar
+qualquer uma seria dar a ele a chave do acervo do dono."""
 
 
 def request_path(target: str) -> str:
@@ -739,6 +1076,39 @@ def match_route(method: str, path: str) -> RouteMatch | None:
 # ---------- ligacao HTTP ----------
 
 
+def _open_tester_session(connection: sqlite3.Connection) -> tuple[Session, str]:
+    """Cria o testador anonimo e a sessao dele. Sem cadastro, sem e-mail, sem senha.
+
+    O prazo do usuario e o da sessao sao o mesmo numero de propostio: sessao que
+    sobrevive ao dono dela e uma linha apontando para nada, e usuario que
+    sobrevive a sessao e area em disco que ninguem alcanca mais.
+    """
+    expires_at = (datetime.now(UTC) + timedelta(hours=TESTER_SESSION_HOURS)).isoformat(
+        timespec="seconds"
+    )
+    user = create_user(connection, kind="tester", expires_at=expires_at)
+    token, session_expires = issue(connection, user.id, hours=TESTER_SESSION_HOURS)
+    return Session(user=user, expires_at=session_expires), token
+
+
+def _internal_redirect(cfg: Config, path: Path) -> str | None:
+    """O caminho interno que o proxy serve, ou None para transmitir daqui.
+
+    O prefixo mapeia a raiz do projeto dentro do proxy e NAO e alcancavel de fora -
+    se for, toda a autorizacao deste modulo passa a ser decorativa, porque o
+    caminho direto responde sem passar por aqui.
+    """
+    prefix = os.environ.get(INTERNAL_REDIRECT_ENV, "").strip()
+    if not prefix:
+        return None
+    try:
+        relative = path.resolve().relative_to(cfg.root.resolve())
+    except ValueError:
+        # Fora da raiz do projeto o proxy nao alcanca; transmitir daqui e o certo.
+        return None
+    return f"{prefix.rstrip('/')}/{relative.as_posix()}"
+
+
 def make_panel_handler(cfg: Config, jobs: JobRegistry | None = None) -> type[ReaderHandler]:
     """Handler que serve o leitor e, para a propria maquina, tambem o painel.
 
@@ -749,10 +1119,14 @@ def make_panel_handler(cfg: Config, jobs: JobRegistry | None = None) -> type[Rea
     pipeline de verdade. Em producao o default e o unico caminho.
     """
 
-    context = Context(cfg=cfg, jobs=jobs or JobRegistry())
+    registry = jobs or JobRegistry()
 
     class PanelHandler(ReaderHandler):
         def __init__(self, *args: object, **kwargs: object) -> None:
+            # A PWA e a vitrine saem da raiz do projeto. `library/` e `output/`
+            # deixaram de ser servidos por caminho, entao esta base so sobra para o
+            # leitor local - que continua sendo o uso principal desta ferramenta.
+            self.content_root = cfg.library_dir.parent
             super().__init__(*args, directory=str(cfg.root), **kwargs)
 
         def do_GET(self) -> None:  # noqa: N802 - assinatura herdada da stdlib
@@ -769,24 +1143,20 @@ def make_panel_handler(cfg: Config, jobs: JobRegistry | None = None) -> type[Rea
             self._serve_api("DELETE")
 
         def _serve_api(self, method: str) -> bool:
-            """Atende o pedido se ele for do painel; devolve False para o resto."""
+            """Atende o pedido se ele for nosso; devolve False para o resto.
+
+            A ordem das checagens e deliberada: rota, CSRF, sessao, papel, corpo.
+            CSRF antes da sessao porque um pedido forjado nao pode nem criar
+            sessao anonima; corpo por ultimo porque ler megabytes de quem vai
+            levar 401 e trabalho jogado fora.
+            """
             path = request_path(self.path)
-            if not path.startswith(API_PREFIX):
+            if not path.startswith((API_PREFIX, USER_PREFIX)):
                 # Metodo sem arquivo para servir nao tem para onde cair.
                 if method != "GET":
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "rota nao existe"})
                     return True
                 return False
-
-            # Antes de resolver a rota: quem nao e local nao descobre nem quais
-            # rotas existem.
-            client = self.client_address[0] if self.client_address else ""
-            if not is_local_client(client):
-                self._send_json(
-                    HTTPStatus.FORBIDDEN,
-                    {"error": "o painel responde so para a maquina onde o servidor roda"},
-                )
-                return True
 
             match = match_route(method, path)
             if match is None:
@@ -800,12 +1170,64 @@ def make_panel_handler(cfg: Config, jobs: JobRegistry | None = None) -> type[Rea
                 )
                 return True
 
-            body = self._read_body(match.route)
+            route = match.route
+            if route.writes and not csrf_is_valid(self._csrf_headers()):
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": f"pedido sem origem conferida; mande {REQUESTED_WITH}"},
+                )
+                return True
+
+            with connect(cfg) as connection:
+                return self._dispatch(method, path, route, match.groups, connection)
+
+        def _csrf_headers(self) -> dict[str, str | None]:
+            return {
+                name: self.headers.get(name)
+                for name in (REQUESTED_WITH, "Origin", "Referer", "Host")
+            }
+
+        def _dispatch(
+            self,
+            method: str,
+            path: str,
+            route: Route,
+            groups: tuple[str, ...],
+            connection: sqlite3.Connection,
+        ) -> bool:
+            token = token_from_cookies(self.headers.get("Cookie"))
+            session = resolve(connection, token)
+            issued: str | None = None
+
+            if session is None and route.writes and route.access != "public":
+                # A sessao anonima nasce aqui, na primeira escrita, e nao no
+                # primeiro `GET`: a home e publica e robo de busca a visita.
+                session, token = _open_tester_session(connection)
+                issued = token
+
+            if session is None and route.access != "public":
+                self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "entre para continuar"})
+                return True
+            if route.access == "owner" and (session is None or not session.is_owner):
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "so o dono faz isso"})
+                return True
+
+            body = self._read_body(route)
             if body is None:
                 return True
 
+            context = Context(
+                cfg=area_config(cfg, session.user) if session else cfg,
+                base=cfg,
+                jobs=registry,
+                connection=connection,
+                session=session,
+                token=token,
+                client_ip=self.client_address[0] if self.client_address else "",
+            )
+
             try:
-                status, payload = match.route.handler(context, match.groups, body)
+                status, payload = route.handler(context, groups, body)
             except Invalid as error:
                 self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(error)})
                 return True
@@ -814,8 +1236,66 @@ def make_panel_handler(cfg: Config, jobs: JobRegistry | None = None) -> type[Rea
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "falha no painel"})
                 return True
 
-            self._send_json(status, payload)
+            self._respond(status, payload, issued=issued, kind=session.user.kind if session else None)
             return True
+
+        def _respond(
+            self, status: int, payload: object, *, issued: str | None, kind: str | None
+        ) -> None:
+            """Manda o que a rota devolveu, e o cookie que ela provocou.
+
+            Tres formas de resposta e nao uma porque as tres tem naturezas
+            diferentes: JSON, um arquivo que o proxy entrega, e a troca de sessao.
+            Deixar a rota escrever no socket para cobrir os tres a tornaria
+            impossivel de testar sem subir servidor.
+            """
+            headers: dict[str, str] = {}
+            if isinstance(payload, _Issued):
+                headers["Set-Cookie"] = cookie_header(payload.token, hours=payload.hours)
+                payload = payload.payload
+            elif isinstance(payload, _Cleared):
+                headers["Set-Cookie"] = clearing_cookie_header()
+                payload = payload.payload
+            elif issued is not None and kind is not None:
+                headers["Set-Cookie"] = cookie_header(issued, hours=hours_for(kind))
+
+            if isinstance(payload, Raw):
+                self._send_file(payload, headers)
+                return
+            self._send_json(status, payload, headers=headers)
+
+        def _send_file(self, raw: Raw, headers: dict[str, str]) -> None:
+            """Entrega o arquivo ja autorizado.
+
+            Com `INTERNAL_REDIRECT_PREFIX` definido o Python sai do caminho dos
+            bytes: responde vazio com o caminho interno, o proxy le do disco e
+            transmite, e o worker volta a atender na hora. Sem ele, transmite em
+            pedacos daqui - funciona, e e divida anotada.
+            """
+            internal = _internal_redirect(cfg, raw.path)
+            if internal is not None:
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", raw.content_type)
+                self.send_header("X-Accel-Redirect", internal)
+                self.send_header("Cache-Control", "private, no-store")
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.end_headers()
+                return
+
+            size = raw.path.stat().st_size
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", raw.content_type)
+            self.send_header("Content-Length", str(size))
+            # `private` e `no-store`: e conteudo de uma conta, e cache
+            # compartilhado servindo isto para outra pessoa e o vazamento que
+            # todo o resto deste modulo existe para impedir.
+            self.send_header("Cache-Control", "private, no-store")
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.end_headers()
+            with raw.path.open("rb") as source:
+                shutil.copyfileobj(source, self.wfile, 64 * 1024)
 
         def _read_body(self, route: Route) -> bytes | None:
             """O corpo cru, ou None quando ja respondeu recusando.

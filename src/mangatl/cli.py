@@ -11,7 +11,9 @@ from pathlib import Path
 import typer
 from dotenv import load_dotenv
 
+from .accounts import MigrationRefused, migrate_to_accounts, owner_config
 from .config import Config, load_config
+from .demo import DemoError, build_demo, demo_root
 from .detectors.base import (
     DetectorUnavailableError,
     UnknownDetectorError,
@@ -35,6 +37,11 @@ def _configure_logging(verbose: bool) -> None:
 
 
 def _load() -> Config:
+    """O projeto, sem conta nenhuma: `library/` e `output/` na raiz.
+
+    So `migrate-to-accounts` e `doctor` usam isto. Todo o resto quer `_load_owner`,
+    porque depois da migracao o acervo nao mora mais aqui.
+    """
     load_dotenv()
     try:
         return load_config()
@@ -43,13 +50,32 @@ def _load() -> Config:
         raise typer.Exit(code=2) from error
 
 
+def _load_owner() -> Config:
+    """O projeto apontado para a area do dono, ou para a raiz antes da migracao.
+
+    Um comando so, e nao uma flag `--user`: na linha de comando quem esta
+    digitando e o dono da maquina. Conta de terceiro so existe pela rede.
+    """
+    return owner_config(_load())
+
+
 def _resolve_chapter(cfg: Config, target: str) -> tuple[str, str]:
-    """Aceita `library/serie/001`, `serie/001` ou um caminho absoluto."""
+    """Aceita `library/serie/001`, `serie/001` ou um caminho absoluto.
+
+    Tres bases e nao uma porque a biblioteca deixou de morar na raiz do projeto
+    depois da migracao: `library/serie/001` e o que o proprio `mangatl slice`
+    imprime e continua tendo que funcionar, e ele so casa com a base de conteudo.
+    A mais especifica vem primeiro.
+    """
     path = Path(target)
-    candidate = path if path.is_absolute() else (cfg.root / path)
-    if not candidate.is_dir():
-        candidate = cfg.library_dir / target
-    if not candidate.is_dir():
+    if path.is_absolute():
+        candidates = (path,)
+    else:
+        content_root = cfg.library_dir.parent
+        candidates = (cfg.library_dir / path, content_root / path, cfg.root / path)
+
+    candidate = next((option for option in candidates if option.is_dir()), None)
+    if candidate is None:
         raise ChapterNotFoundError(f"capitulo nao encontrado: {target}")
 
     resolved = candidate.resolve()
@@ -138,7 +164,7 @@ def process(
 ) -> None:
     """Processa um capitulo: deteccao, OCR e traducao."""
     _configure_logging(verbose)
-    cfg = _load()
+    cfg = _load_owner()
     if model:
         cfg = cfg.model_copy(update={"translation": cfg.translation.model_copy(update={"model": model})})
 
@@ -170,7 +196,7 @@ def process_all(
 ) -> None:
     """Processa todos os capitulos; os ja processados e inalterados sao no-op."""
     _configure_logging(verbose)
-    cfg = _load()
+    cfg = _load_owner()
     engine_name = engine or cfg.translation.engine
 
     pairs = [pair for pair in discover_chapters(cfg) if series is None or pair[0] == series]
@@ -207,7 +233,7 @@ def slice_command(
 ) -> None:
     """Importa capturas de rolagem de uma pasta externa, ja fatiadas em paginas."""
     _configure_logging(verbose)
-    cfg = _load()
+    cfg = _load_owner()
 
     source_dir = Path(source).expanduser()
     if not source_dir.is_dir():
@@ -261,9 +287,59 @@ def slice_command(
 @app.command(name="build-library")
 def build_library_command() -> None:
     """Regenera output/library.json a partir do que ja existe em disco."""
-    cfg = _load()
+    cfg = _load_owner()
     path = save_library(cfg, build_library(cfg))
     typer.secho(f"escrito {path}", fg=typer.colors.GREEN)
+
+
+@app.command(name="build-demo")
+def build_demo_command(
+    series: str = typer.Argument(..., help="Serie de onde os capitulos saem"),
+    chapters: list[str] = typer.Argument(..., help="Um ou mais capitulos ja processados"),
+) -> None:
+    """Publica capitulos seus na vitrine `public/demo/`, que qualquer um le sem conta.
+
+    Roda na sua maquina. O servidor hospedado nunca escreve em `public/` - a
+    vitrine viaja dentro da imagem, e por isso e imutavel para quem a visita.
+
+    O material publicado aqui fica na internet aberta, sem login. Publique so o
+    que voce pode publicar: dominio publico, licenca livre ou arte sua.
+    """
+    cfg = _load_owner()
+    try:
+        library, copied = build_demo(cfg, [(series, chapter) for chapter in chapters])
+    except DemoError as error:
+        typer.secho(str(error), fg=typer.colors.RED)
+        raise typer.Exit(code=1) from error
+
+    published = sum(len(entry.chapters) for entry in library.series)
+    typer.secho(f"{copied} arquivo(s) copiado(s) para {demo_root(cfg)}", fg=typer.colors.GREEN)
+    typer.echo(f"vitrine: {published} capitulo(s) em {len(library.series)} serie(s)")
+    for entry in library.series:
+        motors = sorted({engine for chapter in entry.chapters for engine in chapter.engines})
+        typer.echo(f"  {entry.series}: {len(entry.chapters)} cap., motores {', '.join(motors)}")
+
+
+@app.command(name="migrate-to-accounts")
+def migrate_to_accounts_command() -> None:
+    """Cria o dono e move library/ e output/ para a area dele. Roda uma vez."""
+    cfg = _load()
+    try:
+        result = migrate_to_accounts(cfg)
+    except MigrationRefused as error:
+        typer.secho(str(error), fg=typer.colors.RED)
+        raise typer.Exit(code=1) from error
+
+    owner = owner_config(cfg)
+    if not result.moved:
+        typer.secho(f"nada a mover; o acervo do dono ja esta em {owner.library_dir}", fg=typer.colors.YELLOW)
+    else:
+        typer.secho(f"movido: {', '.join(result.moved)} -> {owner.library_dir.parent}", fg=typer.colors.GREEN)
+
+    # O `library.json` guarda caminhos; deixa-lo apontando para a raiz antiga
+    # daria um leitor que lista capitulo e nao acha imagem nenhuma.
+    save_library(owner, build_library(owner))
+    typer.echo(f"dono: {result.owner_id}")
 
 
 @app.command(name="setup-free")
@@ -304,7 +380,7 @@ def _lan_addresses() -> list[str]:
 @app.command()
 def serve(port: int = typer.Option(8000, "--port", "-p")) -> None:
     """Sobe o leitor web servindo reader/, output/ e library/ (imagens + JSONs + PWA)."""
-    cfg = _load()
+    cfg = _load_owner()
     save_library(cfg, build_library(cfg))
 
     typer.secho(f"leitor:   http://localhost:{port}/reader/", fg=typer.colors.GREEN)
@@ -370,7 +446,7 @@ def doctor() -> None:
     """Verifica tudo que o pipeline precisa e diz o que falta."""
     import os
 
-    cfg = _load()
+    cfg = _load_owner()
     typer.echo(f"projeto: {cfg.root}\n")
 
     checks = [

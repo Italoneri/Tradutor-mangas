@@ -15,6 +15,16 @@ import { fitFontSize, fontCqw, overlayBox } from "./overlay.js";
 const ROOT = "..";
 const params = new URLSearchParams(location.search);
 
+/* Onde a vitrine publica mora. Caminho e nao rota: ela e conteudo estatico e
+   imutavel, servida sem sessao e sem cookie, exatamente como esta PWA. */
+const SHOWCASE_INDEX = `${ROOT}/public/demo/demo-library.json`;
+
+/* O indice do usuario logado. Nao leva id de usuario: quem esta pedindo sai da
+   sessao, e um id na URL seria convite para trocar o numero. */
+const MY_LIBRARY = `${ROOT}/u/library`;
+
+const REPOSITORY = "https://github.com/Italoneri/Tradutor-mangas";
+
 const el = {
   main: document.getElementById("main"),
   brand: document.getElementById("brand"),
@@ -158,7 +168,27 @@ function panelLinkHtml() {
   return SERVED_LOCALLY ? `<a class="btn btn-secondary" href="admin.html">Painel</a>` : "";
 }
 
-function renderShelf(library) {
+/* O convite da vitrine. Fica depois das obras, e nao antes: quem chegou de um
+   link quer ver a traducao funcionando primeiro, e so entao decide se sobe algo. */
+function inviteHtml() {
+  return `<section class="invite">
+    <h2>Suba a sua amostra</h2>
+    <p>
+      Mande de 5 a 10 páginas em inglês e veja o resultado em português.
+      Nada de cadastro: o que você subir vive 48 horas e some sozinho.
+    </p>
+    <div class="invite-actions">
+      <a class="btn btn-primary" href="admin.html">Subir uma amostra</a>
+      <a class="btn btn-secondary" href="${REPOSITORY}" rel="noopener">Ver o código</a>
+    </div>
+    <p class="fine">
+      O motor <code>claude</code> está desligado aqui porque a chave da API seria a do dono.
+      Rodando na sua máquina, com a sua chave, a tradução é bem melhor — o repositório explica como.
+    </p>
+  </section>`;
+}
+
+function renderShelf(library, { showcase }) {
   document.title = "Tinta";
   setChrome({ search: library.series.length > 0 });
   el.main.className = "";
@@ -173,18 +203,22 @@ function renderShelf(library) {
     return;
   }
 
+  const heading = showcase
+    ? `<h1>Veja a tradução funcionando</h1>
+       <p>Capítulos publicáveis, traduzidos por este pipeline. Troque o motor durante a leitura para comparar.</p>`
+    : `<h1>Sua biblioteca</h1>
+       <p>Ponha um <code>cover.jpg</code> na pasta da obra para dar capa a ela.</p>`;
+
   el.main.innerHTML = `
     <div class="head">
-      <div>
-        <h1>Sua biblioteca</h1>
-        <p>Ponha um <code>cover.jpg</code> na pasta da obra para dar capa a ela.</p>
-      </div>
+      <div>${heading}</div>
       <div class="head-actions">
         <span class="count">${library.series.length} ${library.series.length === 1 ? "obra" : "obras"}</span>
-        ${panelLinkHtml()}
+        ${showcase ? "" : panelLinkHtml()}
       </div>
     </div>
-    <div class="shelf">${library.series.map(workHtml).join("")}</div>`;
+    <div class="shelf">${library.series.map(workHtml).join("")}</div>
+    ${showcase ? inviteHtml() : ""}`;
 
   setupSearch();
 }
@@ -548,22 +582,48 @@ function setupOverlayToggle() {
   };
 }
 
+/* Qual biblioteca esta pessoa ve.
+ *
+ * A do usuario primeiro, a vitrine como resposta para quem nao tem sessao. A
+ * ordem importa: `/u/library` responde 401 sem cookie e NAO cria sessao, entao o
+ * visitante que so quer ler a vitrine nunca ganha um cookie por ter aberto a
+ * home - e a home continua sendo uma pagina que robo de busca pode visitar sem
+ * abrir area em disco para ele.
+ */
+async function loadLibrary() {
+  const mine = await fetchJson(MY_LIBRARY).catch(() => null);
+  if (mine) return { library: mine, showcase: false };
+
+  /* O leitor local, que continua sendo o uso principal: na sua maquina nao ha
+     sessao nenhuma e o indice e um arquivo. Na instancia hospedada este caminho
+     nao responde - `output/` deixa de ser servivel por caminho - e a busca cai
+     na vitrine, que e o certo para quem chegou sem cookie. */
+  const local = await fetchJson(`${ROOT}/output/library.json`).catch(() => null);
+  /* Vazio conta como ausente. `mangatl serve` escreve esse arquivo na subida,
+     mesmo sem nada processado, e aceita-lo assim faria a vitrine perder para um
+     indice de zero obras - o visitante veria "nenhum capitulo traduzido ainda"
+     numa pagina que existe justamente para mostrar capitulo traduzido. */
+  if (local && local.series.length) return { library: local, showcase: false };
+
+  const demo = await fetchJson(SHOWCASE_INDEX).catch(() => null);
+  return demo ? { library: demo, showcase: true } : null;
+}
+
 async function main() {
   setupOverlayToggle();
 
-  let library;
-  try {
-    library = await fetchJson(`${ROOT}/output/library.json`);
-  } catch {
-    fail("Nao achei output/library.json. Rode `mangatl build-library` e recarregue.");
+  const loaded = await loadLibrary();
+  if (!loaded) {
+    fail("Nao achei biblioteca nenhuma. Rode `mangatl build-library` e recarregue.");
     return;
   }
+  const { library, showcase } = loaded;
 
   const seriesName = params.get("series");
   const chapterName = params.get("chapter");
 
   if (!seriesName) {
-    renderShelf(library);
+    renderShelf(library, { showcase });
     return;
   }
 

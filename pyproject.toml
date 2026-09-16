@@ -9,7 +9,9 @@ description = "Tradutor em lote de mahuas/mangas EN->PT com leitor web offline"
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.69",
-    "opencv-python>=4.10",
+    # Headless: o pipeline nunca abre janela, e a variante normal arrasta GTK e
+    # dezenas de MB de X11 que num contêiner sao peso morto.
+    "opencv-python-headless>=4.10",
     "pytesseract>=0.3.13",
     "pillow>=10.4",
     "pydantic>=2.9",

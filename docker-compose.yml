@@ -1,0 +1,55 @@
+# Um servico so em producao. A fila em processo separado entra na Fase 4 e o
+# Caddy na frente entra na Fase 5.
+
+services:
+  app:
+    build: .
+    image: mangatl:dev
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      # O motor `claude` so funciona se a chave vier de fora. Ausente, o `free`
+      # continua funcionando e o `doctor` diz o que falta.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      # O acervo e o banco. E o unico diretorio que precisa de backup.
+      - ./data:/app/data
+      # Enquanto a Fase 1 nao move o acervo para dentro de data/, estes dois
+      # continuam sendo onde o capitulo vive.
+      - ./library:/app/library
+      - ./output:/app/output
+      # Volumes nomeados, nao bind: um volume nomeado nasce com o conteudo que o
+      # diretorio tem na imagem, entao o modelo e o pacote de idioma ja baixados
+      # na construcao continuam la, e um download futuro sobrevive ao rebuild.
+      - hf-cache:/opt/huggingface
+      - argos-data:/opt/argos
+    # O pico medido num capitulo de 155 fatias foi 575MB; a folga aqui cobre a
+    # fila da Fase 4 e o torch, que pede alguns GB so para carregar.
+    mem_limit: 6g
+
+  # So para desenvolver: monta o codigo de fora por cima do que a imagem tem,
+  # entao `docker compose run --rm dev python -m pytest` roda o que voce acabou
+  # de editar. Reconstruir a imagem a cada edicao rebaixaria o modelo de 200MB,
+  # que e copiado na construcao de proposito. O `profiles` mantem o
+  # `docker compose up` sem este servico.
+  dev:
+    build: .
+    image: mangatl:dev
+    profiles: ["dev"]
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - ./src:/app/src
+      - ./reader:/app/reader
+      - ./public:/app/public
+      - ./fixtures:/app/fixtures
+      - ./data:/app/data
+      - ./library:/app/library
+      - ./output:/app/output
+      - hf-cache:/opt/huggingface
+      - argos-data:/opt/argos
+    command: ["python", "-m", "pytest"]
+
+volumes:
+  hf-cache:
+  argos-data:
