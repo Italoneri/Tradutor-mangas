@@ -21,12 +21,48 @@
       <strong>Painel</strong>
       <span id="health">verificando o servidor&hellip;</span>
     </div>
+
+    <div class="controls">
+      <button class="btn btn-ghost" id="sign-out" hidden>Sair</button>
+    </div>
   </div>
 </header>
 
 <main id="main" class="admin" aria-live="polite">
 
   <p class="flash" id="flash" hidden></p>
+
+  <!-- A entrada. O caminho anonimo vem primeiro de proposito: um testador nao quer
+       criar conta para experimentar, e a sessao dele nasce sozinha no upload. -->
+  <section class="card" id="login" hidden>
+    <div class="card-head">
+      <h2>Subir uma amostra</h2>
+    </div>
+    <p class="hint">
+      De 5 a 12 páginas em inglês, traduzidas com o motor <code>free</code>.
+      Sem cadastro: o que você subir expira em 48 horas e some sozinho.
+    </p>
+    <div class="row">
+      <button class="btn btn-primary" id="enter-tester">Começar</button>
+    </div>
+
+    <details class="owner-login">
+      <summary>Entrar como dono</summary>
+      <form class="row" id="login-form">
+        <label class="field">
+          <span>e-mail</span>
+          <input id="login-email" type="email" autocomplete="username" required>
+        </label>
+        <label class="field">
+          <span>senha</span>
+          <input id="login-password" type="password" autocomplete="current-password" required>
+        </label>
+        <button class="btn btn-secondary" type="submit">Entrar</button>
+      </form>
+    </details>
+  </section>
+
+  <div id="panel" hidden>
 
   <section class="card">
     <div class="card-head">
@@ -143,6 +179,8 @@
       <a class="btn btn-primary" id="job-read" hidden>Ler o capítulo</a>
     </div>
   </section>
+
+  </div><!-- #panel -->
 
 </main>
 

@@ -9,7 +9,11 @@ from pathlib import Path
 
 import pytest
 
+from .accounts import ensure_owner
 from .config import Config
+from .db import connect, migrate
+from .jobs import finish, get_any, set_progress
+from .models import Progress
 from .panel import (
     MAX_JSON_BYTES,
     ROUTES,
@@ -217,6 +221,88 @@ def test_strips_query_and_fragment(name: str, target: str, expected: str):
     assert request_path(target) == expected, name
 
 
+OWNER_EMAIL = "dono@example.com"
+OWNER_PASSWORD = "senha-do-dono-bem-comprida"
+
+
+class Client:
+    """Um cliente HTTP com sessao, porque agora toda rota pergunta quem esta pedindo.
+
+    Guarda o cookie entre chamadas como um navegador guardaria, e manda os
+    cabecalhos de CSRF por padrao - que e o que a tela real manda. Os testes que
+    querem provar a recusa passam `csrf=False` ou `cookie=""` de proposito.
+    """
+
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self.cookie: str | None = None
+
+    def raw(
+        self,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        *,
+        declare_length: bool = True,
+        csrf: bool = True,
+        cookie: str | None = None,
+        extra_length: int | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, bytes, dict[str, str]]:
+        """Pedido cru, para poder omitir o Content-Length ou o cookie de proposito."""
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        connection.putrequest(method, path)
+        sent = self.cookie if cookie is None else cookie
+        if sent:
+            connection.putheader("Cookie", sent)
+        if csrf:
+            connection.putheader("X-Requested-With", "fetch")
+            connection.putheader("Origin", f"http://127.0.0.1:{self.port}")
+        for name, value in (headers or {}).items():
+            connection.putheader(name, value)
+        if extra_length is not None:
+            # Declara mais do que se vai mandar, para provar que o teto e conferido
+            # no cabecalho e nao depois de ler.
+            connection.putheader("Content-Length", str(extra_length))
+        elif body is not None and declare_length:
+            connection.putheader("Content-Length", str(len(body)))
+        connection.endheaders()
+        if body is not None and declare_length:
+            connection.send(body)
+
+        response = connection.getresponse()
+        payload = response.read()
+        headers = {key.lower(): value for key, value in response.getheaders()}
+        connection.close()
+
+        issued = headers.get("set-cookie")
+        if issued and cookie is None:
+            self.cookie = issued.split(";", 1)[0]
+        return response.status, payload, headers
+
+    def get(self, path: str, method: str = "GET", **kwargs) -> tuple[int, bytes]:
+        status, body, _ = self.raw(method, path, **kwargs)
+        return status, body
+
+    def send(
+        self, method: str, path: str, body: bytes | None = None, **kwargs
+    ) -> tuple[int, bytes]:
+        status, payload, _ = self.raw(method, path, body, **kwargs)
+        return status, payload
+
+    def login(self, email: str = OWNER_EMAIL, password: str = OWNER_PASSWORD) -> int:
+        status, _, _ = self.raw(
+            "POST",
+            "/api/login",
+            json.dumps({"email": email, "password": password}).encode("utf-8"),
+        )
+        return status
+
+    def forget(self) -> None:
+        """Esquece a sessao, como um navegador sem cookie."""
+        self.cookie = None
+
+
 @pytest.fixture
 def panel_server(tmp_path: Path):
     """Sobe o handler real numa porta efemera, para provar a ligacao e nao so as funcoes."""
@@ -227,27 +313,26 @@ def panel_server(tmp_path: Path):
     (tmp_path / "output").mkdir()
 
     cfg = Config(root=tmp_path)
+    migrate(cfg)
+    with connect(cfg) as connection:
+        ensure_owner(connection, OWNER_EMAIL, OWNER_PASSWORD)
+
     with _Server(("127.0.0.1", 0), make_panel_handler(cfg)) as httpd:
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
+        client = Client(httpd.server_address[1])
+        # O dono entra uma vez. Os testes que precisam de outro papel trocam de
+        # sessao explicitamente, para a troca aparecer no proprio teste.
+        assert client.login() == 200
         try:
-            yield httpd.server_address[1]
+            yield client
         finally:
             httpd.shutdown()
             thread.join(timeout=5)
 
 
-def _get(port: int, path: str, method: str = "GET") -> tuple[int, bytes]:
-    connection = HTTPConnection("127.0.0.1", port, timeout=5)
-    connection.request(method, path)
-    response = connection.getresponse()
-    body = response.read()
-    connection.close()
-    return response.status, body
-
-
-def test_reports_what_the_machine_can_do(panel_server: int):
-    status, body = _get(panel_server, "/api/health")
+def test_reports_what_the_machine_can_do(panel_server: Client):
+    status, body = panel_server.get("/api/health")
     payload = json.loads(body)
 
     assert status == 200
@@ -256,14 +341,14 @@ def test_reports_what_the_machine_can_do(panel_server: int):
     assert isinstance(payload["has_api_key"], bool)
 
 
-def test_never_answers_with_the_api_key(panel_server: int):
+def test_never_answers_with_the_api_key(panel_server: Client):
     # A chave esta no ambiente do processo de teste ou nao; o que nao pode e o
     # valor sair numa resposta.
-    _, body = _get(panel_server, "/api/health")
+    _, body = panel_server.get("/api/health")
     assert b"sk-" not in body
 
 
-def test_lists_the_disk_and_not_the_reader_index(panel_server: int, tmp_path: Path):
+def test_lists_the_disk_and_not_the_reader_index(panel_server: Client, tmp_path: Path):
     # Uma serie com capitulo enviado e nao traduzido: o painel precisa ve-la para
     # oferecer o botao que a traduz, e o leitor nao pode lista-la porque nao ha o
     # que abrir.
@@ -271,7 +356,7 @@ def test_lists_the_disk_and_not_the_reader_index(panel_server: int, tmp_path: Pa
     chapter.mkdir(parents=True)
     (chapter / "1.jpg").write_bytes(b"0")
 
-    status, body = _get(panel_server, "/api/series")
+    status, body = panel_server.get("/api/series")
     payload = json.loads(body)
 
     assert status == 200
@@ -280,38 +365,38 @@ def test_lists_the_disk_and_not_the_reader_index(panel_server: int, tmp_path: Pa
     assert payload["series"][0]["chapters"][0]["engines"] == []
 
 
-def test_lists_an_empty_library_as_empty(panel_server: int):
-    status, body = _get(panel_server, "/api/series")
+def test_lists_an_empty_library_as_empty(panel_server: Client):
+    status, body = panel_server.get("/api/series")
 
     assert status == 200
     assert json.loads(body)["series"] == []
 
 
-def test_shows_a_series_created_by_the_panel_right_away(panel_server: int):
+def test_shows_a_series_created_by_the_panel_right_away(panel_server: Client):
     # Sem isso a tela criaria a serie e ela sumiria ate ter capitulo traduzido.
-    _send(panel_server, "POST", "/api/series", json.dumps({"slug": "Recem-criada"}).encode("utf-8"))
+    panel_server.send("POST", "/api/series", json.dumps({"slug": "Recem-criada"}).encode("utf-8"))
 
-    _, body = _get(panel_server, "/api/series")
+    _, body = panel_server.get("/api/series")
 
     assert [s["series"] for s in json.loads(body)["series"]] == ["Recem-criada"]
 
 
-def test_keeps_serving_the_reader_next_to_the_panel(panel_server: int):
-    assert _get(panel_server, "/reader/app.js")[0] == 200
-    assert _get(panel_server, "/.env")[0] == 404
+def test_keeps_serving_the_reader_next_to_the_panel(panel_server: Client):
+    assert panel_server.get("/reader/app.js")[0] == 200
+    assert panel_server.get("/.env")[0] == 404
 
 
-def test_refuses_the_wrong_method_on_a_real_route(panel_server: int):
-    status, body = _get(panel_server, "/api/health", method="POST")
+def test_refuses_the_wrong_method_on_a_real_route(panel_server: Client):
+    status, body = panel_server.get("/api/health", method="POST")
 
     assert status == 405
     assert b"GET" in body
 
 
-def test_refuses_a_write_method_outside_the_panel(panel_server: int):
+def test_refuses_a_write_method_outside_the_panel(panel_server: Client):
     # Sem rota e sem arquivo para servir: PUT em caminho de leitor nao tem para
     # onde cair.
-    assert _get(panel_server, "/reader/app.js", method="PUT")[0] == 404
+    assert panel_server.get("/reader/app.js", method="PUT")[0] == 404
 
 
 # ---------- rotas de escrita, pelo servidor de verdade ----------
@@ -320,35 +405,12 @@ PNG = bytes.fromhex("89504e470d0a1a0a") + b"0" * 32
 JPEG = bytes.fromhex("ffd8ffe0") + b"0" * 32
 
 
-def _send(
-    port: int,
-    method: str,
-    path: str,
-    body: bytes | None = None,
-    *,
-    declare_length: bool = True,
-) -> tuple[int, bytes]:
-    """Pedido cru, para poder omitir o Content-Length de proposito."""
-    connection = HTTPConnection("127.0.0.1", port, timeout=5)
-    connection.putrequest(method, path)
-    if body is not None and declare_length:
-        connection.putheader("Content-Length", str(len(body)))
-    connection.endheaders()
-    if body is not None and declare_length:
-        connection.send(body)
-    response = connection.getresponse()
-    payload = response.read()
-    connection.close()
-    return response.status, payload
+def _put_json(client: Client, path: str, payload: object) -> tuple[int, bytes]:
+    return client.send("PUT", path, json.dumps(payload).encode("utf-8"))
 
 
-def _put_json(port: int, path: str, payload: object) -> tuple[int, bytes]:
-    return _send(port, "PUT", path, json.dumps(payload).encode("utf-8"))
-
-
-def test_creates_a_series_with_slug_and_title(panel_server: int, tmp_path: Path):
-    status, body = _send(
-        panel_server,
+def test_creates_a_series_with_slug_and_title(panel_server: Client, tmp_path: Path):
+    status, body = panel_server.send(
         "POST",
         "/api/series",
         json.dumps({"slug": "Obra Nova", "title": "Obra Nova, o Titulo"}).encode("utf-8"),
@@ -359,38 +421,38 @@ def test_creates_a_series_with_slug_and_title(panel_server: int, tmp_path: Path)
     assert (tmp_path / "library" / "Obra Nova" / "series.json").is_file()
 
 
-def test_refuses_to_create_a_series_twice(panel_server: int):
+def test_refuses_to_create_a_series_twice(panel_server: Client):
     payload = json.dumps({"slug": "Repetida"}).encode("utf-8")
-    assert _send(panel_server, "POST", "/api/series", payload)[0] == 201
-    assert _send(panel_server, "POST", "/api/series", payload)[0] == 409
+    assert panel_server.send("POST", "/api/series", payload)[0] == 201
+    assert panel_server.send("POST", "/api/series", payload)[0] == 409
 
 
 @pytest.mark.parametrize(
     ("name", "slug"),
     [("fuga", "../fora"), ("oculta", ".git"), ("vazia", "")],
 )
-def test_refuses_a_hostile_series_name(panel_server: int, name: str, slug: str):
-    status, body = _send(
-        panel_server, "POST", "/api/series", json.dumps({"slug": slug}).encode("utf-8")
+def test_refuses_a_hostile_series_name(panel_server: Client, name: str, slug: str):
+    status, body = panel_server.send(
+        "POST", "/api/series", json.dumps({"slug": slug}).encode("utf-8")
     )
 
     assert status == 422, name
     assert b"inaceitavel" in body, name
 
 
-def test_keeps_the_glossary_across_a_write_and_a_read(panel_server: int):
-    _send(panel_server, "POST", "/api/series", json.dumps({"slug": "Obra"}).encode("utf-8"))
+def test_keeps_the_glossary_across_a_write_and_a_read(panel_server: Client):
+    panel_server.send("POST", "/api/series", json.dumps({"slug": "Obra"}).encode("utf-8"))
     terms = {"Zhuge": "Zhuge", "Sect Master": "Mestre da Seita"}
 
     assert _put_json(panel_server, "/api/series/Obra/glossary", terms)[0] == 200
 
-    status, body = _send(panel_server, "GET", "/api/series/Obra/glossary")
+    status, body = panel_server.send("GET", "/api/series/Obra/glossary")
     assert status == 200
     assert json.loads(body) == terms
 
 
-def test_answers_422_and_not_500_for_a_broken_glossary(panel_server: int):
-    _send(panel_server, "POST", "/api/series", json.dumps({"slug": "Obra"}).encode("utf-8"))
+def test_answers_422_and_not_500_for_a_broken_glossary(panel_server: Client):
+    panel_server.send("POST", "/api/series", json.dumps({"slug": "Obra"}).encode("utf-8"))
 
     status, body = _put_json(panel_server, "/api/series/Obra/glossary", ["nao", "e", "objeto"])
 
@@ -398,65 +460,62 @@ def test_answers_422_and_not_500_for_a_broken_glossary(panel_server: int):
     assert b"objeto JSON" in body
 
 
-def test_answers_422_for_a_series_that_does_not_exist(panel_server: int):
-    status, body = _send(panel_server, "GET", "/api/series/nao-existe/glossary")
+def test_answers_422_for_a_series_that_does_not_exist(panel_server: Client):
+    status, body = panel_server.send("GET", "/api/series/nao-existe/glossary")
 
     assert status == 422
     assert b"nao existe" in body
 
 
-def test_writes_the_cover_with_the_suffix_the_bytes_ask_for(panel_server: int, tmp_path: Path):
-    _send(panel_server, "POST", "/api/series", json.dumps({"slug": "Obra"}).encode("utf-8"))
+def test_writes_the_cover_with_the_suffix_the_bytes_ask_for(panel_server: Client, tmp_path: Path):
+    panel_server.send("POST", "/api/series", json.dumps({"slug": "Obra"}).encode("utf-8"))
 
-    assert _send(panel_server, "PUT", "/api/series/Obra/cover", PNG)[0] == 200
+    assert panel_server.send("PUT", "/api/series/Obra/cover", PNG)[0] == 200
     assert (tmp_path / "library" / "Obra" / "cover.png").is_file()
 
 
-def test_replaces_the_old_cover_instead_of_stacking_one(panel_server: int, tmp_path: Path):
-    _send(panel_server, "POST", "/api/series", json.dumps({"slug": "Obra"}).encode("utf-8"))
-    _send(panel_server, "PUT", "/api/series/Obra/cover", PNG)
-    _send(panel_server, "PUT", "/api/series/Obra/cover", JPEG)
+def test_replaces_the_old_cover_instead_of_stacking_one(panel_server: Client, tmp_path: Path):
+    panel_server.send("POST", "/api/series", json.dumps({"slug": "Obra"}).encode("utf-8"))
+    panel_server.send("PUT", "/api/series/Obra/cover", PNG)
+    panel_server.send("PUT", "/api/series/Obra/cover", JPEG)
 
     covers = sorted(p.name for p in (tmp_path / "library" / "Obra").glob("cover.*"))
     assert covers == ["cover.jpg"]
 
 
-def test_refuses_a_cover_that_is_not_an_image(panel_server: int):
-    _send(panel_server, "POST", "/api/series", json.dumps({"slug": "Obra"}).encode("utf-8"))
+def test_refuses_a_cover_that_is_not_an_image(panel_server: Client):
+    panel_server.send("POST", "/api/series", json.dumps({"slug": "Obra"}).encode("utf-8"))
 
-    status, body = _send(panel_server, "PUT", "/api/series/Obra/cover", b"MZ" + b"0" * 40)
+    status, body = panel_server.send("PUT", "/api/series/Obra/cover", b"MZ" + b"0" * 40)
 
     assert status == 422
     assert b"nao e jpeg" in body
 
 
-def test_demands_a_declared_length_on_a_write(panel_server: int):
+def test_demands_a_declared_length_on_a_write(panel_server: Client):
     # `http.server` nao decodifica chunked e o painel nao adivinha tamanho.
-    status, _ = _send(panel_server, "PUT", "/api/series/Obra/glossary", b"{}", declare_length=False)
+    status, _ = panel_server.send("PUT", "/api/series/Obra/glossary", b"{}", declare_length=False)
     assert status == 411
 
 
-def test_refuses_a_body_over_the_route_ceiling_before_reading_it(panel_server: int):
-    connection = HTTPConnection("127.0.0.1", panel_server, timeout=5)
-    connection.putrequest("PUT", "/api/series/Obra/glossary")
-    connection.putheader("Content-Length", str(MAX_JSON_BYTES + 1))
-    connection.endheaders()
-    response = connection.getresponse()
-    status = response.status
-    connection.close()
+def test_refuses_a_body_over_the_route_ceiling_before_reading_it(panel_server: Client):
+    # O corpo nunca e enviado: o teto e conferido pelo `Content-Length`, e recusar
+    # depois de receber o megabyte nao protegeria de nada.
+    status, _ = panel_server.send(
+        "PUT", "/api/series/Obra/glossary", b"x" * 8, declare_length=False, extra_length=MAX_JSON_BYTES + 1
+    )
 
     assert status == 413
 
 
-def test_shows_the_title_from_series_json(panel_server: int, tmp_path: Path):
-    _send(
-        panel_server,
+def test_shows_the_title_from_series_json(panel_server: Client, tmp_path: Path):
+    panel_server.send(
         "POST",
         "/api/series",
         json.dumps({"slug": "obra-slug", "title": "O Titulo Bonito"}).encode("utf-8"),
     )
 
-    status, body = _send(panel_server, "GET", "/api/series/obra-slug/series.json")
+    status, body = panel_server.send("GET", "/api/series/obra-slug/series.json")
 
     assert status == 200
     assert json.loads(body)["title"] == "O Titulo Bonito"
@@ -544,62 +603,62 @@ def test_refuses_an_archive_without_a_single_image(tmp_path: Path):
         extract_archive(zip_of({"leiame.txt": b"oi"}), target)
 
 
-def series_with(port: int, slug: str = "Obra") -> str:
-    _send(port, "POST", "/api/series", json.dumps({"slug": slug}).encode("utf-8"))
+def series_with(client: Client, slug: str = "Obra") -> str:
+    client.send("POST", "/api/series", json.dumps({"slug": slug}).encode("utf-8"))
     return slug
 
 
-def test_suggests_the_chapter_number_when_the_body_is_empty(panel_server: int, tmp_path: Path):
+def test_suggests_the_chapter_number_when_the_body_is_empty(panel_server: Client, tmp_path: Path):
     slug = series_with(panel_server)
     (tmp_path / "library" / slug / "001").mkdir()
 
-    status, body = _send(panel_server, "POST", f"/api/series/{slug}/chapters", b"")
+    status, body = panel_server.send("POST", f"/api/series/{slug}/chapters", b"")
 
     assert status == 201
     assert json.loads(body)["chapter"] == "002"
 
 
-def test_opens_the_staging_area_and_not_the_chapter(panel_server: int, tmp_path: Path):
+def test_opens_the_staging_area_and_not_the_chapter(panel_server: Client, tmp_path: Path):
     slug = series_with(panel_server)
 
-    _send(panel_server, "POST", f"/api/series/{slug}/chapters", json.dumps({"chapter": "007"}).encode())
+    panel_server.send("POST", f"/api/series/{slug}/chapters", json.dumps({"chapter": "007"}).encode())
 
     assert (tmp_path / "library" / slug / "007.incoming").is_dir()
     assert not (tmp_path / "library" / slug / "007").exists()
 
 
-def test_refuses_to_stage_over_a_chapter_that_exists(panel_server: int, tmp_path: Path):
+def test_refuses_to_stage_over_a_chapter_that_exists(panel_server: Client, tmp_path: Path):
     slug = series_with(panel_server)
     (tmp_path / "library" / slug / "001").mkdir()
 
-    status, _ = _send(
-        panel_server, "POST", f"/api/series/{slug}/chapters", json.dumps({"chapter": "001"}).encode()
+    status, _ = panel_server.send(
+        "POST", f"/api/series/{slug}/chapters", json.dumps({"chapter": "001"}).encode()
     )
 
     assert status == 409
 
 
-def stage(port: int, slug: str, chapter: str) -> None:
-    _send(port, "POST", f"/api/series/{slug}/chapters", json.dumps({"chapter": chapter}).encode())
+def stage(client: Client, slug: str, chapter: str) -> None:
+    client.send("POST", f"/api/series/{slug}/chapters", json.dumps({"chapter": chapter}).encode())
 
 
-def test_writes_a_page_into_the_staging_area(panel_server: int, tmp_path: Path):
+def test_writes_a_page_into_the_staging_area(panel_server: Client, tmp_path: Path):
     slug = series_with(panel_server)
     stage(panel_server, slug, "001")
 
-    status, body = _send(panel_server, "PUT", f"/api/series/{slug}/chapters/001/files/1.jpg", JPEG)
+    status, body = panel_server.send("PUT", f"/api/series/{slug}/chapters/001/files/1.jpg", JPEG)
 
     assert status == 200
     assert json.loads(body)["file"] == "1.jpg"
     assert (tmp_path / "library" / slug / "001.incoming" / "1.jpg").read_bytes() == JPEG
 
 
-def test_refuses_a_page_that_is_not_an_image(panel_server: int):
+def test_refuses_a_page_that_is_not_an_image(panel_server: Client):
     slug = series_with(panel_server)
     stage(panel_server, slug, "001")
 
-    status, body = _send(
-        panel_server, "PUT", f"/api/series/{slug}/chapters/001/files/1.jpg", b"MZ" + b"0" * 40
+    status, body = panel_server.send(
+        "PUT", f"/api/series/{slug}/chapters/001/files/1.jpg", b"MZ" + b"0" * 40
     )
 
     assert status == 422
@@ -607,24 +666,24 @@ def test_refuses_a_page_that_is_not_an_image(panel_server: int):
 
 
 @pytest.mark.parametrize("filename", ["..%2F..%2F.env", "1.exe", ".oculta.jpg"])
-def test_refuses_a_hostile_page_name(panel_server: int, filename: str):
+def test_refuses_a_hostile_page_name(panel_server: Client, filename: str):
     slug = series_with(panel_server)
     stage(panel_server, slug, "001")
 
-    status, _ = _send(
-        panel_server, "PUT", f"/api/series/{slug}/chapters/001/files/{filename}", JPEG
+    status, _ = panel_server.send(
+        "PUT", f"/api/series/{slug}/chapters/001/files/{filename}", JPEG
     )
 
     assert status == 422
 
 
-def test_reports_the_staging_area_in_reading_order(panel_server: int):
+def test_reports_the_staging_area_in_reading_order(panel_server: Client):
     slug = series_with(panel_server)
     stage(panel_server, slug, "001")
     for name in ("10.jpg", "2.jpg", "1.jpg"):
-        _send(panel_server, "PUT", f"/api/series/{slug}/chapters/001/files/{name}", JPEG)
+        panel_server.send("PUT", f"/api/series/{slug}/chapters/001/files/{name}", JPEG)
 
-    status, body = _send(panel_server, "GET", f"/api/series/{slug}/chapters/001/incoming")
+    status, body = panel_server.send("GET", f"/api/series/{slug}/chapters/001/incoming")
     payload = json.loads(body)
 
     assert status == 200
@@ -632,12 +691,11 @@ def test_reports_the_staging_area_in_reading_order(panel_server: int):
     assert payload["bytes"] == 3 * len(JPEG)
 
 
-def test_extracts_an_archive_into_the_staging_area(panel_server: int, tmp_path: Path):
+def test_extracts_an_archive_into_the_staging_area(panel_server: Client, tmp_path: Path):
     slug = series_with(panel_server)
     stage(panel_server, slug, "001")
 
-    status, body = _send(
-        panel_server,
+    status, body = panel_server.send(
         "POST",
         f"/api/series/{slug}/chapters/001/archive",
         zip_of({"cap/1.jpg": JPEG, "cap/2.png": PNG}),
@@ -648,13 +706,12 @@ def test_extracts_an_archive_into_the_staging_area(panel_server: int, tmp_path: 
     assert (tmp_path / "library" / slug / "001.incoming" / "1.jpg").is_file()
 
 
-def test_throws_away_the_staging_area_when_an_archive_fails(panel_server: int, tmp_path: Path):
+def test_throws_away_the_staging_area_when_an_archive_fails(panel_server: Client, tmp_path: Path):
     # Meio zip extraido e pior que zip nenhum: parece capitulo e o commit aceitaria.
     slug = series_with(panel_server)
     stage(panel_server, slug, "001")
 
-    status, body = _send(
-        panel_server,
+    status, body = panel_server.send(
         "POST",
         f"/api/series/{slug}/chapters/001/archive",
         zip_of({"1.jpg": JPEG, "../../.env": b"CHAVE=1"}),
@@ -665,12 +722,12 @@ def test_throws_away_the_staging_area_when_an_archive_fails(panel_server: int, t
     assert not (tmp_path / "library" / slug / "001.incoming").exists()
 
 
-def test_promotes_the_staging_area_to_a_chapter(panel_server: int, tmp_path: Path):
+def test_promotes_the_staging_area_to_a_chapter(panel_server: Client, tmp_path: Path):
     slug = series_with(panel_server)
     stage(panel_server, slug, "001")
-    _send(panel_server, "PUT", f"/api/series/{slug}/chapters/001/files/1.jpg", JPEG)
+    panel_server.send("PUT", f"/api/series/{slug}/chapters/001/files/1.jpg", JPEG)
 
-    status, body = _send(panel_server, "POST", f"/api/series/{slug}/chapters/001/commit")
+    status, body = panel_server.send("POST", f"/api/series/{slug}/chapters/001/commit")
 
     assert status == 200
     assert json.loads(body)["files"] == ["1.jpg"]
@@ -678,48 +735,48 @@ def test_promotes_the_staging_area_to_a_chapter(panel_server: int, tmp_path: Pat
     assert not (tmp_path / "library" / slug / "001.incoming").exists()
 
 
-def test_refuses_to_promote_an_empty_staging_area(panel_server: int):
+def test_refuses_to_promote_an_empty_staging_area(panel_server: Client):
     slug = series_with(panel_server)
     stage(panel_server, slug, "001")
 
-    status, body = _send(panel_server, "POST", f"/api/series/{slug}/chapters/001/commit")
+    status, body = panel_server.send("POST", f"/api/series/{slug}/chapters/001/commit")
 
     assert status == 422
     assert b"vazia" in body
 
 
-def test_refuses_to_promote_over_a_chapter_that_exists(panel_server: int, tmp_path: Path):
+def test_refuses_to_promote_over_a_chapter_that_exists(panel_server: Client, tmp_path: Path):
     slug = series_with(panel_server)
     incoming = tmp_path / "library" / slug / "001.incoming"
     incoming.mkdir(parents=True)
     (incoming / "1.jpg").write_bytes(JPEG)
     (tmp_path / "library" / slug / "001").mkdir()
 
-    status, _ = _send(panel_server, "POST", f"/api/series/{slug}/chapters/001/commit")
+    status, _ = panel_server.send("POST", f"/api/series/{slug}/chapters/001/commit")
 
     assert status == 409
 
 
-def test_discards_the_staging_area_on_request(panel_server: int, tmp_path: Path):
+def test_discards_the_staging_area_on_request(panel_server: Client, tmp_path: Path):
     slug = series_with(panel_server)
     stage(panel_server, slug, "001")
-    _send(panel_server, "PUT", f"/api/series/{slug}/chapters/001/files/1.jpg", JPEG)
+    panel_server.send("PUT", f"/api/series/{slug}/chapters/001/files/1.jpg", JPEG)
 
-    status, body = _send(panel_server, "DELETE", f"/api/series/{slug}/chapters/001/incoming")
+    status, body = panel_server.send("DELETE", f"/api/series/{slug}/chapters/001/incoming")
 
     assert status == 200
     assert json.loads(body)["removed"] == 1
     assert not (tmp_path / "library" / slug / "001.incoming").exists()
 
 
-def test_keeps_the_staging_area_out_of_the_reader_index(panel_server: int, tmp_path: Path):
+def test_keeps_the_staging_area_out_of_the_reader_index(panel_server: Client, tmp_path: Path):
     # E o bug que a area de espera existe para evitar: upload interrompido virando
     # capitulo para o process-all.
     slug = series_with(panel_server)
     stage(panel_server, slug, "001")
-    _send(panel_server, "PUT", f"/api/series/{slug}/chapters/001/files/1.jpg", JPEG)
+    panel_server.send("PUT", f"/api/series/{slug}/chapters/001/files/1.jpg", JPEG)
 
-    _, body = _get(panel_server, "/api/series")
+    _, body = panel_server.get("/api/series")
     chapters = json.loads(body)["series"][0]["chapters"]
 
     assert [c["chapter"] for c in chapters] == ["001"]
@@ -728,65 +785,75 @@ def test_keeps_the_staging_area_out_of_the_reader_index(panel_server: int, tmp_p
 
 
 # ---------- jobs ----------
+#
+# A fila deixou de rodar neste processo: quem processa e o `mangatl worker`. O que
+# estas rotas precisam provar mudou junto - que enfileiram, recusam e leem estado,
+# e nao que o pipeline roda. Quem prova o pipeline e o `worker_test.py`.
 
 
 @pytest.fixture
 def panel_with_jobs(tmp_path: Path):
-    """Painel com um registro que nao dispara pipeline nenhum.
-
-    Rodar o pipeline de verdade num teste de rota pediria imagens, Tesseract e o
-    detector; o que estas rotas precisam provar e outra coisa - que aceitam,
-    recusam e respondem o estado certo.
-    """
-    from .jobs_test import FakeRegistry
-
     (tmp_path / "library" / "Obra" / "001").mkdir(parents=True)
     (tmp_path / "reader").mkdir()
-    registry = FakeRegistry()
 
     cfg = Config(root=tmp_path)
-    with _Server(("127.0.0.1", 0), make_panel_handler(cfg, registry)) as httpd:
+    migrate(cfg)
+    with connect(cfg) as connection:
+        ensure_owner(connection, OWNER_EMAIL, OWNER_PASSWORD)
+
+    with _Server(("127.0.0.1", 0), make_panel_handler(cfg)) as httpd:
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
+        client = Client(httpd.server_address[1])
+        assert client.login() == 200
         try:
-            yield httpd.server_address[1], registry
+            yield client, cfg
         finally:
-            registry.release.set()
             httpd.shutdown()
             thread.join(timeout=5)
 
 
-def post_job(port: int, **fields: object) -> tuple[int, bytes]:
+def post_job(client: Client, **fields: object) -> tuple[int, bytes]:
     payload = {"series": "Obra", "chapter": "001", "engine": "free", **fields}
-    return _send(port, "POST", "/api/jobs", json.dumps(payload).encode("utf-8"))
+    return client.send("POST", "/api/jobs", json.dumps(payload).encode("utf-8"))
 
 
-def test_accepts_the_job_and_answers_before_it_finishes(panel_with_jobs):
+def test_accepts_the_job_and_answers_before_it_runs(panel_with_jobs):
     # 202 e nao 200: o que volta e um recibo, nao o resultado.
-    port, registry = panel_with_jobs
+    client, cfg = panel_with_jobs
 
-    status, body = post_job(port)
+    status, body = post_job(client)
     payload = json.loads(body)
 
     assert status == 202
-    assert payload["job"]["state"] == "running"
-    assert registry.get(payload["job_id"]) is not None
+    assert payload["job"]["state"] == "pending"
+    with connect(cfg) as connection:
+        assert get_any(connection, payload["job_id"]) is not None
+
+
+def test_tells_the_waiting_person_their_place_in_the_queue(panel_with_jobs):
+    """"na fila" sem numero e indistinguivel de travado."""
+    client, _ = panel_with_jobs
+
+    payload = json.loads(post_job(client)[1])
+
+    assert payload["job"]["queue_position"] == 0
 
 
 def test_refuses_a_second_job_with_a_readable_conflict(panel_with_jobs):
-    port, registry = panel_with_jobs
-    post_job(port)
+    client, _ = panel_with_jobs
+    post_job(client)
 
-    status, body = post_job(port)
+    status, body = post_job(client)
 
     assert status == 409
-    assert b"ja ha um processamento" in body
+    assert b"ja tem um processamento" in body
 
 
 def test_refuses_an_engine_that_does_not_exist(panel_with_jobs):
-    port, _ = panel_with_jobs
+    client, _ = panel_with_jobs
 
-    status, body = post_job(port, engine="tradutor-magico")
+    status, body = post_job(client, engine="tradutor-magico")
 
     assert status == 422
     assert b"nao existe" in body
@@ -794,73 +861,65 @@ def test_refuses_an_engine_that_does_not_exist(panel_with_jobs):
 
 def test_refuses_a_chapter_that_was_never_committed(panel_with_jobs):
     # Area de espera nao e capitulo: processar meio upload e o que ela evita.
-    port, _ = panel_with_jobs
+    client, _ = panel_with_jobs
 
-    status, body = post_job(port, chapter="999")
+    status, body = post_job(client, chapter="999")
 
     assert status == 422
     assert b"nao existe" in body
 
 
-def test_reports_the_progress_of_a_running_job(panel_with_jobs):
-    port, registry = panel_with_jobs
-    job_id = json.loads(post_job(port)[1])["job_id"]
+def test_reports_the_progress_the_worker_wrote(panel_with_jobs):
+    client, cfg = panel_with_jobs
+    job_id = json.loads(post_job(client)[1])["job_id"]
 
-    assert wait_for(lambda: registry.get(job_id).progress.total == 2)
+    with connect(cfg) as connection:
+        set_progress(
+            connection,
+            job_id,
+            Progress(phase="extract", done=1, total=2, detail="p0001.jpg"),
+            ("INFO linha que o job coletou",),
+        )
 
-    status, body = _send(port, "GET", f"/api/jobs/{job_id}")
-    payload = json.loads(body)
+    payload = json.loads(client.send("GET", f"/api/jobs/{job_id}")[1])
 
-    assert status == 200
     assert payload["progress"] == {
         "phase": "extract",
         "done": 1,
         "total": 2,
-        "detail": "fingindo",
+        "detail": "p0001.jpg",
     }
-
-
-def test_reports_the_job_as_done_with_its_log(panel_with_jobs):
-    port, registry = panel_with_jobs
-    job_id = json.loads(post_job(port)[1])["job_id"]
-    registry.release.set()
-
-    assert wait_for(lambda: registry.get(job_id).state == "done")
-
-    payload = json.loads(_send(port, "GET", f"/api/jobs/{job_id}")[1])
-
-    assert payload["state"] == "done"
-    assert payload["finished_at"] is not None
     assert any("linha que o job coletou" in line for line in payload["log"])
 
 
-def test_lists_the_jobs_newest_first(panel_with_jobs):
-    port, registry = panel_with_jobs
-    registry.release.set()
-    first = json.loads(post_job(port)[1])["job_id"]
-    assert wait_for(lambda: registry.get(first).state == "done")
-    second = json.loads(post_job(port)[1])["job_id"]
+def test_reports_the_job_as_done_once_the_worker_finishes_it(panel_with_jobs):
+    client, cfg = panel_with_jobs
+    job_id = json.loads(post_job(client)[1])["job_id"]
 
-    payload = json.loads(_send(port, "GET", "/api/jobs")[1])
+    with connect(cfg) as connection:
+        finish(connection, job_id, state="done")
+
+    payload = json.loads(client.send("GET", f"/api/jobs/{job_id}")[1])
+
+    assert payload["state"] == "done"
+    assert payload["finished_at"] is not None
+
+
+def test_lists_the_jobs_newest_first(panel_with_jobs):
+    client, cfg = panel_with_jobs
+    first = json.loads(post_job(client)[1])["job_id"]
+    with connect(cfg) as connection:
+        finish(connection, first, state="done")
+    second = json.loads(post_job(client)[1])["job_id"]
+
+    payload = json.loads(client.send("GET", "/api/jobs")[1])
 
     assert [job["id"] for job in payload["jobs"]] == [second, first]
 
 
-def test_reports_no_job_for_an_id_this_process_never_saw(panel_with_jobs):
-    port, _ = panel_with_jobs
+def test_reports_no_job_for_an_id_that_does_not_exist(panel_with_jobs):
+    client, _ = panel_with_jobs
 
-    status, body = _send(port, "GET", "/api/jobs/naoexiste")
+    status, body = client.send("GET", "/api/jobs/naoexiste")
 
     assert status == 404
-    assert b"neste processo" in body
-
-
-def wait_for(condition, timeout: float = 5.0) -> bool:
-    import time
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if condition():
-            return True
-        time.sleep(0.01)
-    return False

@@ -26,12 +26,11 @@ import re
 import secrets
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from http.cookies import SimpleCookie
 from urllib.parse import urlsplit
 
 from .accounts import User, UserKind, user_from_row
-from .db import now
+from .db import in_hours, minutes_ago, now
 
 COOKIE_NAME = "sid"
 """Nome curto e generico de proposito: um cookie chamado `mangatl_session`
@@ -163,10 +162,6 @@ class Session:
         return self.user.is_owner
 
 
-def _in_hours(hours: int) -> str:
-    return (datetime.now(UTC) + timedelta(hours=hours)).isoformat(timespec="seconds")
-
-
 def hours_for(kind: UserKind) -> int:
     return OWNER_SESSION_HOURS if kind == "owner" else TESTER_SESSION_HOURS
 
@@ -179,7 +174,7 @@ def issue(connection: sqlite3.Connection, user_id: str, *, hours: int) -> tuple[
     recuperavel, e isso esta certo.
     """
     token = secrets.token_urlsafe(TOKEN_BYTES)
-    expires_at = _in_hours(hours)
+    expires_at = in_hours(hours)
     moment = now()
     connection.execute(
         "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_seen)"
@@ -288,9 +283,7 @@ def record_login_attempt(connection: sqlite3.Connection, subject: str) -> None:
 
 
 def recent_login_attempts(connection: sqlite3.Connection, subject: str) -> int:
-    since = (
-        datetime.now(UTC) - timedelta(minutes=LOGIN_ATTEMPT_WINDOW_MINUTES)
-    ).isoformat(timespec="seconds")
+    since = minutes_ago(LOGIN_ATTEMPT_WINDOW_MINUTES)
     row = connection.execute(
         "SELECT count(*) AS n FROM login_attempts WHERE subject = ? AND at > ?",
         (subject.lower(), since),
@@ -316,9 +309,7 @@ def clear_login_attempts(connection: sqlite3.Connection, subjects: tuple[str, ..
 
 
 def purge_old_login_attempts(connection: sqlite3.Connection) -> int:
-    since = (
-        datetime.now(UTC) - timedelta(minutes=LOGIN_ATTEMPT_WINDOW_MINUTES)
-    ).isoformat(timespec="seconds")
+    since = minutes_ago(LOGIN_ATTEMPT_WINDOW_MINUTES)
     cursor = connection.execute("DELETE FROM login_attempts WHERE at <= ?", (since,))
     return cursor.rowcount
 

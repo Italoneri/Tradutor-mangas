@@ -16,10 +16,10 @@ As rotas `/u/` sao o outro lado do mesmo assunto: `library/` e `output/` deixara
 de ser servidos por caminho, porque uma lista de pastas permitidas responde "esta
 pasta pode sair na rede" e a pergunta virou "esta pasta pode sair para VOCE".
 
-Este modulo depende do venv inteiro: pydantic, o store, o pipeline. O
-`serving.py` continua sendo stdlib pura porque o `scripts/serve.py` roda no python
-do Windows, sem venv. Manter essa fronteira e o que impede um import pesado de
-derrubar o servidor que o celular usa.
+Este modulo depende do venv inteiro: pydantic, o store, o pipeline. O `serving.py`
+continua sendo stdlib pura e continua servindo so o que e publico por natureza -
+a PWA e a vitrine. Essa separacao e o que deixa obvio, lendo um arquivo curto, que
+nada de acervo sai sem passar por aqui.
 
 Ponto de extensao anotado e nao implementado: baixar capitulo de URL pediria uma
 `import_from_url(url) -> list[Path]`. Qualquer site serio precisa de navegador
@@ -38,7 +38,6 @@ import sqlite3
 import sys
 import zipfile
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from pathlib import Path, PurePosixPath
 from typing import Literal, NamedTuple
@@ -46,10 +45,30 @@ from urllib.parse import unquote
 
 from .accounts import User, area_config, create_user, find_owner, password_hash_of
 from .config import Config
-from .db import connect
+from .db import connect, in_hours
 from .engines.base import available_engines
-from .jobs import Busy, JobRegistry
+from .jobs import (
+    OWNER_PRIORITY,
+    TESTER_PRIORITY,
+    Busy,
+    enqueue,
+    get as get_job,
+    queue_position,
+    recent as recent_jobs,
+)
 from .models import SeriesMeta
+from .quotas import (
+    TESTER_MAX_PAGES_PER_CHAPTER,
+    OutOfSpace,
+    QuotaExceeded,
+    check_disk,
+    check_engine,
+    check_incoming_pages,
+    check_new_chapter,
+    check_upload_bytes,
+    engines_for,
+    record_usage,
+)
 from .serving import ReaderHandler, serve_handler
 from .sessions import (
     REQUESTED_WITH,
@@ -122,30 +141,6 @@ sinal de que veio coisa errada pelo cano."""
 
 MAX_GLOSSARY_ENTRIES = 500
 """Acima disso nao e glossario de serie, e despejo de dicionario."""
-
-# ---------- cota do testador ----------
-#
-# Todas juntas, num lugar so, cada uma com o numero justificado. Espalhar estes
-# valores pelas rotas e como nao te-los: ninguem consegue responder "o que um
-# testador pode fazer aqui?" sem ler o servidor inteiro.
-
-TESTER_MAX_PAGES_PER_CHAPTER = 12
-"""Doze paginas mostram a qualidade da traducao tao bem quanto 155 e custam 1/13
-do CPU. O capitulo medido aqui levou 216s para 155 fatias; doze levam ~17s."""
-
-TESTER_MAX_CHAPTERS = 2
-"""Dois bastam para comparar uma pagina facil com uma dificil. Mais que isso e
-acervo, e acervo e o que este servidor nao e."""
-
-TESTER_MAX_UPLOAD_BYTES = 40 * 1024 * 1024
-"""Doze paginas de manhwa em jpeg nao passam de alguns MB; 40MB cobre PNG sem
-perda e ainda e um teto que um disco pequeno aguenta vezes muitos testadores."""
-
-TESTER_ENGINES: tuple[str, ...] = ("free",)
-"""Sem `claude`: a chave da API e do dono, e a conta chega para ele.
-
-E a trava de custo mais importante deste projeto. Ela vale na interface, que nao
-oferece a opcao, e na API, que recusa - a interface sozinha e sugestao."""
 
 MAX_ARCHIVE_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
 """Teto do descompactado, conferido somando `ZipInfo.file_size` ANTES de extrair.
@@ -325,7 +320,6 @@ class Context(NamedTuple):
 
     cfg: Config
     base: Config
-    jobs: JobRegistry
     connection: sqlite3.Connection
     session: Session | None
     token: str | None = None
@@ -437,7 +431,7 @@ def _session_payload(session: Session | None) -> dict:
         "expires_at": session.expires_at,
         # O testador nunca ve `claude` na lista: a chave da API e do dono, e a
         # conta chega para ele. A interface esconde e a API recusa - as duas.
-        "engines": available_engines() if session.is_owner else list(TESTER_ENGINES),
+        "engines": list(engines_for(session.user)),
     }
 
 
@@ -478,8 +472,7 @@ def _login(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, obj
     hours = hours_for(owner.kind)
     token, expires_at = issue(ctx.connection, owner.id, hours=hours)
     return HTTPStatus.OK, _Issued(
-        payload={"authenticated": True, "kind": owner.kind, "expires_at": expires_at,
-                 "engines": available_engines()},
+        payload=_session_payload(Session(user=owner, expires_at=expires_at)),
         token=token,
         hours=hours,
     )
@@ -629,7 +622,12 @@ def _incoming_files(incoming: Path) -> list[Path]:
     return list_page_images(incoming) if incoming.is_dir() else []
 
 
-def extract_archive(data: bytes, target: Path) -> list[str]:
+def _page_limit(user: User) -> int:
+    """Quantas paginas este usuario pode ter num capitulo."""
+    return MAX_PAGES_PER_CHAPTER if user.is_owner else TESTER_MAX_PAGES_PER_CHAPTER
+
+
+def extract_archive(data: bytes, target: Path, limit: int = MAX_PAGES_PER_CHAPTER) -> list[str]:
     """Grava as paginas do zip na area de espera, uma entrada por vez.
 
     Nunca `extractall`: ele obedece ao caminho gravado dentro do zip, e o zip
@@ -652,8 +650,8 @@ def extract_archive(data: bytes, target: Path) -> list[str]:
             raise Invalid("o arquivo tem entrada com caminho de fuga; nada foi extraido")
         if not entries:
             raise Invalid("o arquivo nao tem nenhuma imagem")
-        if len(entries) > MAX_PAGES_PER_CHAPTER:
-            raise Invalid(f"{len(entries)} paginas; o teto e {MAX_PAGES_PER_CHAPTER}")
+        if len(entries) > limit:
+            raise Invalid(f"{len(entries)} paginas; o teto e {limit}")
 
         names = [name for _, name in entries]
         if len(set(names)) != len(names):
@@ -696,6 +694,11 @@ def _create_chapter(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple
     if not isinstance(asked, str):
         raise Invalid("chapter precisa ser texto")
 
+    # Antes de criar a pasta, e nao depois: area de espera aberta ja e disco
+    # ocupado, e recusar depois deixaria o lixo para a limpeza varrer.
+    check_new_chapter(ctx.cfg, ctx.user)
+    check_disk(ctx.base)
+
     chapter, incoming = _chapter_paths(ctx.cfg, directory.name, asked)
     if chapter.is_dir():
         return HTTPStatus.CONFLICT, {"error": f"capitulo {chapter.name!r} ja existe"}
@@ -731,7 +734,14 @@ def _put_page(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, 
             f"{len(existing)} paginas na area de espera; o teto e {MAX_PAGES_PER_CHAPTER}"
         )
 
+    # Sobrescrever uma pagina que ja subiu nao acrescenta pagina nenhuma.
+    adding = 0 if (incoming / name).exists() else 1
+    check_incoming_pages(ctx.cfg, ctx.user, incoming, adding)
+    check_upload_bytes(ctx.cfg, ctx.user, len(body))
+    check_disk(ctx.base, len(body))
+
     (incoming / name).write_bytes(body)
+    record_usage(ctx.connection, ctx.user.id, pages=adding, bytes_=len(body))
     return HTTPStatus.OK, {"file": name, "bytes": len(body)}
 
 
@@ -746,12 +756,18 @@ def _put_archive(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[in
     if not incoming.is_dir():
         raise Invalid("area de espera nao existe; crie o capitulo antes")
 
+    # O zip comprime, entao o corpo nao diz quanto vai ocupar; o que o teto de
+    # paginas garante e que o descompactado tambem cabe.
+    check_upload_bytes(ctx.cfg, ctx.user, len(body))
+    check_disk(ctx.base, len(body))
+
     try:
-        names = extract_archive(body, incoming)
+        names = extract_archive(body, incoming, limit=_page_limit(ctx.user))
     except Exception:
         shutil.rmtree(incoming, ignore_errors=True)
         raise
 
+    record_usage(ctx.connection, ctx.user.id, pages=len(names), bytes_=len(body))
     return HTTPStatus.OK, {"files": names, "count": len(names)}
 
 
@@ -795,6 +811,7 @@ def _commit_chapter(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple
         return HTTPStatus.CONFLICT, {"error": f"capitulo {chapter.name!r} ja existe"}
 
     incoming.rename(chapter)
+    record_usage(ctx.connection, ctx.user.id, chapters=1)
     return HTTPStatus.OK, {"chapter": chapter.name, "files": [path.name for path in files]}
 
 
@@ -813,38 +830,64 @@ def _create_job(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int
 
     series = str(payload.get("series", ""))
     chapter = str(payload.get("chapter", ""))
-    engine = str(payload.get("engine", "")) or ctx.cfg.translation.engine
+    engine = str(payload.get("engine", "")) or engines_for(ctx.user)[0]
     if engine not in available_engines():
         raise Invalid(f"motor {engine!r} nao existe; ha {', '.join(available_engines())}")
+    # A trava de custo. A interface do testador nem mostra `claude`, e esta linha
+    # e o que torna esconder irrelevante: a API recusa do mesmo jeito.
+    check_engine(ctx.user, engine)
 
     directory, _ = _chapter_paths(ctx.cfg, series, chapter)
     if not directory.is_dir():
         raise Invalid(f"capitulo {series}/{chapter} nao existe; promova a area de espera antes")
 
     try:
-        job = ctx.jobs.start(
-            ctx.cfg,
+        job = enqueue(
+            ctx.connection,
+            user_id=ctx.user.id,
             series=directory.parent.name,
             chapter=directory.name,
             engine=engine,
+            priority=OWNER_PRIORITY if ctx.is_owner else TESTER_PRIORITY,
             force=bool(payload.get("force")),
             dry_run=bool(payload.get("dry_run")),
         )
     except Busy as error:
         return HTTPStatus.CONFLICT, {"error": str(error)}
 
-    return HTTPStatus.ACCEPTED, {"job_id": job.id, "job": job.snapshot()}
+    return HTTPStatus.ACCEPTED, {"job_id": job.id, "job": _job_payload(ctx, job)}
+
+
+def _job_payload(ctx: Context, job) -> dict:  # noqa: ANN001 - `Job` importado tardiamente
+    """O job como a tela o ve, com o lugar na fila quando ainda espera.
+
+    "na fila" sem numero e indistinguivel de travado, e agora que a fila e
+    compartilhada isso acontece de verdade: o capitulo de 155 fatias do dono
+    segura o de 12 paginas do visitante por alguns minutos.
+    """
+    payload = job.snapshot()
+    if job.state == "pending":
+        payload["queue_position"] = queue_position(ctx.connection, job)
+    return payload
 
 
 def _list_jobs(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
-    return HTTPStatus.OK, {"jobs": [job.snapshot() for job in ctx.jobs.recent()]}
+    """So os jobs de quem esta pedindo.
+
+    Sem o filtro, a tela de progresso de um testador listaria o capitulo que outro
+    subiu - nome de serie e de capitulo inclusos. Nenhuma tela lista acervo alheio,
+    e isto tambem e uma tela."""
+    jobs = recent_jobs(ctx.connection, ctx.user.id)
+    return HTTPStatus.OK, {"jobs": [_job_payload(ctx, job) for job in jobs]}
 
 
 def _get_job(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
-    job = ctx.jobs.get(groups[0])
+    job = get_job(ctx.connection, groups[0], ctx.user.id)
     if job is None:
-        return HTTPStatus.NOT_FOUND, {"error": f"job {groups[0]!r} nao existe neste processo"}
-    return HTTPStatus.OK, job.snapshot()
+        # 404 e nao 403 pelo mesmo motivo das rotas de conteudo: 403 confirmaria
+        # que o job existe e e de outra pessoa.
+        return HTTPStatus.NOT_FOUND, {"error": f"job {groups[0]!r} nao existe"}
+    return HTTPStatus.OK, _job_payload(ctx, job)
 
 
 # ---------- conteudo do usuario ----------
@@ -1083,9 +1126,7 @@ def _open_tester_session(connection: sqlite3.Connection) -> tuple[Session, str]:
     sobrevive ao dono dela e uma linha apontando para nada, e usuario que
     sobrevive a sessao e area em disco que ninguem alcanca mais.
     """
-    expires_at = (datetime.now(UTC) + timedelta(hours=TESTER_SESSION_HOURS)).isoformat(
-        timespec="seconds"
-    )
+    expires_at = in_hours(TESTER_SESSION_HOURS)
     user = create_user(connection, kind="tester", expires_at=expires_at)
     token, session_expires = issue(connection, user.id, hours=TESTER_SESSION_HOURS)
     return Session(user=user, expires_at=session_expires), token
@@ -1109,24 +1150,20 @@ def _internal_redirect(cfg: Config, path: Path) -> str | None:
     return f"{prefix.rstrip('/')}/{relative.as_posix()}"
 
 
-def make_panel_handler(cfg: Config, jobs: JobRegistry | None = None) -> type[ReaderHandler]:
+def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
     """Handler que serve o leitor e, para a propria maquina, tambem o painel.
 
     Estende o `ReaderHandler`: pedido que nao casa com `/api/` cai no `super()` e
     e servido como arquivo, exatamente como antes.
 
-    `jobs` existe para o teste poder trocar o registro por um que nao dispara o
-    pipeline de verdade. Em producao o default e o unico caminho.
+    Nao ha registro de jobs aqui: a fila mora no banco e quem a roda e o
+    `mangatl worker`, noutro processo. Este handler so enfileira e le.
     """
-
-    registry = jobs or JobRegistry()
 
     class PanelHandler(ReaderHandler):
         def __init__(self, *args: object, **kwargs: object) -> None:
-            # A PWA e a vitrine saem da raiz do projeto. `library/` e `output/`
-            # deixaram de ser servidos por caminho, entao esta base so sobra para o
-            # leitor local - que continua sendo o uso principal desta ferramenta.
-            self.content_root = cfg.library_dir.parent
+            # Só a PWA e a vitrine saem por caminho, e as duas moram na raiz do
+            # projeto. O acervo sai pelas rotas `/u/`, que conferem a sessão.
             super().__init__(*args, directory=str(cfg.root), **kwargs)
 
         def do_GET(self) -> None:  # noqa: N802 - assinatura herdada da stdlib
@@ -1219,7 +1256,6 @@ def make_panel_handler(cfg: Config, jobs: JobRegistry | None = None) -> type[Rea
             context = Context(
                 cfg=area_config(cfg, session.user) if session else cfg,
                 base=cfg,
-                jobs=registry,
                 connection=connection,
                 session=session,
                 token=token,
@@ -1230,6 +1266,16 @@ def make_panel_handler(cfg: Config, jobs: JobRegistry | None = None) -> type[Rea
                 status, payload = route.handler(context, groups, body)
             except Invalid as error:
                 self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(error)})
+                return True
+            except QuotaExceeded as error:
+                # 429 com a mensagem que explica o teto, e nao erro generico: quem
+                # bateu na cota precisa saber qual e ela para decidir o que fazer.
+                self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": str(error)})
+                return True
+            except OutOfSpace as error:
+                # 507 e nao 429: o limite nao e desta pessoa, e tentar de novo em
+                # um minuto nao adianta.
+                self._send_json(HTTPStatus.INSUFFICIENT_STORAGE, {"error": str(error)})
                 return True
             except Exception:  # noqa: BLE001 - erro nosso vira 500, nunca stack na resposta
                 self.log_error("falha em %s %s", method, path)

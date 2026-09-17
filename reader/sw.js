@@ -19,7 +19,7 @@
 */
 
 const VERSION = "mangatl-v5";
-const SHELL = ["./", "./index.html", "./app.js", "./overlay.js", "./style.css", "./manifest.webmanifest", "./icon.svg"];
+const SHELL = ["./", "./index.html", "./app.js", "./overlay.js", "./style.css", "./manifest.webmanifest", "./icon.svg", "./termos.html"];
 /* `admin.html` e `admin.js` ficam de fora: o painel so funciona com o servidor de
    pe, e guarda-lo offline criaria uma tela que abre e nao faz nada. */
 
