@@ -1,186 +1,240 @@
 from __future__ import annotations
 
-import logging
-import threading
-import time
-
 import pytest
 
+from .accounts import create_user
 from .config import Config
-from .jobs import HISTORY, LOG_LINES, Busy, JobRegistry
+from .db import connect, migrate
+from .jobs import (
+    HISTORY,
+    OWNER_PRIORITY,
+    TESTER_PRIORITY,
+    Busy,
+    claim_next,
+    enqueue,
+    finish,
+    get,
+    get_any,
+    queue_position,
+    recent,
+    requeue_running,
+    set_progress,
+)
 from .models import Progress
-
-
-class FakeRegistry(JobRegistry):
-    """Registro que nao dispara pipeline nenhum.
-
-    O job fica preso ate o teste liberar, que e o unico jeito de observar o estado
-    `running` sem depender de quanto tempo um OCR de verdade demora.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.release = threading.Event()
-        self.blow_up = False
-
-    def _process(self, job, cfg, *, force: bool, dry_run: bool) -> None:  # noqa: ANN001
-        job.progress = Progress(phase="extract", done=1, total=2, detail="fingindo")
-        logging.getLogger("mangatl.teste").info("linha que o job coletou")
-        self.release.wait(timeout=5)
-        if self.blow_up:
-            raise RuntimeError("estourou de proposito")
 
 
 @pytest.fixture
 def cfg(tmp_path) -> Config:  # noqa: ANN001
+    migrate(Config(root=tmp_path))
     return Config(root=tmp_path)
 
 
-def wait_until(condition, timeout: float = 5.0) -> bool:  # noqa: ANN001
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if condition():
-            return True
-        time.sleep(0.01)
-    return False
+@pytest.fixture
+def people(cfg):  # noqa: ANN001
+    """Um dono e dois testadores, que e a mistura que a fila existe para arbitrar."""
+    with connect(cfg) as connection:
+        owner = create_user(connection, kind="owner", email="dono@example.com")
+        first = create_user(connection, kind="tester")
+        second = create_user(connection, kind="tester")
+    return owner, first, second
 
 
-def start(registry: JobRegistry, cfg: Config, chapter: str = "001"):  # noqa: ANN201
-    return registry.start(cfg, series="serie", chapter=chapter, engine="free")
+def _queue(connection, user, chapter="001", priority=TESTER_PRIORITY):  # noqa: ANN001
+    return enqueue(
+        connection,
+        user_id=user.id,
+        series="Obra",
+        chapter=chapter,
+        engine="free",
+        priority=priority,
+    )
 
 
-def test_reports_the_job_as_running_until_it_finishes(cfg: Config):
-    registry = FakeRegistry()
-    job = start(registry, cfg)
-
-    assert wait_until(lambda: registry.running() is not None)
-    assert job.state == "running"
-    assert job.finished_at is None
-
-    registry.release.set()
-    assert wait_until(lambda: job.state == "done")
-    assert job.finished_at is not None
-    assert registry.running() is None
+# ---------- enfileirar ----------
 
 
-def test_refuses_a_second_job_while_one_runs(cfg: Config):
-    # Dois jobs nao entregam nada mais rapido: o motor free carrega um modelo na
-    # memoria e o claude consome cota.
-    registry = FakeRegistry()
-    start(registry, cfg)
-    wait_until(lambda: registry.running() is not None)
+def test_stores_the_job_as_pending(cfg, people):
+    owner, _, _ = people
+    with connect(cfg) as connection:
+        job = _queue(connection, owner, priority=OWNER_PRIORITY)
 
-    with pytest.raises(Busy, match="ja ha um processamento"):
-        start(registry, cfg, "002")
-
-    registry.release.set()
+        assert job.state == "pending"
+        assert get(connection, job.id, owner.id).chapter == "001"
 
 
-def test_accepts_the_next_job_after_the_first_ends(cfg: Config):
-    registry = FakeRegistry()
-    first = start(registry, cfg)
-    registry.release.set()
-    wait_until(lambda: first.state == "done")
+def test_refuses_a_second_job_for_the_same_person(cfg, people):
+    _, tester, _ = people
+    with connect(cfg) as connection:
+        _queue(connection, tester, "001")
 
-    registry.release.clear()
-    second = start(registry, cfg, "002")
-    registry.release.set()
-
-    assert wait_until(lambda: second.state == "done")
-    assert first.id != second.id
+        with pytest.raises(Busy):
+            _queue(connection, tester, "002")
 
 
-def test_keeps_the_failure_as_the_result_of_the_job(cfg: Config):
-    registry = FakeRegistry()
-    registry.blow_up = True
-    job = start(registry, cfg)
-    registry.release.set()
+def test_lets_two_people_queue_at_the_same_time(cfg, people):
+    _, first, second = people
+    with connect(cfg) as connection:
+        _queue(connection, first)
+        _queue(connection, second)
 
-    assert wait_until(lambda: job.state == "failed")
-    assert job.error is not None
-    assert "estourou de proposito" in job.error
-    assert job.finished_at is not None
+        assert len(recent(connection, first.id)) == 1
+        assert len(recent(connection, second.id)) == 1
 
 
-def test_collects_the_log_lines_of_the_running_job(cfg: Config):
-    registry = FakeRegistry()
-    job = start(registry, cfg)
-    registry.release.set()
-    wait_until(lambda: job.state == "done")
-
-    assert any("linha que o job coletou" in line for line in job.log)
+# ---------- ordem da fila ----------
 
 
-def test_stops_collecting_when_the_job_ends(cfg: Config):
-    # Handler esquecido no logger faria o job seguinte escrever tambem no anterior.
-    registry = FakeRegistry()
-    job = start(registry, cfg)
-    registry.release.set()
-    wait_until(lambda: job.state == "done")
-    before = len(job.log)
+def test_runs_the_owner_before_the_tester(cfg, people):
+    """O dono nao espera a curiosidade de um visitante terminar."""
+    owner, tester, _ = people
+    with connect(cfg) as connection:
+        _queue(connection, tester)
+        _queue(connection, owner, priority=OWNER_PRIORITY)
 
-    logging.getLogger("mangatl.teste").info("depois que acabou")
-
-    assert len(job.log) == before
+        assert claim_next(connection).user_id == owner.id
 
 
-def test_keeps_only_the_last_lines(cfg: Config):
-    registry = FakeRegistry()
-    job = start(registry, cfg)
-    for index in range(LOG_LINES + 50):
-        job.log.append(str(index))
-    registry.release.set()
+def test_runs_the_older_first_among_equals(cfg, people):
+    _, first, second = people
+    with connect(cfg) as connection:
+        older = _queue(connection, first)
+        _queue(connection, second)
 
-    assert len(job.log) == LOG_LINES
-    assert job.log[-1] == str(LOG_LINES + 49)
+        assert claim_next(connection).id == older.id
 
 
-def test_remembers_the_most_recent_jobs_newest_first(cfg: Config):
-    registry = FakeRegistry()
-    registry.release.set()
-    ids = []
-    for index in range(3):
-        job = start(registry, cfg, f"00{index}")
-        wait_until(lambda job=job: job.state == "done")
-        ids.append(job.id)
+def test_never_runs_two_jobs_of_the_same_person(cfg, people):
+    """A trava que impede uma pessoa de ocupar a fila inteira."""
+    _, tester, other = people
+    with connect(cfg) as connection:
+        mine = _queue(connection, tester)
+        claim_next(connection)
+        finish(connection, mine.id, state="done")
+        _queue(connection, tester, "002")
+        _queue(connection, other)
 
-    assert [job.id for job in registry.recent()] == list(reversed(ids))
+        claimed = claim_next(connection)
+        second = claim_next(connection)
 
-
-def test_forgets_the_oldest_job_when_the_history_is_full(cfg: Config):
-    registry = FakeRegistry()
-    registry.release.set()
-    first = start(registry, cfg)
-    wait_until(lambda: first.state == "done")
-    for index in range(HISTORY):
-        job = start(registry, cfg, f"x{index}")
-        wait_until(lambda job=job: job.state == "done")
-
-    assert registry.get(first.id) is None
-    assert len(registry.recent()) == HISTORY
+    # Os dois rodam, mas nunca dois do mesmo ao mesmo tempo.
+    assert {claimed.user_id, second.user_id} == {tester.id, other.id}
 
 
-def test_serializes_without_leaking_the_live_log(cfg: Config):
-    registry = FakeRegistry()
-    job = start(registry, cfg)
-    registry.release.set()
-    wait_until(lambda: job.state == "done")
+def test_claims_nothing_when_the_queue_is_empty(cfg):
+    with connect(cfg) as connection:
+        assert claim_next(connection) is None
 
-    snapshot = job.snapshot()
-    job.log.append("depois do retrato")
 
-    assert isinstance(snapshot["log"], list)
-    assert "depois do retrato" not in snapshot["log"]
-    assert snapshot["progress"]["phase"] == "extract"
-    assert set(snapshot) == {
-        "id",
-        "series",
-        "chapter",
-        "engine",
-        "state",
-        "progress",
-        "log",
-        "started_at",
-        "finished_at",
-        "error",
-    }
+def test_reports_how_many_are_ahead(cfg, people):
+    owner, tester, other = people
+    with connect(cfg) as connection:
+        mine = _queue(connection, tester)
+        _queue(connection, owner, priority=OWNER_PRIORITY)
+        _queue(connection, other)
+
+        assert queue_position(connection, get_any(connection, mine.id)) == 1
+
+
+# ---------- sobreviver ao reinicio ----------
+
+
+def test_puts_running_jobs_back_in_the_queue_on_boot(cfg, people):
+    """Ninguem estava rodando durante o reinicio; um job preso em `running` e uma
+    tela que nunca sai do lugar."""
+    _, tester, _ = people
+    with connect(cfg) as connection:
+        job = _queue(connection, tester)
+        claim_next(connection)
+        assert get_any(connection, job.id).state == "running"
+
+        assert requeue_running(connection) == 1
+
+        back = get_any(connection, job.id)
+        assert back.state == "pending"
+        assert back.started_at is None
+
+
+def test_keeps_the_options_across_a_restart(cfg, people):
+    """`--force` perdido no reinicio faria o job voltar reaproveitando o OCR que
+    ele existia para refazer."""
+    _, tester, _ = people
+    with connect(cfg) as connection:
+        job = enqueue(
+            connection,
+            user_id=tester.id,
+            series="Obra",
+            chapter="001",
+            engine="free",
+            priority=TESTER_PRIORITY,
+            force=True,
+            dry_run=True,
+        )
+        claim_next(connection)
+        requeue_running(connection)
+
+        assert get_any(connection, job.id).options == {"force": True, "dry_run": True}
+
+
+# ---------- progresso e fim ----------
+
+
+def test_keeps_the_progress_and_the_last_log_lines(cfg, people):
+    _, tester, _ = people
+    with connect(cfg) as connection:
+        job = _queue(connection, tester)
+        set_progress(
+            connection,
+            job.id,
+            Progress(phase="extract", done=3, total=12, detail="p0003.jpg"),
+            ("INFO uma linha", "INFO outra"),
+        )
+
+        stored = get_any(connection, job.id)
+
+    assert stored.progress.done == 3
+    assert stored.progress.detail == "p0003.jpg"
+    assert stored.log == ("INFO uma linha", "INFO outra")
+
+
+def test_records_the_failure_as_the_result_of_the_job(cfg, people):
+    _, tester, _ = people
+    with connect(cfg) as connection:
+        job = _queue(connection, tester)
+        finish(connection, job.id, state="failed", error="RuntimeError: estourou")
+
+        stored = get_any(connection, job.id)
+
+    assert stored.state == "failed"
+    assert stored.error == "RuntimeError: estourou"
+    assert stored.finished_at is not None
+
+
+# ---------- isolamento ----------
+
+
+def test_never_hands_a_job_to_someone_else(cfg, people):
+    _, tester, other = people
+    with connect(cfg) as connection:
+        job = _queue(connection, tester)
+
+        assert get(connection, job.id, other.id) is None
+        assert recent(connection, other.id) == []
+
+
+def test_keeps_the_user_id_out_of_the_snapshot(cfg, people):
+    """Devolver o id seria oferecer um valor para alguem tentar numa URL."""
+    _, tester, _ = people
+    with connect(cfg) as connection:
+        job = _queue(connection, tester)
+
+    assert "user_id" not in job.snapshot()
+
+
+def test_shows_only_the_most_recent_jobs(cfg, people):
+    _, tester, _ = people
+    with connect(cfg) as connection:
+        for number in range(HISTORY + 5):
+            job = _queue(connection, tester, f"{number:03d}")
+            finish(connection, job.id, state="done")
+
+        assert len(recent(connection, tester.id)) == HISTORY

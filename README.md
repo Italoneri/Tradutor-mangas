@@ -16,14 +16,48 @@ só o segundo — o OCR não roda de novo.
 
 ---
 
-## Por que WSL
+## Rodar
 
-O Smart App Control desta máquina Windows está em modo *enforced* e bloqueia DLLs
-nativas sem reputação. Na prática isso derruba todo wheel Python com extensão em C:
-`numpy`, `Pillow`, `pydantic`, `opencv` e `ctranslate2` — a base inteira do pipeline.
+O jeito curto, em qualquer sistema:
 
-Rodar dentro do WSL resolve sem desligar o Smart App Control, que é uma mudança
-irreversível no Windows.
+```bash
+cp .env.example .env          # preencha OWNER_EMAIL, OWNER_PASSWORD e, se tiver, a chave
+docker compose --profile local up -d app worker
+```
+
+O leitor fica em `http://localhost:8000/reader/`. O `worker` é um processo separado
+que tira job da fila e roda o pipeline — sem ele o upload funciona e nada traduz.
+
+### Por que contêiner e não WSL
+
+O WSL existia aqui por um motivo local: o Smart App Control desta máquina Windows
+está em modo *enforced* e bloqueia DLLs nativas sem reputação, o que derruba todo
+wheel Python com extensão em C — `numpy`, `Pillow`, `pydantic`, `opencv`,
+`ctranslate2`, a base inteira do pipeline.
+
+O contêiner resolve o mesmo problema sem ser específico desta máquina: o pipeline
+passa a rodar em Linux de verdade em qualquer lugar. **O caminho por WSL continua
+funcionando** e está descrito abaixo, mas é o detalhe histórico que ele é.
+
+### Requisitos reais, medidos
+
+Medidos num capítulo real de 155 fatias, dentro do contêiner, com o backend
+`rtdetr` e o motor `free`:
+
+| | medido |
+|---|---|
+| RAM em repouso (`mangatl serve`) | **40 MB** |
+| RAM no pico (extração + tradução) | **575 MB** |
+| Capítulo inteiro, 155 fatias | **216 s** |
+| Por fatia | **~1,4 s** |
+| Imagem construída | 4,6 GB |
+
+Dois avisos que esses números carregam:
+
+- **o wheel CUDA do torch é inútil sem GPU.** São ~2,5 GB baixados para nada. O
+  `Dockerfile` instala pelo índice `cpu` de propósito, antes do resto;
+- **os 575 MB são o pico do worker, não o do servidor.** Quem atende HTTP não
+  carrega torch; é por isso que são dois processos.
 
 ## Onde o projeto mora
 
@@ -63,7 +97,7 @@ máquina; se ainda estiver lá, apague com `rm -rf ~/traducao`. O venv em
 `~/.venvs/mangatl` já aponta para o caminho `/mnt/c` em modo editável, que é o
 arranjo correto.
 
-## Setup
+## Setup por WSL (o caminho antigo)
 
 ```bash
 # 1. No PowerShell do Windows, uma vez:
@@ -405,48 +439,119 @@ node --test reader/overlay.test.js
 
 ## Ler no celular
 
-**Sirva pelo Windows, não pelo WSL.** O `mangatl serve` roda, mas o IP que ele
-imprime é o endereço interno do WSL (`172.x.x.x`), que o celular não alcança. Como os
-arquivos estão em `/mnt/c`, o `scripts/serve.py` serve do lado do Windows — e ele é só
-stdlib, então roda no python do sistema, sem o venv, e o Smart App Control não o bloqueia:
+O contêiner escuta em `0.0.0.0`, então o celular alcança o PC direto:
 
-```powershell
-python scripts\serve.py 8000
+```bash
+docker compose --profile local up -d app worker
 ```
 
-**Não use `python -m http.server --directory <raiz>`.** Ele publica a raiz do projeto
-inteira em `0.0.0.0`, e a raiz contém o `.env` — qualquer um no mesmo Wi-Fi baixa a sua
-chave da Anthropic em `http://<ip-do-pc>:8000/.env`. O `scripts/serve.py` e o
-`mangatl serve` usam o mesmo filtro (`src/mangatl/serving.py`): só `reader/`, `output/`
-e `library/` saem na rede, e a raiz redireciona para `/reader/` em vez de se listar.
+Abra `http://<ip-do-pc>:8000/reader/` no celular (`ipconfig` mostra o IP) e use
+"Adicionar à tela de início". O service worker guarda as páginas da vitrine, que é
+imutável; o acervo de conta não entra em cache, e isso é deliberado — cache é por
+origem e não por conta, e uma página guardada numa sessão sairia servida em outra.
 
-Depois abra `http://<ip-do-pc>:8000/reader/` no celular (`ipconfig` mostra o IP) e use
-"Adicionar à tela de início". O service worker guarda as páginas e as traduções do
-capítulo visitado, então ele reabre sem rede depois da primeira visita.
+**O `scripts/serve.py` foi apagado, e o motivo importa.** Ele era um servidor de
+arquivos sem autorização: uma lista de pastas permitidas decidia o que saía na
+rede, sem nunca perguntar *quem* estava pedindo. Isso era aceitável enquanto o
+programa rodava na sua máquina, para você — e deixa de ser no instante em que
+alguém além de você tem uma conta aqui, porque uma tela de login na frente de um
+servidor de arquivos aberto não protege nada: a senha é pedida na tela e os
+arquivos continuam saindo por URL direta. O acervo agora sai pelas rotas `/u/`,
+que conferem a sessão antes de mandar um byte.
 
-`mangatl serve` continua útil para testar no próprio PC, em
-`http://localhost:8000/reader/`.
+Ele também existia por um problema que o contêiner resolveu: o IP que o
+`mangatl serve` imprimia dentro do WSL era o endereço interno (`172.x.x.x`), que o
+celular não enxerga. Num contêiner isso não acontece.
+
+---
+
+## Hospedar para outras pessoas
+
+A instância pública tem dois papéis, e eles não são simétricos:
+
+| | **dono** | **testador** |
+|---|---|---|
+| Identidade | e-mail e senha | sessão anônima, sem cadastro |
+| Biblioteca | persistente | expira em 48 h |
+| Motor | `free` e `claude` | **só `free`** |
+| Cota | nenhuma | 12 páginas, 2 capítulos, 40 MB |
+| Painel | completo | só subir e traduzir o próprio |
+
+```bash
+cp .env.example .env               # OWNER_EMAIL, OWNER_PASSWORD, ACME_EMAIL
+$EDITOR Caddyfile                  # troque tinta.example.com pelo seu domínio
+docker compose --profile public up -d
+```
+
+**Por que a instância pública é limitada.** O motor `claude` está desligado lá
+porque a chave da API seria a do dono — cada tradução de um visitante sairia da
+conta dele. Quem vê só o `free` está vendo metade da ferramenta: o `free` traduz
+literal e não enxerga a página. Para o resultado bom, rode na sua máquina com a
+sua chave; é o que a seção **Rodar** acima descreve, e custa ~$0,15 por capítulo
+de 40 páginas.
+
+**O que o projeto não é.** É uma ferramenta de tradução para uso próprio. Não é um
+acervo e não é um serviço de distribuição de capítulos: nenhuma tela lista o que
+outra pessoa subiu, upload de testador expira e some sozinho, e o material da
+vitrine pública é escolhido e copiado à mão pelo dono — conteúdo de usuário nunca
+vira vitrine, nem por botão.
+
+### A vitrine
+
+Dois capítulos que qualquer visitante lê sem criar nada:
+
+```bash
+mangatl build-demo "Nome da Obra" 001 002
+```
+
+Roda na sua máquina, pega capítulos já processados da sua área e copia para
+`public/demo/`, que viaja dentro da imagem. O servidor hospedado nunca escreve ali.
+
+O que vai nesses capítulos é uma decisão de conteúdo, não de código: eles ficam
+publicados na internet aberta, sem login. Domínio público, licença livre ou arte
+sua — e a escolha fica registrada aqui. Se o material for licenciado, mantenha a
+vitrine fora do ar e mostre a ferramenta por vídeo; a engenharia aparece igual.
+
+> **Pendente:** os dois capítulos da vitrine ainda não foram escolhidos, e o
+> endereço de contato para pedidos de remoção em `reader/termos.html` ainda é um
+> `contato@exemplo.com` de exemplo.
 
 ---
 
 ## Estado atual
 
-Fase 1 completa e verificada em execução: 164 testes passando, extração ponta a ponta
-(detecção → ordem de leitura → OCR → `extract.json`), tradução pelo motor `free`
-gerando `chapter.free.json`, reprocessamento idempotente, e o leitor servindo todos
-os arquivos.
+478 testes passando. O pipeline está completo ponta a ponta: detecção → ordem de
+leitura → OCR → `extract.json` → motor → `chapter.<motor>.json` → leitor.
 
 A detecção é o `rtdetr` por padrão. Medido no capítulo `manhwa/001` contra a
 heurística: letras de diálogo 2427 → 2774, páginas com diálogo 61 → 71, e nenhuma
 regressão real. Os blocos caem de 123 para 88 porque a heurística picava um balão
 por linha de texto — 19.7 letras por bloco viraram 31.5.
 
-O motor `claude` tem o formato de request e o parsing cobertos por testes com cliente
-dublê, mas ainda não foi exercitado contra a API real — falta a chave.
+O motor `claude` tem o formato de request e o parsing cobertos por testes com
+cliente dublê, mas ainda não foi exercitado contra a API real — falta a chave.
 
-Fase 2 parcial: o texto traduzido já é escrito dentro do balão, sobre a tira
-contínua, verificado em execução no capítulo de teste (88 falas posicionadas, 16
-testes de geometria passando). Falta o inpainting — a caixa é branca e retangular,
-e apaga o contorno do balão junto com o texto original. O `kind` já chega ao
-`chapter.json` (seis falas marcadas `free` no capítulo de teste), que é o que vai
-permitir parar de pintar caixa branca sobre SFX.
+### O que a hospedagem acrescentou
+
+- contêiner: o pipeline roda em Linux de verdade, em qualquer máquina;
+- contas: `data/users/<id>/`, com duas trancas independentes contra vazamento
+  entre áreas — nome validado na borda, caminho conferido depois de resolvido;
+- `library/` e `output/` deixaram de sair por caminho; o acervo sai por `/u/`,
+  depois de conferida a sessão;
+- fila no banco, worker em processo separado, `running` volta a `pending` na
+  subida;
+- cota de testador e teto global de disco;
+- vitrine pública, estática e imutável, servida sem cookie.
+
+A bateria de isolamento (`src/mangatl/isolation_test.py`) roda as sete checagens
+que decidem se o servidor guarda o acervo de cada um: acervo alheio dá 404, caminho
+direto dá 404, fuga de caminho dá 404 nas cinco formas, sem cookie dá 401, sessão
+vencida dá 401, testador pedindo `claude` dá 429 e rota de dono dá 403.
+
+### Ainda não feito
+
+- **rodar a bateria contra o domínio público, de outra rede.** Ela passa contra o
+  servidor local; o plano pede a mesma bateria contra o endereço real, e essa
+  execução só é possível depois do deploy;
+- escolher o conteúdo da vitrine e preencher o contato nos termos;
+- medir a entrega por `X-Accel-Redirect` com quatro leitores simultâneos.

@@ -1,43 +1,95 @@
-# Um servico so em producao. A fila em processo separado entra na Fase 4 e o
-# Caddy na frente entra na Fase 5.
+# Tres processos com ciclos de vida diferentes, e e por isso que sao tres:
+#
+#   app     atende HTTP. Precisa responder rapido e nunca segurar um nucleo.
+#   worker  roda o pipeline. Segura um nucleo por minutos, e reiniciar o `app`
+#           nao pode matar o capitulo que ele esta traduzindo no meio.
+#   caddy   HTTPS, limites de corpo, timeouts e a entrega dos bytes.
+#
+# `docker compose up -d` sobe os tres. O `caddy` exige um dominio configurado no
+# Caddyfile; para rodar so na sua maquina, use o perfil `local`:
+#
+#     docker compose --profile local up -d app worker
+
+x-app: &app
+  build: .
+  image: mangatl:dev
+  environment:
+    # A chave nunca entra na imagem. Ela chega por aqui, em tempo de execucao.
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    # Lidos uma vez, na subida, e gravados como hash. Sem eles o painel fica sem
+    # dono e a instancia serve so a vitrine.
+    OWNER_EMAIL: ${OWNER_EMAIL:-}
+    OWNER_PASSWORD: ${OWNER_PASSWORD:-}
+    # Desligue so em `http://` local: um cookie `Secure` nunca volta por http, e
+    # a sessao pareceria nao existir.
+    COOKIE_SECURE: ${COOKIE_SECURE:-1}
+    MAX_TOTAL_DISK_BYTES: ${MAX_TOTAL_DISK_BYTES:-}
+  volumes:
+    # O acervo e o banco. E o unico diretorio que precisa de backup.
+    - ./data:/app/data
+    # Volumes nomeados, nao bind: um volume nomeado nasce com o conteudo que o
+    # diretorio tem na imagem, entao o modelo e o pacote de idioma ja baixados na
+    # construcao continuam la, e um download futuro sobrevive ao rebuild.
+    - hf-cache:/opt/huggingface
+    - argos-data:/opt/argos
+  restart: unless-stopped
 
 services:
   app:
-    build: .
-    image: mangatl:dev
+    <<: *app
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OWNER_EMAIL: ${OWNER_EMAIL:-}
+      OWNER_PASSWORD: ${OWNER_PASSWORD:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-1}
+      MAX_TOTAL_DISK_BYTES: ${MAX_TOTAL_DISK_BYTES:-}
+      # O prefixo que o Caddy serve como `internal`. Definido, o app autoriza e
+      # devolve o caminho; os bytes saem pelo proxy e o worker Python volta a
+      # atender na hora.
+      INTERNAL_REDIRECT_PREFIX: /_internal
+    expose:
+      - "8000"
+    # Publicada so no loopback: quem fala com a internet e o Caddy.
     ports:
       - "127.0.0.1:8000:8000"
-    environment:
-      # O motor `claude` so funciona se a chave vier de fora. Ausente, o `free`
-      # continua funcionando e o `doctor` diz o que falta.
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-    volumes:
-      # O acervo e o banco. E o unico diretorio que precisa de backup.
-      - ./data:/app/data
-      # Enquanto a Fase 1 nao move o acervo para dentro de data/, estes dois
-      # continuam sendo onde o capitulo vive.
-      - ./library:/app/library
-      - ./output:/app/output
-      # Volumes nomeados, nao bind: um volume nomeado nasce com o conteudo que o
-      # diretorio tem na imagem, entao o modelo e o pacote de idioma ja baixados
-      # na construcao continuam la, e um download futuro sobrevive ao rebuild.
-      - hf-cache:/opt/huggingface
-      - argos-data:/opt/argos
-    # O pico medido num capitulo de 155 fatias foi 575MB; a folga aqui cobre a
-    # fila da Fase 4 e o torch, que pede alguns GB so para carregar.
+    command: ["mangatl", "serve", "--port", "8000"]
+    # O `app` nao carrega torch: ele so enfileira e le.
+    mem_limit: 1g
+
+  worker:
+    <<: *app
+    command: ["mangatl", "worker"]
+    # O pico medido num capitulo de 155 fatias foi 575MB. A folga cobre o torch,
+    # que pede alguns GB so para carregar o modelo.
     mem_limit: 6g
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["public"]
+    depends_on: [app]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Somente leitura: o proxy entrega bytes, nunca escreve no acervo.
+      - ./data:/app/data:ro
+      - ./public:/app/public:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
 
   # So para desenvolver: monta o codigo de fora por cima do que a imagem tem,
   # entao `docker compose run --rm dev python -m pytest` roda o que voce acabou
   # de editar. Reconstruir a imagem a cada edicao rebaixaria o modelo de 200MB,
-  # que e copiado na construcao de proposito. O `profiles` mantem o
-  # `docker compose up` sem este servico.
+  # que e copiado na construcao de proposito.
   dev:
-    build: .
-    image: mangatl:dev
+    <<: *app
     profiles: ["dev"]
-    environment:
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    restart: "no"
     volumes:
       - ./src:/app/src
       - ./reader:/app/reader
@@ -53,3 +105,5 @@ services:
 volumes:
   hf-cache:
   argos-data:
+  caddy-data:
+  caddy-config:

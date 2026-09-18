@@ -488,6 +488,13 @@ body.hide-overlay .bubble { display: none; }
 
 .check { display: inline-flex; align-items: center; gap: var(--space-2); font-size: 13px; color: var(--n-500); }
 .hint { margin: 0; font-size: 12.5px; color: var(--n-600); }
+
+/* Entrar como dono fica dobrado: e o caminho de uma pessoa so, e o do testador -
+   que e quem chega sem saber nada - precisa ser o primeiro que se ve. */
+.owner-login { margin-top: var(--space-6); border-top: 1px solid var(--line); padding-top: var(--space-4); }
+.owner-login summary { cursor: pointer; font-size: 13px; color: var(--n-500); }
+.owner-login summary:hover { color: var(--ink); }
+.owner-login .row { margin-top: var(--space-4); }
 .card code { background: var(--n-900); padding: 1px 5px; border-radius: var(--radius-sm); font-size: 12px; }
 
 /* O input de arquivo nativo nao aceita estilo; o label vira o botao e o input

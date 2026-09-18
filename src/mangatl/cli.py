@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import socket
 import subprocess
@@ -11,8 +12,16 @@ from pathlib import Path
 import typer
 from dotenv import load_dotenv
 
-from .accounts import MigrationRefused, migrate_to_accounts, owner_config
+from .accounts import (
+    MigrationRefused,
+    ensure_owner,
+    migrate_to_accounts,
+    owner_config,
+    password_hash_of,
+    sole_owner,
+)
 from .config import Config, load_config
+from .db import connect, migrate, transaction
 from .demo import DemoError, build_demo, demo_root
 from .detectors.base import (
     DetectorUnavailableError,
@@ -25,6 +34,7 @@ from .panel import serve_panel
 from .pipeline import ChapterNotFoundError, extract_chapter, translate_chapter
 from .slicing import is_tall, slice_stream
 from .store import IMAGE_SUFFIXES, build_library, discover_chapters, save_library
+from .worker import run_forever
 
 app = typer.Typer(add_completion=False, help="Traduz capitulos de manga/mahua EN->PT e serve um leitor web.")
 
@@ -377,11 +387,44 @@ def _lan_addresses() -> list[str]:
     return sorted(address for address in addresses if not address.startswith("127."))
 
 
+def _prepare_server(cfg: Config) -> None:
+    """Esquema do banco e dono, antes de abrir a porta.
+
+    Migrar em toda subida em vez de por comando separado: conferir uma tabela de
+    quatro linhas nao custa nada, e a alternativa e alguem subir com o esquema
+    velho e descobrir na primeira escrita.
+
+    `OWNER_EMAIL` e `OWNER_PASSWORD` sao lidos aqui e so aqui. A senha vira hash
+    na hora; nem o banco nem o log veem o valor.
+    """
+    migrate(cfg)
+    email, password = os.environ.get("OWNER_EMAIL"), os.environ.get("OWNER_PASSWORD")
+    with connect(cfg) as connection, transaction(connection):
+        try:
+            owner = ensure_owner(connection, email, password)
+        except ValueError as error:
+            typer.secho(str(error), fg=typer.colors.RED)
+            raise typer.Exit(code=2) from error
+        existing = owner or sole_owner(connection)
+        has_password = existing is not None and password_hash_of(connection, existing.id)
+
+    if not has_password:
+        typer.secho(
+            "sem dono com senha: defina OWNER_EMAIL e OWNER_PASSWORD para entrar no painel.\n"
+            "      A vitrine publica continua funcionando sem isso.",
+            fg=typer.colors.YELLOW,
+        )
+
+
 @app.command()
 def serve(port: int = typer.Option(8000, "--port", "-p")) -> None:
-    """Sobe o leitor web servindo reader/, output/ e library/ (imagens + JSONs + PWA)."""
-    cfg = _load_owner()
-    save_library(cfg, build_library(cfg))
+    """Sobe o leitor web: a vitrine para qualquer um, o acervo para quem tem sessao."""
+    cfg = _load()
+    _prepare_server(cfg)
+
+    owner = owner_config(cfg)
+    if owner.library_dir.is_dir():
+        save_library(owner, build_library(owner))
 
     typer.secho(f"leitor:   http://localhost:{port}/reader/", fg=typer.colors.GREEN)
     for address in _lan_addresses():
@@ -439,6 +482,21 @@ def _report_detector(cfg: Config) -> None:
         isinstance(try_to_load_from_cache(cfg.detect.rtdetr.model_id, "config.json"), str),
         "baixa sozinho na primeira extracao (~200MB)",
     )
+
+
+@app.command()
+def worker(verbose: bool = typer.Option(False, "--verbose", "-v")) -> None:
+    """Roda a fila de processamento. Processo separado do que atende HTTP.
+
+    O pipeline segura um nucleo por minutos; no mesmo processo do servidor, isso e
+    a tela de progresso congelando junto com o trabalho que ela mostra.
+    """
+    _configure_logging(verbose)
+    cfg = _load()
+    migrate(cfg)
+    typer.secho("worker de pe; Ctrl+C para parar", fg=typer.colors.GREEN)
+    run_forever(cfg)
+    typer.echo("parado")
 
 
 @app.command()

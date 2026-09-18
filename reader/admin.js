@@ -2,7 +2,11 @@
 
    Mesmo padrao do app.js - modulo ES nativo, sem framework e sem build - e a
    mesma folha de estilo. O que muda e que aqui tudo escreve: cada acao e uma
-   chamada a `/api/`, que so responde para a propria maquina.
+   chamada a `/api/`, que confere a sessao antes de tocar no disco.
+
+   Duas telas no mesmo documento: a de entrar, para quem nao tem sessao de dono, e
+   o painel. Quem sobe uma amostra sem conta nenhuma nao ve a de entrar - a sessao
+   anonima nasce sozinha no primeiro upload.
 
    O que esta tela deliberadamente nao faz: apagar obra, apagar capitulo,
    renomear, reordenar pagina, editar traducao. Cada um e destrutivo ou grande, e
@@ -24,6 +28,14 @@ const ARCHIVE_SUFFIXES = [".zip", ".cbz"];
 const el = {
   flash: document.getElementById("flash"),
   health: document.getElementById("health"),
+
+  login: document.getElementById("login"),
+  loginForm: document.getElementById("login-form"),
+  loginEmail: document.getElementById("login-email"),
+  loginPassword: document.getElementById("login-password"),
+  enterTester: document.getElementById("enter-tester"),
+  signOut: document.getElementById("sign-out"),
+  panel: document.getElementById("panel"),
 
   seriesList: document.getElementById("series-list"),
   toggleNewSeries: document.getElementById("toggle-new-series"),
@@ -73,6 +85,8 @@ const el = {
 
 const state = {
   health: null,
+  /** Quem esta usando o painel. `{authenticated, kind, engines}`, como o back manda. */
+  session: { authenticated: false, kind: null, engines: [] },
   series: [],
   selected: null,
   /** Arquivos escolhidos e ainda nao enviados, com o resultado de cada um. */
@@ -89,10 +103,15 @@ const state = {
  * mostrar o motivo; engolir isso e trocar "capitulo 001 ja existe" por "falhou".
  */
 async function api(path, { method = "GET", body = null, raw = false } = {}) {
-  const options = { method, cache: "no-store" };
+  /* `X-Requested-With` em toda chamada, e nao so nas que escrevem: o servidor
+     exige o cabecalho nas rotas de escrita, e um formulario HTML de outro site
+     nao consegue mandar cabecalho nenhum. Junto com a conferencia de origem no
+     back, e o que fecha o CSRF que `SameSite=Lax` sozinho deixa passar. */
+  const headers = { "X-Requested-With": "fetch" };
+  const options = { method, cache: "no-store", credentials: "same-origin", headers };
   if (body !== null) {
     options.body = raw ? body : JSON.stringify(body);
-    if (!raw) options.headers = { "Content-Type": "application/json" };
+    if (!raw) headers["Content-Type"] = "application/json";
   }
 
   const response = await fetch(`${API}${path}`, options);
@@ -372,9 +391,21 @@ function openJob(chapter) {
   el.jobCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
+/* Estados que ainda vao mudar sozinhos. A fila e compartilhada agora: um capítulo
+   pode ficar minutos em `pending` esperando o que está na frente terminar. */
+const LIVE_STATES = ["pending", "running"];
+
+function queueLabel(job) {
+  if (job.state !== "pending") return job.state;
+  /* "na fila" sem número é indistinguível de travado. */
+  const ahead = job.queue_position;
+  if (!ahead) return "na fila, é o próximo";
+  return `na fila, ${ahead} na frente`;
+}
+
 function renderJob(job) {
   el.jobView.hidden = false;
-  el.jobState.textContent = job.state;
+  el.jobState.textContent = queueLabel(job);
   el.jobPhase.textContent = job.progress.total
     ? `${job.progress.phase} ${job.progress.done}/${job.progress.total} · ${job.progress.detail}`
     : `${job.progress.phase} · ${job.progress.detail}`;
@@ -383,7 +414,7 @@ function renderJob(job) {
   el.jobLog.textContent = job.log.join("\n");
   el.jobLog.scrollTop = el.jobLog.scrollHeight;
 
-  el.jobStart.disabled = job.state === "running";
+  el.jobStart.disabled = LIVE_STATES.includes(job.state);
   if (job.state === "failed") flash(job.error || "o processamento falhou");
   if (job.state === "done") {
     const href = `index.html?series=${encodeURIComponent(job.series)}&chapter=${encodeURIComponent(job.chapter)}`;
@@ -400,7 +431,7 @@ function pollJob(id) {
     const job = await api(`/jobs/${id}`).catch(() => null);
     if (!job) return;
     renderJob(job);
-    if (job.state !== "running") {
+    if (!LIVE_STATES.includes(job.state)) {
       clearInterval(state.polling);
       state.polling = null;
       loadSeries().catch(() => {});
@@ -408,11 +439,11 @@ function pollJob(id) {
   }, 1000);
 }
 
-/** Reencontra o que ficou rodando enquanto a aba estava fechada.
+/** Reencontra o que ficou na fila enquanto a aba estava fechada.
  *
- * O job vive na thread do servidor e nao na pagina: fechar a aba nao para nada, e
- * reabrir sem procurar deixaria a tela fingindo que nao ha nada acontecendo - com
- * o botao de traduzir liberado para disparar um segundo que so tomaria 409.
+ * O job vive no banco e quem o roda e outro processo: fechar a aba nao para nada,
+ * e reabrir sem procurar deixaria a tela fingindo que nao ha nada acontecendo -
+ * com o botao de traduzir liberado para disparar um segundo que so tomaria 409.
  */
 async function restoreJob() {
   const payload = await api("/jobs").catch(() => null);
@@ -424,7 +455,7 @@ async function restoreJob() {
   }
   openJob(job.chapter);
   renderJob(job);
-  if (job.state === "running") pollJob(job.id);
+  if (LIVE_STATES.includes(job.state)) pollJob(job.id);
 }
 
 async function startJob() {
@@ -572,6 +603,76 @@ function wire() {
     event.preventDefault();
     guard(startJob);
   };
+
+  el.loginForm.onsubmit = signIn;
+  el.signOut.onclick = () => guard(signOut);
+
+  /* Entrar como testador nao chama rota nenhuma: a sessao nasce no servidor na
+     primeira escrita, e criar uma aqui daria area em disco para quem so clicou. */
+  el.enterTester.onclick = () => {
+    state.session = { authenticated: false, kind: "tester", engines: ["free"] };
+    guard(enterPanel);
+  };
+}
+
+/* Quais motores esta conta pode escolher.
+ *
+ * A lista vem do servidor, e nao do front: para o testador ela nunca traz
+ * `claude`, porque a chave da API e do dono e a conta chegaria para ele. Esconder
+ * no front e cortesia; quem recusa de verdade e a rota - as duas coisas juntas.
+ */
+function renderEngines() {
+  const engines = state.session.engines || [];
+  el.jobEngine.innerHTML = engines
+    .map((name) => {
+      const blocked = name === "claude" && !state.health.has_api_key;
+      return `<option value="${escapeHtml(name)}"${blocked ? " disabled" : ""}>${escapeHtml(name)}</option>`;
+    })
+    .join("");
+
+  const owner = state.session.kind === "owner";
+  if (owner && !state.health.has_api_key) {
+    el.engineNote.hidden = false;
+    el.engineNote.textContent =
+      "O motor claude está desligado porque não há ANTHROPIC_API_KEY no ambiente do servidor. Copie .env.example para .env, preencha a chave e reinicie.";
+  } else if (!owner) {
+    el.engineNote.hidden = false;
+    el.engineNote.textContent =
+      "Esta é uma sessão de teste: só o motor free, até 12 páginas por capítulo, e o que você subir expira em 48 horas.";
+  }
+}
+
+async function signIn(event) {
+  event.preventDefault();
+  clearFlash();
+  try {
+    state.session = await api("/login", {
+      method: "POST",
+      body: { email: el.loginEmail.value.trim(), password: el.loginPassword.value },
+    });
+  } catch (error) {
+    flash(error.message);
+    return;
+  }
+  el.loginPassword.value = "";
+  await enterPanel();
+}
+
+async function signOut() {
+  await api("/logout", { method: "POST" }).catch(() => null);
+  /* O cache e por origem, nao por conta: sem esta limpeza a proxima pessoa a
+     usar este navegador poderia receber uma pagina guardada na sessao anterior. */
+  navigator.serviceWorker?.controller?.postMessage({ type: "purge" });
+  location.reload();
+}
+
+async function enterPanel() {
+  el.login.hidden = true;
+  el.panel.hidden = false;
+  el.signOut.hidden = false;
+  renderEngines();
+  await guard(() => loadSeries(false));
+  await guard(restoreJob);
 }
 
 async function main() {
@@ -580,25 +681,21 @@ async function main() {
   state.health = await api("/health").catch(() => null);
   if (!state.health) {
     el.health.textContent = "servidor fora do ar";
-    flash("O painel só responde na máquina que roda o servidor. Suba o `mangatl serve` e recarregue.");
+    flash("Não consegui falar com o servidor. Suba o `mangatl serve` e recarregue.");
+    return;
+  }
+  el.health.textContent = `detector ${state.health.detector}`;
+
+  state.session = await api("/session").catch(() => ({ authenticated: false }));
+  if (state.session.authenticated) {
+    await enterPanel();
     return;
   }
 
-  el.health.textContent = `${state.health.root} · detector ${state.health.detector}`;
-  el.jobEngine.innerHTML = state.health.engines
-    .map((name) => {
-      const blocked = name === "claude" && !state.health.has_api_key;
-      return `<option value="${escapeHtml(name)}"${blocked ? " disabled" : ""}>${escapeHtml(name)}</option>`;
-    })
-    .join("");
-  if (!state.health.has_api_key) {
-    el.engineNote.hidden = false;
-    el.engineNote.textContent =
-      "O motor claude está desligado porque não há ANTHROPIC_API_KEY no ambiente do servidor. Copie .env.example para .env, preencha a chave e reinicie.";
-  }
-
-  await guard(() => loadSeries(false));
-  await guard(restoreJob);
+  /* Sem sessao a tela fica na entrada, com o caminho anonimo em destaque: o
+     testador nao cria conta, e a sessao dele nasce no primeiro upload. */
+  el.login.hidden = false;
+  el.panel.hidden = true;
 }
 
 main();

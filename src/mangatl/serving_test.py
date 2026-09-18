@@ -23,8 +23,12 @@ from .serving import is_servable, make_handler
         ("nega a raiz, que lista o .env", "/", False),
         ("aceita a pwa", "/reader/app.js", True),
         ("aceita o indice do leitor", "/reader/", True),
-        ("aceita a biblioteca em json", "/output/library.json", True),
-        ("aceita a imagem da pagina", "/library/manhwa/001/p0001.jpg", True),
+        ("aceita a vitrine publica", "/public/demo/obra/001/p0001.jpg", True),
+        # Os dois saiam da lista quando o servidor passou a ter contas: acervo e de
+        # alguem, e lista de pasta nao sabe responder "de quem". Quem responde sao
+        # as rotas `/u/` do painel, que conferem a sessao antes de mandar um byte.
+        ("nega a biblioteca por caminho", "/output/library.json", False),
+        ("nega a imagem da pagina por caminho", "/library/manhwa/001/p0001.jpg", False),
         ("ignora a query string", "/reader/app.js?v=3", True),
     ],
 )

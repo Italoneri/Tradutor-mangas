@@ -24,7 +24,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .config import Config
@@ -42,11 +42,29 @@ handler devolver erro em vez de pendurar a requisicao."""
 def now() -> str:
     """Instante atual em UTC, no formato que todas as colunas de data usam.
 
-    ISO 8601 com segundos e texto: ordena lexicograficamente igual a
-    cronologicamente, que e o que faz `WHERE expires_at < ?` funcionar sem
-    funcao de data no meio do indice.
+    ISO 8601 em texto: ordena lexicograficamente igual a cronologicamente, que e o
+    que faz `WHERE expires_at < ?` funcionar sem funcao de data no meio do indice.
+
+    Milissegundos e nao segundos porque a fila ordena por `created_at`: dois jobs
+    enfileirados no mesmo segundo empatavam, e empate ali significa que a ordem de
+    atendimento passa a ser o que o banco decidir - uma fila que nao e FIFO sem
+    ninguem ter escolhido isso.
     """
-    return datetime.now(UTC).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+def in_hours(hours: int) -> str:
+    """Um instante no futuro, no mesmo formato de `now`.
+
+    Existe para ninguem escrever a propria versao com outra precisao: comparar um
+    `expires_at` gravado em segundos com um `now()` em milissegundos erra por um
+    segundo, sempre para o lado de expirar cedo demais.
+    """
+    return (datetime.now(UTC) + timedelta(hours=hours)).isoformat(timespec="milliseconds")
+
+
+def minutes_ago(minutes: int) -> str:
+    return (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat(timespec="milliseconds")
 
 
 MIGRATIONS: tuple[str, ...] = (
@@ -108,6 +126,15 @@ MIGRATIONS: tuple[str, ...] = (
 
     CREATE INDEX login_attempts_subject ON login_attempts (subject, at);
     """,
+    # 3 - a fila deixa de viver na memoria
+    """
+    ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE jobs ADD COLUMN options_json TEXT NOT NULL DEFAULT '{}';
+    ALTER TABLE jobs ADD COLUMN log_json TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE jobs ADD COLUMN started_at TEXT;
+
+    CREATE INDEX jobs_queue ON jobs (state, priority, created_at);
+    """,
 )
 """Scripts aplicados em ordem, uma vez cada.
 
@@ -134,9 +161,14 @@ def connect(cfg: Config) -> Iterator[sqlite3.Connection]:
     )
     connection.row_factory = sqlite3.Row
     try:
+        # `busy_timeout` PRIMEIRO, e isto nao e estilo. Ligar o WAL pede uma trava
+        # exclusiva por um instante, e sem o timeout ja valendo essa linha falha na
+        # hora com `database is locked` quando outro processo esta abrindo o banco
+        # ao mesmo tempo - que e exatamente o que `app` e `worker` fazem ao subir
+        # juntos. Medido: o worker morria no primeiro boot e so entrava no restart.
+        connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         yield connection
     finally:
         connection.close()

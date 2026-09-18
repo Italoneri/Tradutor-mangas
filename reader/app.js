@@ -160,12 +160,11 @@ function workHtml(series) {
   </a>`;
 }
 
-/* O painel so responde para 127.0.0.1. Mostrar o link no celular seria oferecer
-   um botao que responde 403 - e o celular nao tem o que fazer com ele. */
-const SERVED_LOCALLY = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(location.hostname);
-
+/* O painel responde para quem tem sessao, e quem esta vendo a propria biblioteca
+   tem uma. A regra antiga era o endereco de origem - so 127.0.0.1 - e ela morreu
+   junto com a hospedagem: atras de um proxy todo cliente chega com o IP do proxy. */
 function panelLinkHtml() {
-  return SERVED_LOCALLY ? `<a class="btn btn-secondary" href="admin.html">Painel</a>` : "";
+  return `<a class="btn btn-secondary" href="admin.html">Painel</a>`;
 }
 
 /* O convite da vitrine. Fica depois das obras, e nao antes: quem chegou de um
@@ -180,6 +179,7 @@ function inviteHtml() {
     <div class="invite-actions">
       <a class="btn btn-primary" href="admin.html">Subir uma amostra</a>
       <a class="btn btn-secondary" href="${REPOSITORY}" rel="noopener">Ver o código</a>
+      <a class="btn btn-secondary" href="termos.html">Termos</a>
     </div>
     <p class="fine">
       O motor <code>claude</code> está desligado aqui porque a chave da API seria a do dono.
@@ -194,12 +194,8 @@ function renderShelf(library, { showcase }) {
   el.main.className = "";
 
   if (!library.series.length) {
-    // Do PC o caminho e o painel; do celular ele nao existe, e mandar rodar um
-    // comando de terminal la seria pior que dizer que nao ha nada.
-    const way = SERVED_LOCALLY
-      ? `<br>Abra o <a href="admin.html">painel</a> para subir o primeiro.`
-      : `<br>Suba um capítulo pelo PC que serve esta biblioteca.`;
-    el.main.innerHTML = `<p class="empty">Nenhum capítulo traduzido ainda.${way}</p>`;
+    el.main.innerHTML = `<p class="empty">Nenhum capítulo traduzido ainda.<br>
+      Abra o <a href="admin.html">painel</a> para subir o primeiro.</p>`;
     return;
   }
 
@@ -584,26 +580,19 @@ function setupOverlayToggle() {
 
 /* Qual biblioteca esta pessoa ve.
  *
- * A do usuario primeiro, a vitrine como resposta para quem nao tem sessao. A
- * ordem importa: `/u/library` responde 401 sem cookie e NAO cria sessao, entao o
- * visitante que so quer ler a vitrine nunca ganha um cookie por ter aberto a
- * home - e a home continua sendo uma pagina que robo de busca pode visitar sem
- * abrir area em disco para ele.
+ * A do usuario primeiro, a vitrine como resposta para quem nao tem sessao.
+ *
+ * `/u/library` responde 401 sem cookie e NAO cria sessao: a sessao anonima nasce
+ * no primeiro upload, e nao no primeiro `GET`. E o que mantem a home aberta para
+ * robo de busca e previa de link sem dar area em disco para cada um deles.
+ *
+ * Nao ha mais fallback para `output/library.json`. Aquele arquivo era servido por
+ * caminho, e caminho deixou de responder por acervo - e o mesmo motivo pelo qual
+ * uma tela de login sozinha nao protegeria nada.
  */
 async function loadLibrary() {
   const mine = await fetchJson(MY_LIBRARY).catch(() => null);
   if (mine) return { library: mine, showcase: false };
-
-  /* O leitor local, que continua sendo o uso principal: na sua maquina nao ha
-     sessao nenhuma e o indice e um arquivo. Na instancia hospedada este caminho
-     nao responde - `output/` deixa de ser servivel por caminho - e a busca cai
-     na vitrine, que e o certo para quem chegou sem cookie. */
-  const local = await fetchJson(`${ROOT}/output/library.json`).catch(() => null);
-  /* Vazio conta como ausente. `mangatl serve` escreve esse arquivo na subida,
-     mesmo sem nada processado, e aceita-lo assim faria a vitrine perder para um
-     indice de zero obras - o visitante veria "nenhum capitulo traduzido ainda"
-     numa pagina que existe justamente para mostrar capitulo traduzido. */
-  if (local && local.series.length) return { library: local, showcase: false };
 
   const demo = await fetchJson(SHOWCASE_INDEX).catch(() => null);
   return demo ? { library: demo, showcase: true } : null;
