@@ -25,6 +25,7 @@ x-app: &app
     # a sessao pareceria nao existir.
     COOKIE_SECURE: ${COOKIE_SECURE:-1}
     MAX_TOTAL_DISK_BYTES: ${MAX_TOTAL_DISK_BYTES:-}
+    PUBLIC_SHOWCASE: ${PUBLIC_SHOWCASE:-0}
   volumes:
     # O acervo e o banco. E o unico diretorio que precisa de backup.
     - ./data:/app/data
@@ -44,6 +45,7 @@ services:
       OWNER_PASSWORD: ${OWNER_PASSWORD:-}
       COOKIE_SECURE: ${COOKIE_SECURE:-1}
       MAX_TOTAL_DISK_BYTES: ${MAX_TOTAL_DISK_BYTES:-}
+      PUBLIC_SHOWCASE: ${PUBLIC_SHOWCASE:-0}
       # O prefixo que o Caddy serve como `internal`. Definido, o app autoriza e
       # devolve o caminho; os bytes saem pelo proxy e o worker Python volta a
       # atender na hora.

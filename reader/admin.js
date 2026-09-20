@@ -34,6 +34,8 @@ const el = {
   loginEmail: document.getElementById("login-email"),
   loginPassword: document.getElementById("login-password"),
   enterTester: document.getElementById("enter-tester"),
+  loginTitle: document.getElementById("login-title"),
+  testerPath: document.getElementById("tester-path"),
   signOut: document.getElementById("sign-out"),
   panel: document.getElementById("panel"),
 
@@ -692,10 +694,16 @@ async function main() {
     return;
   }
 
-  /* Sem sessao a tela fica na entrada, com o caminho anonimo em destaque: o
-     testador nao cria conta, e a sessao dele nasce no primeiro upload. */
+  /* Sem sessao a tela fica na entrada. Quem lidera depende da instancia: numa
+     privada o dono e o unico usuario e o formulario dele e a tela inteira; numa
+     vitrine o caminho anonimo aparece embaixo, porque o visitante nao quer criar
+     conta para experimentar. */
+  const showcase = state.session.showcase === true;
+  el.testerPath.hidden = !showcase;
+  el.loginTitle.textContent = showcase ? "Entrar como dono" : "Entrar";
   el.login.hidden = false;
   el.panel.hidden = true;
+  if (!showcase) el.loginEmail.focus();
 }
 
 main();

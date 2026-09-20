@@ -32,34 +32,36 @@
 
   <p class="flash" id="flash" hidden></p>
 
-  <!-- A entrada. O caminho anonimo vem primeiro de proposito: um testador nao quer
-       criar conta para experimentar, e a sessao dele nasce sozinha no upload. -->
+  <!-- A entrada. Qual dos dois caminhos lidera sai de `showcase` na sessao: numa
+       instancia privada o dono e o unico usuario, e enterrar o formulario dele
+       dentro de um <details> fechado era o motivo de as pessoas subirem capitulo
+       como visitante anonimo sem perceber. -->
   <section class="card" id="login" hidden>
     <div class="card-head">
-      <h2>Subir uma amostra</h2>
-    </div>
-    <p class="hint">
-      De 5 a 12 páginas em inglês, traduzidas com o motor <code>free</code>.
-      Sem cadastro: o que você subir expira em 48 horas e some sozinho.
-    </p>
-    <div class="row">
-      <button class="btn btn-primary" id="enter-tester">Começar</button>
+      <h2 id="login-title">Entrar</h2>
     </div>
 
-    <details class="owner-login">
-      <summary>Entrar como dono</summary>
-      <form class="row" id="login-form">
-        <label class="field">
-          <span>e-mail</span>
-          <input id="login-email" type="email" autocomplete="username" required>
-        </label>
-        <label class="field">
-          <span>senha</span>
-          <input id="login-password" type="password" autocomplete="current-password" required>
-        </label>
-        <button class="btn btn-secondary" type="submit">Entrar</button>
-      </form>
-    </details>
+    <form class="row" id="login-form">
+      <label class="field">
+        <span>e-mail</span>
+        <input id="login-email" type="email" autocomplete="username" required>
+      </label>
+      <label class="field">
+        <span>senha</span>
+        <input id="login-password" type="password" autocomplete="current-password" required>
+      </label>
+      <button class="btn btn-primary" type="submit">Entrar</button>
+    </form>
+
+    <div id="tester-path" hidden>
+      <p class="hint">
+        Ou experimente sem conta: de 5 a 12 páginas em inglês, motor <code>free</code>.
+        O que você subir expira em 48 horas e some sozinho.
+      </p>
+      <div class="row">
+        <button class="btn btn-secondary" id="enter-tester">Subir uma amostra</button>
+      </div>
+    </div>
   </section>
 
   <div id="panel" hidden>

@@ -3,12 +3,14 @@ from __future__ import annotations
 import io
 import json
 import threading
+from unittest import mock
 import zipfile
 from http.client import HTTPConnection
 from pathlib import Path
 
 import pytest
 
+from . import panel
 from .accounts import ensure_owner, sole_owner, user_path
 from .config import Config
 from .db import connect, migrate
@@ -717,6 +719,66 @@ def test_extracts_an_archive_into_the_staging_area(panel_server: Client, tmp_pat
     assert status == 200
     assert json.loads(body)["files"] == ["1.jpg", "2.png"]
     assert (owner_area(tmp_path, "library") / slug / "001.incoming" / "1.jpg").is_file()
+
+
+def test_never_holds_the_whole_archive_in_memory(panel_server: Client, tmp_path: Path):
+    """O handler recebe o caminho do arquivo, e nao os bytes dele.
+
+    Um zip de capitulo passa de 100MB e a rota aceita ate 500MB. `rfile.read` disso
+    e o processo inteiro segurando o upload na RAM enquanto atende todo mundo - o
+    contêiner `app` tem 1GB.
+    """
+    received: list[object] = []
+    original = panel.extract_archive
+
+    def spy(data, target, limit=panel.MAX_PAGES_PER_CHAPTER):
+        received.append(data)
+        return original(data, target, limit)
+
+    slug = series_with(panel_server)
+    stage(panel_server, slug, "001")
+
+    with mock.patch.object(panel, "extract_archive", spy):
+        status, _ = panel_server.send(
+            "POST", f"/api/series/{slug}/chapters/001/archive", zip_of({"1.jpg": JPEG})
+        )
+
+    assert status == 200
+    assert isinstance(received[0], Path)
+
+
+def test_wipes_the_spooled_upload_once_the_archive_is_extracted(
+    panel_server: Client, tmp_path: Path
+):
+    slug = series_with(panel_server)
+    stage(panel_server, slug, "001")
+
+    panel_server.send(
+        "POST", f"/api/series/{slug}/chapters/001/archive", zip_of({"1.jpg": JPEG})
+    )
+
+    spool = tmp_path / "data" / "uploads"
+    assert not spool.exists() or not list(spool.iterdir())
+
+
+def test_wipes_the_spooled_upload_when_the_archive_is_refused(
+    panel_server: Client, tmp_path: Path
+):
+    """Recusa ocupa o mesmo disco que aceite.
+
+    So o caminho de sucesso limpar transformaria cada zip malformado em lixo
+    permanente no volume que o teto de disco vigia.
+    """
+    slug = series_with(panel_server)
+    stage(panel_server, slug, "001")
+
+    status, _ = panel_server.send(
+        "POST", f"/api/series/{slug}/chapters/001/archive", b"isto nao e um zip"
+    )
+
+    assert status == 422
+    spool = tmp_path / "data" / "uploads"
+    assert not spool.exists() or not list(spool.iterdir())
 
 
 def test_throws_away_the_staging_area_when_an_archive_fails(panel_server: Client, tmp_path: Path):

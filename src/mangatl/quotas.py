@@ -127,6 +127,18 @@ def check_incoming_pages(cfg: Config, user: User, incoming: Path, adding: int = 
         )
 
 
+def upload_headroom(cfg: Config, user: User) -> int | None:
+    """Quantos bytes esta area ainda aceita, ou None quando nao ha teto.
+
+    Existe para o upload que chega em pedacos: sem ela, a unica forma de saber que
+    o zip nao cabe seria receber o zip inteiro primeiro, e ai os 500MB ja estao no
+    disco que a cota existia para proteger.
+    """
+    if user.is_owner:
+        return None
+    return max(0, TESTER_MAX_UPLOAD_BYTES - area_bytes(cfg))
+
+
 def check_upload_bytes(cfg: Config, user: User, incoming_bytes: int) -> None:
     """Se o upload cabe no que esta sessao ainda pode gravar."""
     if user.is_owner:

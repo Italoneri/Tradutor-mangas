@@ -326,3 +326,23 @@ def test_reuses_that_session_instead_of_opening_another(server: Client, tmp_path
     with connect(Config(root=tmp_path)) as connection:
         testers = connection.execute("SELECT COUNT(*) AS n FROM users WHERE kind = 'tester'")
         assert testers.fetchone()["n"] == 1
+
+
+def test_says_the_instance_is_private_by_default(server: Client, monkeypatch):
+    _, body, _ = server.raw("GET", "/api/session")
+
+    assert json.loads(body)["showcase"] is False
+
+
+def test_says_the_instance_shows_a_showcase_when_asked(server: Client, monkeypatch):
+    """A vitrine e opcional e desligada por padrao.
+
+    Ligada, ela responde a quem nao tem conta. Desligada, a mesma falta de sessao
+    vira a tela de entrar - que e o que a instalacao de uma pessoa so quer, e o
+    que faltava para o dono achar o proprio painel.
+    """
+    monkeypatch.setenv("PUBLIC_SHOWCASE", "1")
+
+    _, body, _ = server.raw("GET", "/api/session")
+
+    assert json.loads(body)["showcase"] is True
