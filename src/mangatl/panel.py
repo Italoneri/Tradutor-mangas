@@ -36,11 +36,14 @@ import re
 import shutil
 import sqlite3
 import sys
+import tempfile
+import traceback
 import zipfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from http import HTTPStatus
 from pathlib import Path, PurePosixPath
-from typing import Literal, NamedTuple
+from typing import IO, Literal, NamedTuple
 from urllib.parse import unquote
 
 from .accounts import User, area_config, create_user, find_owner, password_hash_of
@@ -68,6 +71,7 @@ from .quotas import (
     check_upload_bytes,
     engines_for,
     record_usage,
+    upload_headroom,
 )
 from .serving import ReaderHandler, serve_handler
 from .sessions import (
@@ -120,6 +124,20 @@ sao 155 JPEGs - com quatro leitores baixando, cada imagem segurando um worker
 durante o download derruba o servidor.
 
 Ausente, o Python transmite em pedacos. Funciona, e e divida anotada."""
+
+SHOWCASE_ENV = "PUBLIC_SHOWCASE"
+
+
+def showcase_is_public() -> bool:
+    """Se quem chega sem sessao ve a vitrine ou a tela de entrar.
+
+    Desligada por padrao porque a instalacao comum e de uma pessoa so, e nela a
+    vitrine responde a pergunta errada: quem abre o endereco quer a propria
+    biblioteca, e recebia um mostruario onde o botao do painel nem aparecia. Ligue
+    numa instancia que existe para demonstrar o pipeline a quem nao tem conta.
+    """
+    return os.environ.get(SHOWCASE_ENV, "0").strip().lower() in {"1", "true", "yes", "on"}
+
 
 MAX_COMPONENT_CHARS = 120
 """Nome de pasta mais longo que isso e engano ou ataque; o NTFS para em 255 e o
@@ -339,7 +357,15 @@ class Context(NamedTuple):
         return self.session is not None and self.session.is_owner
 
 
-Handler = Callable[[Context, tuple[str, ...], bytes], tuple[int, object]]
+Body = bytes | Path
+"""O corpo como o handler o recebe.
+
+`bytes` para quase tudo: JSON e pagina cabem na memoria com folga. `Path` para
+a rota do arquivo, cujo corpo pode passar de 100MB - um zip desses em `bytes` e
+o processo inteiro segurando o upload na RAM enquanto atende o resto.
+"""
+
+Handler = Callable[[Context, tuple[str, ...], Body], tuple[int, object]]
 
 Access = Literal["public", "session", "owner"]
 
@@ -377,6 +403,14 @@ class Route(NamedTuple):
 
     O default e o lado seguro de errar: uma rota que le corpo e esquece a marca
     recebe b"" e recusa com 422 pela propria validacao, em vez de aceitar lixo.
+    """
+
+    stream: bool = False
+    """Se o corpo desce para um arquivo em vez de virar `bytes`.
+
+    Marcada so onde o corpo e grande de verdade. Um zip de capitulo passa de
+    100MB, e `rfile.read(length)` disso e um processo de 1GB segurando o upload
+    inteiro na memoria - o handler recebe um `Path` e le de la.
     """
 
 
@@ -423,10 +457,18 @@ class _Cleared(NamedTuple):
 
 
 def _session_payload(session: Session | None) -> dict:
+    # `showcase` responde tambem para quem nao tem sessao: e por ela que o leitor
+    # sabe se a resposta a falta de sessao e um mostruario ou uma tela de entrar.
     if session is None:
-        return {"authenticated": False, "kind": None, "engines": []}
+        return {
+            "authenticated": False,
+            "kind": None,
+            "engines": [],
+            "showcase": showcase_is_public(),
+        }
     return {
         "authenticated": True,
+        "showcase": showcase_is_public(),
         "kind": session.user.kind,
         "expires_at": session.expires_at,
         # O testador nunca ve `claude` na lista: a chave da API e do dono, e a
@@ -627,7 +669,9 @@ def _page_limit(user: User) -> int:
     return MAX_PAGES_PER_CHAPTER if user.is_owner else TESTER_MAX_PAGES_PER_CHAPTER
 
 
-def extract_archive(data: bytes, target: Path, limit: int = MAX_PAGES_PER_CHAPTER) -> list[str]:
+def extract_archive(
+    data: bytes | Path, target: Path, limit: int = MAX_PAGES_PER_CHAPTER
+) -> list[str]:
     """Grava as paginas do zip na area de espera, uma entrada por vez.
 
     Nunca `extractall`: ele obedece ao caminho gravado dentro do zip, e o zip
@@ -639,10 +683,26 @@ def extract_archive(data: bytes, target: Path, limit: int = MAX_PAGES_PER_CHAPTE
     declarado antes de abrir, porque um zip de 1MB pode dizer 100GB, e os bytes
     realmente escritos durante a copia, porque quem escreve o declarado e o zip.
     """
-    buffer = io.BytesIO(data)
-    if not zipfile.is_zipfile(buffer):
-        raise Invalid("o corpo nao e um zip; .cbz tambem e zip, o nome nao decide")
+    # `zipfile` so precisa de algo que leia e posicione, e um arquivo aberto serve
+    # tao bem quanto um buffer - com a diferenca de que o zip de 160MB fica no disco
+    # e nao na memoria do processo que ainda esta atendendo todo mundo.
+    with _archive_source(data) as buffer:
+        if not zipfile.is_zipfile(buffer):
+            raise Invalid("o corpo nao e um zip; .cbz tambem e zip, o nome nao decide")
+        buffer.seek(0)
+        return _extract_from(buffer, target, limit)
 
+
+@contextmanager
+def _archive_source(data: bytes | Path) -> Iterator[IO[bytes]]:
+    if isinstance(data, Path):
+        with data.open("rb") as handle:
+            yield handle
+        return
+    yield io.BytesIO(data)
+
+
+def _extract_from(buffer: IO[bytes], target: Path, limit: int) -> list[str]:
     with zipfile.ZipFile(buffer) as archive:
         infos = archive.infolist()
         entries = safe_archive_entries([info.filename for info in infos])
@@ -745,21 +805,26 @@ def _put_page(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, 
     return HTTPStatus.OK, {"file": name, "bytes": len(body)}
 
 
-def _put_archive(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+def _put_archive(ctx: Context, groups: tuple[str, ...], body: Body) -> tuple[int, object]:
     """Extrai um zip/cbz inteiro na area de espera.
 
     Falha apaga a area de espera toda: meio zip extraido e pior que zip nenhum,
     porque parece capitulo e o `commit` aceitaria.
+
+    O corpo chega como caminho, e nao como bytes: um zip de capitulo passa de
+    100MB e a rota aceita ate 500MB. Quem apaga o temporario e o `_run`.
     """
     slug, chapter = groups
     _, incoming = _chapter_paths(ctx.cfg, slug, chapter)
     if not incoming.is_dir():
         raise Invalid("area de espera nao existe; crie o capitulo antes")
 
+    size = body.stat().st_size if isinstance(body, Path) else len(body)
+
     # O zip comprime, entao o corpo nao diz quanto vai ocupar; o que o teto de
     # paginas garante e que o descompactado tambem cabe.
-    check_upload_bytes(ctx.cfg, ctx.user, len(body))
-    check_disk(ctx.base, len(body))
+    check_upload_bytes(ctx.cfg, ctx.user, size)
+    check_disk(ctx.base, size)
 
     try:
         names = extract_archive(body, incoming, limit=_page_limit(ctx.user))
@@ -767,7 +832,7 @@ def _put_archive(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[in
         shutil.rmtree(incoming, ignore_errors=True)
         raise
 
-    record_usage(ctx.connection, ctx.user.id, pages=len(names), bytes_=len(body))
+    record_usage(ctx.connection, ctx.user.id, pages=len(names), bytes_=size)
     return HTTPStatus.OK, {"files": names, "count": len(names)}
 
 
@@ -1063,6 +1128,7 @@ ROUTES: tuple[Route, ...] = (
         MAX_ARCHIVE_BYTES,
         writes=True,
         body_required=True,
+        stream=True,
     ),
     Route(
         "POST",
@@ -1249,12 +1315,17 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "so o dono faz isso"})
                 return True
 
-            body = self._read_body(route)
+            # A area sai antes do corpo porque o teto da cota depende dela, e o teto
+            # precisa valer antes de o upload comecar a ocupar disco.
+            area = area_config(cfg, session.user) if session else cfg
+            ceiling = upload_headroom(area, session.user) if route.stream and session else None
+
+            body = self._read_body(route, ceiling)
             if body is None:
                 return True
 
             context = Context(
-                cfg=area_config(cfg, session.user) if session else cfg,
+                cfg=area,
                 base=cfg,
                 connection=connection,
                 session=session,
@@ -1262,24 +1333,44 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
                 client_ip=self.client_address[0] if self.client_address else "",
             )
 
+            # A sessao recem-aberta viaja no cookie ate nas respostas de erro. Sem
+            # isto, uma primeira escrita que nao passa na validacao deixa a linha de
+            # sessao no banco e nao entrega o cookie: o cliente volta sem sessao,
+            # abre outra na tentativa seguinte, e quem erra em laco vira uma fabrica
+            # de sessoes orfas.
+            cookie: dict[str, str] = {}
+            if issued is not None and session is not None:
+                cookie["Set-Cookie"] = cookie_header(issued, hours=hours_for(session.user.kind))
+
             try:
-                status, payload = route.handler(context, groups, body)
+                status, payload = self._run(route, context, groups, body)
             except Invalid as error:
-                self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(error)})
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(error)}, headers=cookie
+                )
                 return True
             except QuotaExceeded as error:
                 # 429 com a mensagem que explica o teto, e nao erro generico: quem
                 # bateu na cota precisa saber qual e ela para decidir o que fazer.
-                self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": str(error)})
+                self._send_json(
+                    HTTPStatus.TOO_MANY_REQUESTS, {"error": str(error)}, headers=cookie
+                )
                 return True
             except OutOfSpace as error:
                 # 507 e nao 429: o limite nao e desta pessoa, e tentar de novo em
                 # um minuto nao adianta.
-                self._send_json(HTTPStatus.INSUFFICIENT_STORAGE, {"error": str(error)})
+                self._send_json(
+                    HTTPStatus.INSUFFICIENT_STORAGE, {"error": str(error)}, headers=cookie
+                )
                 return True
             except Exception:  # noqa: BLE001 - erro nosso vira 500, nunca stack na resposta
-                self.log_error("falha em %s %s", method, path)
-                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "falha no painel"})
+                # A resposta nunca leva stack; o log do servidor sempre leva. Sem o
+                # traceback aqui, um 500 vira "falha em POST /rota" e nada mais, e a
+                # causa morre no processo onde aconteceu.
+                self.log_error("falha em %s %s\n%s", method, path, traceback.format_exc())
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "falha no painel"}, headers=cookie
+                )
                 return True
 
             self._respond(status, payload, issued=issued, kind=session.user.kind if session else None)
@@ -1343,7 +1434,22 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
             with raw.path.open("rb") as source:
                 shutil.copyfileobj(source, self.wfile, 64 * 1024)
 
-        def _read_body(self, route: Route) -> bytes | None:
+        def _run(
+            self, route: Route, context: Context, groups: tuple[str, ...], body: Body
+        ) -> tuple[int, object]:
+            """Roda o handler e apaga o arquivo temporario depois, de todo jeito.
+
+            O `finally` cobre a recusa tambem: um zip que nao passa na validacao
+            ocupa o mesmo disco que um que passa, e so o caminho de sucesso limpar
+            transformaria cada erro em lixo permanente.
+            """
+            try:
+                return route.handler(context, groups, body)
+            finally:
+                if isinstance(body, Path):
+                    body.unlink(missing_ok=True)
+
+        def _read_body(self, route: Route, ceiling: int | None) -> Body | None:
             """O corpo cru, ou None quando ja respondeu recusando.
 
             `http.server` nao decodifica `Transfer-Encoding: chunked` e o `cgi`,
@@ -1377,7 +1483,61 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
                     {"error": f"corpo de {length} bytes; o teto desta rota e {route.max_body}"},
                 )
                 return None
-            return self.rfile.read(length)
+
+            if ceiling is not None and length > ceiling:
+                # A cota responde antes de o primeiro byte sair do cliente. Deixar
+                # para conferir depois seria gravar 500MB no disco que a cota existe
+                # para proteger, so para entao dizer que nao cabia.
+                self._send_json(
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    {
+                        "error": f"corpo de {length // (1024 * 1024)}MB;"
+                        f" esta sessao ainda aceita {ceiling // (1024 * 1024)}MB."
+                    },
+                )
+                return None
+
+            if not route.stream:
+                return self.rfile.read(length)
+            return self._spool_body(length)
+
+        def _spool_body(self, length: int) -> Path | None:
+            """Desce o corpo para um arquivo, em pedacos, e devolve o caminho.
+
+            Ao lado do banco e nao em `/tmp`: no contêiner `/tmp` e a camada de
+            escrita da imagem, e um zip de 500MB la dentro enche o que nao tem dono.
+            Aqui e o mesmo volume do acervo, que e o volume que o teto de disco ja
+            vigia.
+
+            Recebimento incompleto apaga o arquivo e recusa: meio zip nao e zip, e
+            o `zipfile` diria isso de um jeito bem menos claro.
+            """
+            spool = cfg.data_dir / "uploads"
+            spool.mkdir(parents=True, exist_ok=True)
+
+            handle, name = tempfile.mkstemp(dir=spool, suffix=".upload")
+            path = Path(name)
+            received = 0
+            try:
+                with os.fdopen(handle, "wb") as sink:
+                    while received < length:
+                        chunk = self.rfile.read(min(1024 * 1024, length - received))
+                        if not chunk:
+                            break
+                        received += len(chunk)
+                        sink.write(chunk)
+            except Exception:
+                path.unlink(missing_ok=True)
+                raise
+
+            if received != length:
+                path.unlink(missing_ok=True)
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": f"recebi {received} de {length} bytes declarados"},
+                )
+                return None
+            return path
 
         def _send_json(self, status: int, payload: object, *, headers: dict | None = None) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")

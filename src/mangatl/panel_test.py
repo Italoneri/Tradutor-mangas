@@ -3,13 +3,15 @@ from __future__ import annotations
 import io
 import json
 import threading
+from unittest import mock
 import zipfile
 from http.client import HTTPConnection
 from pathlib import Path
 
 import pytest
 
-from .accounts import ensure_owner
+from . import panel
+from .accounts import ensure_owner, sole_owner, user_path
 from .config import Config
 from .db import connect, migrate
 from .jobs import finish, get_any, set_progress
@@ -303,15 +305,28 @@ class Client:
         self.cookie = None
 
 
+def owner_area(tmp_path: Path, *parts: str) -> Path:
+    """Onde o acervo do dono realmente mora depois que ele tem conta.
+
+    Os testes do painel apontavam para `tmp_path/library`, que e a raiz do projeto
+    - o lugar de antes das contas. Continuar olhando para la escondia justamente o
+    caso que importa: numa instalacao nova o dono nasce com area propria.
+    """
+    cfg = Config(root=tmp_path)
+    with connect(cfg) as connection:
+        owner = sole_owner(connection)
+    assert owner is not None
+    resolved = user_path(cfg, owner.id, *parts)
+    assert resolved is not None
+    return resolved
+
+
 @pytest.fixture
 def panel_server(tmp_path: Path):
     """Sobe o handler real numa porta efemera, para provar a ligacao e nao so as funcoes."""
     (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-secreta\n", encoding="utf-8")
     (tmp_path / "reader").mkdir()
     (tmp_path / "reader" / "app.js").write_text("export const ok = 1;\n", encoding="utf-8")
-    (tmp_path / "library").mkdir()
-    (tmp_path / "output").mkdir()
-
     cfg = Config(root=tmp_path)
     migrate(cfg)
     with connect(cfg) as connection:
@@ -352,7 +367,7 @@ def test_lists_the_disk_and_not_the_reader_index(panel_server: Client, tmp_path:
     # Uma serie com capitulo enviado e nao traduzido: o painel precisa ve-la para
     # oferecer o botao que a traduz, e o leitor nao pode lista-la porque nao ha o
     # que abrir.
-    chapter = tmp_path / "library" / "Obra" / "001"
+    chapter = owner_area(tmp_path, "library") / "Obra" / "001"
     chapter.mkdir(parents=True)
     (chapter / "1.jpg").write_bytes(b"0")
 
@@ -418,7 +433,7 @@ def test_creates_a_series_with_slug_and_title(panel_server: Client, tmp_path: Pa
 
     assert status == 201
     assert json.loads(body)["slug"] == "Obra Nova"
-    assert (tmp_path / "library" / "Obra Nova" / "series.json").is_file()
+    assert (owner_area(tmp_path, "library") / "Obra Nova" / "series.json").is_file()
 
 
 def test_refuses_to_create_a_series_twice(panel_server: Client):
@@ -471,7 +486,7 @@ def test_writes_the_cover_with_the_suffix_the_bytes_ask_for(panel_server: Client
     panel_server.send("POST", "/api/series", json.dumps({"slug": "Obra"}).encode("utf-8"))
 
     assert panel_server.send("PUT", "/api/series/Obra/cover", PNG)[0] == 200
-    assert (tmp_path / "library" / "Obra" / "cover.png").is_file()
+    assert (owner_area(tmp_path, "library") / "Obra" / "cover.png").is_file()
 
 
 def test_replaces_the_old_cover_instead_of_stacking_one(panel_server: Client, tmp_path: Path):
@@ -479,7 +494,7 @@ def test_replaces_the_old_cover_instead_of_stacking_one(panel_server: Client, tm
     panel_server.send("PUT", "/api/series/Obra/cover", PNG)
     panel_server.send("PUT", "/api/series/Obra/cover", JPEG)
 
-    covers = sorted(p.name for p in (tmp_path / "library" / "Obra").glob("cover.*"))
+    covers = sorted(p.name for p in (owner_area(tmp_path, "library") / "Obra").glob("cover.*"))
     assert covers == ["cover.jpg"]
 
 
@@ -610,7 +625,7 @@ def series_with(client: Client, slug: str = "Obra") -> str:
 
 def test_suggests_the_chapter_number_when_the_body_is_empty(panel_server: Client, tmp_path: Path):
     slug = series_with(panel_server)
-    (tmp_path / "library" / slug / "001").mkdir()
+    (owner_area(tmp_path, "library") / slug / "001").mkdir()
 
     status, body = panel_server.send("POST", f"/api/series/{slug}/chapters", b"")
 
@@ -623,13 +638,13 @@ def test_opens_the_staging_area_and_not_the_chapter(panel_server: Client, tmp_pa
 
     panel_server.send("POST", f"/api/series/{slug}/chapters", json.dumps({"chapter": "007"}).encode())
 
-    assert (tmp_path / "library" / slug / "007.incoming").is_dir()
-    assert not (tmp_path / "library" / slug / "007").exists()
+    assert (owner_area(tmp_path, "library") / slug / "007.incoming").is_dir()
+    assert not (owner_area(tmp_path, "library") / slug / "007").exists()
 
 
 def test_refuses_to_stage_over_a_chapter_that_exists(panel_server: Client, tmp_path: Path):
     slug = series_with(panel_server)
-    (tmp_path / "library" / slug / "001").mkdir()
+    (owner_area(tmp_path, "library") / slug / "001").mkdir()
 
     status, _ = panel_server.send(
         "POST", f"/api/series/{slug}/chapters", json.dumps({"chapter": "001"}).encode()
@@ -650,7 +665,7 @@ def test_writes_a_page_into_the_staging_area(panel_server: Client, tmp_path: Pat
 
     assert status == 200
     assert json.loads(body)["file"] == "1.jpg"
-    assert (tmp_path / "library" / slug / "001.incoming" / "1.jpg").read_bytes() == JPEG
+    assert (owner_area(tmp_path, "library") / slug / "001.incoming" / "1.jpg").read_bytes() == JPEG
 
 
 def test_refuses_a_page_that_is_not_an_image(panel_server: Client):
@@ -703,7 +718,67 @@ def test_extracts_an_archive_into_the_staging_area(panel_server: Client, tmp_pat
 
     assert status == 200
     assert json.loads(body)["files"] == ["1.jpg", "2.png"]
-    assert (tmp_path / "library" / slug / "001.incoming" / "1.jpg").is_file()
+    assert (owner_area(tmp_path, "library") / slug / "001.incoming" / "1.jpg").is_file()
+
+
+def test_never_holds_the_whole_archive_in_memory(panel_server: Client, tmp_path: Path):
+    """O handler recebe o caminho do arquivo, e nao os bytes dele.
+
+    Um zip de capitulo passa de 100MB e a rota aceita ate 500MB. `rfile.read` disso
+    e o processo inteiro segurando o upload na RAM enquanto atende todo mundo - o
+    contêiner `app` tem 1GB.
+    """
+    received: list[object] = []
+    original = panel.extract_archive
+
+    def spy(data, target, limit=panel.MAX_PAGES_PER_CHAPTER):
+        received.append(data)
+        return original(data, target, limit)
+
+    slug = series_with(panel_server)
+    stage(panel_server, slug, "001")
+
+    with mock.patch.object(panel, "extract_archive", spy):
+        status, _ = panel_server.send(
+            "POST", f"/api/series/{slug}/chapters/001/archive", zip_of({"1.jpg": JPEG})
+        )
+
+    assert status == 200
+    assert isinstance(received[0], Path)
+
+
+def test_wipes_the_spooled_upload_once_the_archive_is_extracted(
+    panel_server: Client, tmp_path: Path
+):
+    slug = series_with(panel_server)
+    stage(panel_server, slug, "001")
+
+    panel_server.send(
+        "POST", f"/api/series/{slug}/chapters/001/archive", zip_of({"1.jpg": JPEG})
+    )
+
+    spool = tmp_path / "data" / "uploads"
+    assert not spool.exists() or not list(spool.iterdir())
+
+
+def test_wipes_the_spooled_upload_when_the_archive_is_refused(
+    panel_server: Client, tmp_path: Path
+):
+    """Recusa ocupa o mesmo disco que aceite.
+
+    So o caminho de sucesso limpar transformaria cada zip malformado em lixo
+    permanente no volume que o teto de disco vigia.
+    """
+    slug = series_with(panel_server)
+    stage(panel_server, slug, "001")
+
+    status, _ = panel_server.send(
+        "POST", f"/api/series/{slug}/chapters/001/archive", b"isto nao e um zip"
+    )
+
+    assert status == 422
+    spool = tmp_path / "data" / "uploads"
+    assert not spool.exists() or not list(spool.iterdir())
 
 
 def test_throws_away_the_staging_area_when_an_archive_fails(panel_server: Client, tmp_path: Path):
@@ -719,7 +794,7 @@ def test_throws_away_the_staging_area_when_an_archive_fails(panel_server: Client
 
     assert status == 422
     assert b"caminho de fuga" in body
-    assert not (tmp_path / "library" / slug / "001.incoming").exists()
+    assert not (owner_area(tmp_path, "library") / slug / "001.incoming").exists()
 
 
 def test_promotes_the_staging_area_to_a_chapter(panel_server: Client, tmp_path: Path):
@@ -731,8 +806,8 @@ def test_promotes_the_staging_area_to_a_chapter(panel_server: Client, tmp_path: 
 
     assert status == 200
     assert json.loads(body)["files"] == ["1.jpg"]
-    assert (tmp_path / "library" / slug / "001" / "1.jpg").is_file()
-    assert not (tmp_path / "library" / slug / "001.incoming").exists()
+    assert (owner_area(tmp_path, "library") / slug / "001" / "1.jpg").is_file()
+    assert not (owner_area(tmp_path, "library") / slug / "001.incoming").exists()
 
 
 def test_refuses_to_promote_an_empty_staging_area(panel_server: Client):
@@ -747,10 +822,10 @@ def test_refuses_to_promote_an_empty_staging_area(panel_server: Client):
 
 def test_refuses_to_promote_over_a_chapter_that_exists(panel_server: Client, tmp_path: Path):
     slug = series_with(panel_server)
-    incoming = tmp_path / "library" / slug / "001.incoming"
+    incoming = owner_area(tmp_path, "library") / slug / "001.incoming"
     incoming.mkdir(parents=True)
     (incoming / "1.jpg").write_bytes(JPEG)
-    (tmp_path / "library" / slug / "001").mkdir()
+    (owner_area(tmp_path, "library") / slug / "001").mkdir()
 
     status, _ = panel_server.send("POST", f"/api/series/{slug}/chapters/001/commit")
 
@@ -766,7 +841,7 @@ def test_discards_the_staging_area_on_request(panel_server: Client, tmp_path: Pa
 
     assert status == 200
     assert json.loads(body)["removed"] == 1
-    assert not (tmp_path / "library" / slug / "001.incoming").exists()
+    assert not (owner_area(tmp_path, "library") / slug / "001.incoming").exists()
 
 
 def test_keeps_the_staging_area_out_of_the_reader_index(panel_server: Client, tmp_path: Path):
@@ -793,13 +868,16 @@ def test_keeps_the_staging_area_out_of_the_reader_index(panel_server: Client, tm
 
 @pytest.fixture
 def panel_with_jobs(tmp_path: Path):
-    (tmp_path / "library" / "Obra" / "001").mkdir(parents=True)
     (tmp_path / "reader").mkdir()
 
     cfg = Config(root=tmp_path)
     migrate(cfg)
     with connect(cfg) as connection:
         ensure_owner(connection, OWNER_EMAIL, OWNER_PASSWORD)
+
+    # Depois de `ensure_owner`, e nao antes: a area do dono e nomeada pelo id que
+    # essa chamada cria.
+    (owner_area(tmp_path, "library") / "Obra" / "001").mkdir(parents=True)
 
     with _Server(("127.0.0.1", 0), make_panel_handler(cfg)) as httpd:
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)

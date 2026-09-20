@@ -23,6 +23,10 @@ const SHOWCASE_INDEX = `${ROOT}/public/demo/demo-library.json`;
    sessao, e um id na URL seria convite para trocar o numero. */
 const MY_LIBRARY = `${ROOT}/u/library`;
 
+/* Quem sou eu, e que instancia e esta. Responde sem sessao tambem - e dela que
+   sai a diferenca entre "esta aberta a visitante" e "e sua, entre". */
+const SESSION = `${ROOT}/api/session`;
+
 const REPOSITORY = "https://github.com/Italoneri/Tradutor-mangas";
 
 const el = {
@@ -167,6 +171,30 @@ function panelLinkHtml() {
   return `<a class="btn btn-secondary" href="admin.html">Painel</a>`;
 }
 
+/* A tela de quem chegou sem sessao numa instancia que nao e vitrine.
+
+   Existe porque a porta estava escondida: sem sessao o leitor caia na vitrine, e
+   no modo vitrine o botao do painel era omitido de proposito. O unico caminho
+   restante era adivinhar `admin.html` - e quem nao adivinhava subia capitulo como
+   visitante anonimo, com teto de 40MB, sem entender por que o zip nao passava. */
+function renderLocked() {
+  document.title = "Tinta";
+  setChrome({});
+  el.main.className = "";
+  el.main.innerHTML = `<section class="invite">
+    <h2>Sua biblioteca</h2>
+    <p>Entre para ver as suas obras e subir capítulos.</p>
+    <div class="invite-actions">
+      <a class="btn btn-primary" href="admin.html#entrar">Entrar</a>
+      <a class="btn btn-secondary" href="${REPOSITORY}" rel="noopener">Ver o código</a>
+    </div>
+    <p class="fine">
+      Sem entrar, o que você subir vale como amostra de visitante: 12 páginas e 40MB,
+      e some em 48 horas.
+    </p>
+  </section>`;
+}
+
 /* O convite da vitrine. Fica depois das obras, e nao antes: quem chegou de um
    link quer ver a traducao funcionando primeiro, e so entao decide se sobe algo. */
 function inviteHtml() {
@@ -210,7 +238,7 @@ function renderShelf(library, { showcase }) {
       <div>${heading}</div>
       <div class="head-actions">
         <span class="count">${library.series.length} ${library.series.length === 1 ? "obra" : "obras"}</span>
-        ${showcase ? "" : panelLinkHtml()}
+        ${panelLinkHtml()}
       </div>
     </div>
     <div class="shelf">${library.series.map(workHtml).join("")}</div>
@@ -594,8 +622,15 @@ async function loadLibrary() {
   const mine = await fetchJson(MY_LIBRARY).catch(() => null);
   if (mine) return { library: mine, showcase: false };
 
+  /* Sem sessao, quem decide o que aparece e a instancia, e nao o leitor. Numa
+     instalacao privada a resposta certa e a tela de entrar: cair na vitrine
+     escondia o painel exatamente de quem e dono da maquina, porque o botao dele
+     so existia fora do modo vitrine. */
+  const session = await fetchJson(SESSION).catch(() => null);
+  if (session && !session.showcase) return { library: null, showcase: false, locked: true };
+
   const demo = await fetchJson(SHOWCASE_INDEX).catch(() => null);
-  return demo ? { library: demo, showcase: true } : null;
+  return demo ? { library: demo, showcase: true } : { library: null, showcase: false, locked: true };
 }
 
 async function main() {
@@ -604,6 +639,10 @@ async function main() {
   const loaded = await loadLibrary();
   if (!loaded) {
     fail("Nao achei biblioteca nenhuma. Rode `mangatl build-library` e recarregue.");
+    return;
+  }
+  if (loaded.locked) {
+    renderLocked();
     return;
   }
   const { library, showcase } = loaded;

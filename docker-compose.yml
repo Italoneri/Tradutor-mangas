@@ -5,10 +5,11 @@
 #           nao pode matar o capitulo que ele esta traduzindo no meio.
 #   caddy   HTTPS, limites de corpo, timeouts e a entrega dos bytes.
 #
-# `docker compose up -d` sobe os tres. O `caddy` exige um dominio configurado no
-# Caddyfile; para rodar so na sua maquina, use o perfil `local`:
+# `docker compose up -d` sobe `app` e `worker`, que e o suficiente para rodar na
+# sua maquina. O `caddy` esta atras do perfil `public` porque exige um dominio
+# real no Caddyfile e as portas 80/443 livres:
 #
-#     docker compose --profile local up -d app worker
+#     docker compose --profile public up -d
 
 x-app: &app
   build: .
@@ -24,6 +25,7 @@ x-app: &app
     # a sessao pareceria nao existir.
     COOKIE_SECURE: ${COOKIE_SECURE:-1}
     MAX_TOTAL_DISK_BYTES: ${MAX_TOTAL_DISK_BYTES:-}
+    PUBLIC_SHOWCASE: ${PUBLIC_SHOWCASE:-0}
   volumes:
     # O acervo e o banco. E o unico diretorio que precisa de backup.
     - ./data:/app/data
@@ -43,6 +45,7 @@ services:
       OWNER_PASSWORD: ${OWNER_PASSWORD:-}
       COOKIE_SECURE: ${COOKIE_SECURE:-1}
       MAX_TOTAL_DISK_BYTES: ${MAX_TOTAL_DISK_BYTES:-}
+      PUBLIC_SHOWCASE: ${PUBLIC_SHOWCASE:-0}
       # O prefixo que o Caddy serve como `internal`. Definido, o app autoriza e
       # devolve o caminho; os bytes saem pelo proxy e o worker Python volta a
       # atender na hora.
