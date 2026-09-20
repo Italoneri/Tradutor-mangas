@@ -36,6 +36,7 @@ import re
 import shutil
 import sqlite3
 import sys
+import traceback
 import zipfile
 from collections.abc import Callable, Sequence
 from http import HTTPStatus
@@ -1262,24 +1263,44 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
                 client_ip=self.client_address[0] if self.client_address else "",
             )
 
+            # A sessao recem-aberta viaja no cookie ate nas respostas de erro. Sem
+            # isto, uma primeira escrita que nao passa na validacao deixa a linha de
+            # sessao no banco e nao entrega o cookie: o cliente volta sem sessao,
+            # abre outra na tentativa seguinte, e quem erra em laco vira uma fabrica
+            # de sessoes orfas.
+            cookie: dict[str, str] = {}
+            if issued is not None and session is not None:
+                cookie["Set-Cookie"] = cookie_header(issued, hours=hours_for(session.user.kind))
+
             try:
                 status, payload = route.handler(context, groups, body)
             except Invalid as error:
-                self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(error)})
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(error)}, headers=cookie
+                )
                 return True
             except QuotaExceeded as error:
                 # 429 com a mensagem que explica o teto, e nao erro generico: quem
                 # bateu na cota precisa saber qual e ela para decidir o que fazer.
-                self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": str(error)})
+                self._send_json(
+                    HTTPStatus.TOO_MANY_REQUESTS, {"error": str(error)}, headers=cookie
+                )
                 return True
             except OutOfSpace as error:
                 # 507 e nao 429: o limite nao e desta pessoa, e tentar de novo em
                 # um minuto nao adianta.
-                self._send_json(HTTPStatus.INSUFFICIENT_STORAGE, {"error": str(error)})
+                self._send_json(
+                    HTTPStatus.INSUFFICIENT_STORAGE, {"error": str(error)}, headers=cookie
+                )
                 return True
             except Exception:  # noqa: BLE001 - erro nosso vira 500, nunca stack na resposta
-                self.log_error("falha em %s %s", method, path)
-                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "falha no painel"})
+                # A resposta nunca leva stack; o log do servidor sempre leva. Sem o
+                # traceback aqui, um 500 vira "falha em POST /rota" e nada mais, e a
+                # causa morre no processo onde aconteceu.
+                self.log_error("falha em %s %s\n%s", method, path, traceback.format_exc())
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "falha no painel"}, headers=cookie
+                )
                 return True
 
             self._respond(status, payload, issued=issued, kind=session.user.kind if session else None)

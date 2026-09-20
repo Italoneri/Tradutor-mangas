@@ -234,6 +234,18 @@ def expired_testers(connection: sqlite3.Connection, moment: str | None = None) -
     return [user_from_row(row) for row in rows]
 
 
+def has_legacy_library(cfg: Config) -> bool:
+    """Se a raiz do projeto ainda guarda um acervo de antes das contas.
+
+    Diretorio vazio nao conta. `library/` sobrevive a migracao como casca vazia, e
+    tratar a casca como acervo prenderia o dono na raiz para sempre.
+    """
+    library = cfg.library_dir
+    if not library.is_dir():
+        return False
+    return any(entry.is_dir() for entry in library.iterdir())
+
+
 def area_config(cfg: Config, user: User) -> Config:
     """O `Config` que descreve a area deste usuario.
 
@@ -241,11 +253,18 @@ def area_config(cfg: Config, user: User) -> Config:
     de `migrate-to-accounts`: enquanto o acervo dele estiver na raiz do projeto, e
     la que ele mora. Testador nao tem essa saida - a area dele nasce no primeiro
     upload e nunca foi a raiz.
+
+    A excecao pergunta pela raiz, e nao pela area. Perguntar pela area devolvia a
+    raiz para todo dono recem-criado, porque a area so passa a existir no primeiro
+    upload - entao numa instalacao nova o painel escrevia em `library/`, fora de
+    qualquer conta, que e exatamente o que a area existe para impedir. Num
+    contêiner isso nem falha silenciosamente: `/app/library` nao e gravavel e o
+    upload morre com `PermissionError`.
     """
     derived = config_for_user(cfg, user.id)
     if derived is None:
         return cfg
-    if user.is_owner and not derived.library_dir.is_dir():
+    if user.is_owner and not derived.library_dir.is_dir() and has_legacy_library(cfg):
         return cfg
     return derived
 

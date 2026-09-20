@@ -6,6 +6,7 @@ import pytest
 
 from .accounts import (
     MigrationRefused,
+    area_config,
     config_for_user,
     create_user,
     delete_user,
@@ -206,3 +207,46 @@ def test_points_the_cli_config_at_the_project_root_before_migrating(cfg):
     _seed_project(cfg.root)
 
     assert owner_config(cfg).library_dir == cfg.root / "library"
+
+
+# ---------- area_config ----------
+
+
+def _owner(cfg):
+    migrate(cfg)
+    with connect(cfg) as connection:
+        return create_user(connection, kind="owner", email="dono@exemplo.com")
+
+
+def test_keeps_the_owner_on_the_project_root_while_the_old_library_has_content(cfg):
+    _seed_project(cfg.root)
+    owner = _owner(cfg)
+
+    assert area_config(cfg, owner).library_dir == cfg.root / "library"
+
+
+def test_sends_a_fresh_owner_to_their_own_area(cfg):
+    """Instalacao nova nao tem acervo na raiz, e o dono novo nao pode herdar a raiz.
+
+    A area so nasce no primeiro upload, entao perguntar se ela existe devolvia a
+    raiz para todo dono recem-criado - e o painel gravava fora de qualquer conta.
+    """
+    owner = _owner(cfg)
+
+    assert area_config(cfg, owner).library_dir == user_path(cfg, owner.id, "library")
+
+
+def test_ignores_an_empty_library_left_behind_by_the_migration(cfg):
+    owner = _owner(cfg)
+    (cfg.root / "library").mkdir()
+
+    assert area_config(cfg, owner).library_dir == user_path(cfg, owner.id, "library")
+
+
+def test_never_sends_a_tester_to_the_project_root(cfg):
+    _seed_project(cfg.root)
+    migrate(cfg)
+    with connect(cfg) as connection:
+        tester = create_user(connection, kind="tester")
+
+    assert area_config(cfg, tester).library_dir == user_path(cfg, tester.id, "library")

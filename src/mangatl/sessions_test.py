@@ -300,3 +300,29 @@ def test_gives_the_anonymous_session_an_expiry(server: Client, tmp_path: Path):
 
     assert row is not None
     assert row["expires_at"] > now()
+
+
+def test_hands_over_the_new_session_even_when_the_write_is_refused(server: Client, tmp_path: Path):
+    """O cookie sai junto com o 422, e nao so com o 201.
+
+    A sessao anonima nasce antes do handler rodar. Se o cookie so viajasse na
+    resposta boa, toda escrita recusada deixaria a linha no banco sem ninguem
+    para usa-la, e a tentativa seguinte abriria outra - quem erra em laco viraria
+    uma fabrica de sessoes orfas.
+    """
+    status, _, headers = server.raw(
+        "POST", "/api/series", json.dumps({"slug": "../fora"}).encode("utf-8")
+    )
+
+    assert status == 422
+    assert headers["set-cookie"].startswith(f"{COOKIE_NAME}=")
+
+
+def test_reuses_that_session_instead_of_opening_another(server: Client, tmp_path: Path):
+    server.send("POST", "/api/series", json.dumps({"slug": "../fora"}).encode("utf-8"))
+    server.send("POST", "/api/series", json.dumps({"slug": "../fora"}).encode("utf-8"))
+    server.send("POST", "/api/series", json.dumps({"slug": "Minha"}).encode("utf-8"))
+
+    with connect(Config(root=tmp_path)) as connection:
+        testers = connection.execute("SELECT COUNT(*) AS n FROM users WHERE kind = 'tester'")
+        assert testers.fetchone()["n"] == 1
