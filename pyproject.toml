@@ -36,4 +36,7 @@ packages = ["src/mangatl"]
 python_files = ["*_test.py"]
 testpaths = ["src/mangatl"]
 # Sem cache: o DrvFs do /mnt/c rejeita as operacoes de permissao que ele faz.
-addopts = "-q -p no:cacheprovider"
+# `-ra` porque com `-q` um teste pulado vira um `s` no meio dos pontos, e a
+# bateria do proxy (`caddy_test.py`) pula inteira quando o Caddy nao esta de pe -
+# que e justamente quando o buraco que ela vigia estaria aberto sem ninguem ver.
+addopts = "-q -ra -p no:cacheprovider"

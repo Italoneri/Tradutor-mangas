@@ -479,9 +479,30 @@ A instância pública tem dois papéis, e eles não são simétricos:
 
 ```bash
 cp .env.example .env               # OWNER_EMAIL, OWNER_PASSWORD, ACME_EMAIL
-$EDITOR Caddyfile                  # troque tinta.example.com pelo seu domínio
+$EDITOR .env                       # SITE_ADDRESS=seu.dominio, PUBLIC_SHOWCASE=1
 docker compose --profile public up -d
 ```
+
+`PUBLIC_SHOWCASE` vem desligada. Desligada, quem chega sem sessão recebe a tela
+de entrar; é o que a instalação de uma pessoa só quer, e é o padrão porque abrir
+numa vitrine escondia o painel justamente de quem é dono da máquina. Ligue com
+`1` se a instância existe para demonstrar o pipeline a quem não tem conta — aí o
+visitante vê as amostras e pode subir 12 páginas sem cadastro.
+
+**Antes de apontar o domínio, rode a bateria do proxy.** Ela não roda com o
+`pytest` normal, porque o perfil `public` não sobe por padrão e o buraco que ela
+vigia mora no `Caddyfile`, fora do alcance do app:
+
+```bash
+SITE_ADDRESS=":80" CADDY_HTTP_PORT=18080 ACME_EMAIL=a@b.com     docker compose --profile public up -d
+docker run --rm --network traduo_default -v "$PWD/src:/app/src" -w /app     -e MANGATL_PROXY_URL=http://caddy:80 -e MANGATL_APP_URL=http://app:8000     -e MANGATL_PROXY_EMAIL=... -e MANGATL_PROXY_PASSWORD=...     mangatl:dev python -m pytest src/mangatl/caddy_test.py
+```
+
+São os casos 8, 9 e 10 do plano: o prefixo interno não responde de fora, os
+caminhos crus continuam 404, e o capítulo inteiro chega com o Caddy transmitindo
+— não o Python. Já falhou de verdade uma vez, servindo `data/mangatl.db` para a
+internet enquanto o `pytest` passava inteiro. Repita contra o domínio público, de
+outra rede, depois de subir.
 
 **Por que a instância pública é limitada.** O motor `claude` está desligado lá
 porque a chave da API seria a do dono — cada tradução de um visitante sairia da

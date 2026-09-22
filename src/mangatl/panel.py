@@ -116,12 +116,17 @@ Nenhuma rota daqui recebe id de usuario. Ele vem da sessao, e so de la: um id na
 URL e convite para trocar o numero e ler o acervo do vizinho."""
 
 INTERNAL_REDIRECT_ENV = "INTERNAL_REDIRECT_PREFIX"
-"""Prefixo interno que o proxy serve e que nao e alcancavel de fora.
+"""Prefixo interno que o proxy consome no meio da resposta.
 
 Definido, o handler autoriza e devolve `X-Accel-Redirect` com o caminho; o proxy
 le do disco e transmite, e o worker Python volta a atender na hora. Um capitulo
 sao 155 JPEGs - com quatro leitores baixando, cada imagem segurando um worker
 durante o download derruba o servidor.
+
+Que este prefixo nao responda como rota publica e responsabilidade do
+`Caddyfile`, nao deste modulo - e ja falhou uma vez, servindo `data/mangatl.db`
+para a internet enquanto o `pytest` passava inteiro. Quem confere sao os casos 8
+e 9 de `caddy_test.py`, com o proxy de pe.
 
 Ausente, o Python transmite em pedacos. Funciona, e e divida anotada."""
 
@@ -1201,9 +1206,16 @@ def _open_tester_session(connection: sqlite3.Connection) -> tuple[Session, str]:
 def _internal_redirect(cfg: Config, path: Path) -> str | None:
     """O caminho interno que o proxy serve, ou None para transmitir daqui.
 
-    O prefixo mapeia a raiz do projeto dentro do proxy e NAO e alcancavel de fora -
-    se for, toda a autorizacao deste modulo passa a ser decorativa, porque o
-    caminho direto responde sem passar por aqui.
+    O prefixo mapeia a raiz do projeto dentro do proxy. Se ele responder de fora,
+    toda a autorizacao deste modulo vira decoracao - existiria um caminho que nao
+    passa por aqui. Mas quem garante isso e o `Caddyfile`, e nao esta funcao: aqui
+    so se monta a string.
+
+    Esta frase ja esteve escrita como se fosse promessa deste arquivo, e enquanto
+    ela estava, o `Caddyfile` tinha um `handle_path /_internal/*` de primeiro nivel
+    servindo `data/mangatl.db` para a internet. Comentario nao e controle. O
+    controle sao os casos 8 e 9 de `caddy_test.py`, que pedem o prefixo de fora,
+    com o proxy de pe, e exigem 404.
     """
     prefix = os.environ.get(INTERNAL_REDIRECT_ENV, "").strip()
     if not prefix:
