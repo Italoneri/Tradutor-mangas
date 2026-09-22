@@ -71,11 +71,15 @@ services:
     profiles: ["public"]
     depends_on: [app]
     ports:
-      - "80:80"
+      - "${CADDY_HTTP_PORT:-80}:80"
       - "443:443"
       - "443:443/udp"
     environment:
       ACME_EMAIL: ${ACME_EMAIL:-}
+      # O endereco do site. Em producao e o dominio; a bateria do proxy sobe isto
+      # como `:80` para pedir os caminhos internos de fora sem dominio nem
+      # certificado - os casos 8 e 9 nao existem sem o proxy de pe.
+      SITE_ADDRESS: ${SITE_ADDRESS:-tinta.example.com}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       # Somente leitura: o proxy entrega bytes, nunca escreve no acervo.

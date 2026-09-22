@@ -8,7 +8,9 @@
 #    worker Python durante o download, quatro leitores derrubariam o servidor.
 #    O app autoriza e responde vazio com `X-Accel-Redirect`; o Caddy le do disco.
 #
-# Troque `tinta.example.com` pelo seu dominio antes de subir.
+# Troque `tinta.example.com` pelo seu dominio antes de subir, ou defina
+# `SITE_ADDRESS`. A bateria do proxy usa `SITE_ADDRESS=:8080` para subir isto
+# sem dominio nem certificado.
 
 {
 	# Sem isto o Caddy tenta emitir certificado para um dominio que ainda nao
@@ -16,7 +18,7 @@
 	email {$ACME_EMAIL}
 }
 
-tinta.example.com {
+{$SITE_ADDRESS:tinta.example.com} {
 	encode zstd gzip
 
 	header {
@@ -30,21 +32,26 @@ tinta.example.com {
 		-Server
 	}
 
-	# O caminho interno que o app aponta em `X-Accel-Redirect`. `internal` e a
-	# palavra que importa: sem ela este prefixo responderia de fora, e toda a
-	# autorizacao do `panel.py` viraria decoracao - bastaria pedir por aqui.
-	handle_path /_internal/* {
-		root * /app
-		file_server
+	# NAO crie um bloco `handle_path /_internal/*` aqui. Ele parece o equivalente
+	# do `internal` do nginx e nao e: `internal` nao existe no Caddy, e uma rota de
+	# primeiro nivel responde de fora. Com `data/` montado aqui, um `GET
+	# /_internal/data/mangatl.db` entregaria o banco - e com os UUIDs de dentro
+	# dele, o acervo de qualquer conta. A Fase 3 inteira viraria decoracao, porque
+	# existiria um caminho que nao passa por ela.
+	#
+	# A entrega mora dentro do `reverse_proxy`, abaixo: `handle_response` roda no
+	# meio da resposta e nao reentra nas rotas do site, entao o prefixo nunca
+	# existe como rota publica. Quem prova isso sao os casos 8 e 9 da bateria, em
+	# `caddy_test.py`, que pedem estes caminhos de fora e exigem 404.
+	# Um zip de capitulo passa raspando de 100MB; o teto da rota no app e 500MB, e
+	# este numero precisa caber os dois. Diretiva de site, e nao subdiretiva do
+	# `reverse_proxy`: escrita la dentro o Caddy recusa a configuracao inteira e
+	# nem sobe.
+	request_body {
+		max_size 512MB
 	}
 
 	reverse_proxy app:8000 {
-		# Um zip de capitulo passa raspando de 100MB; o teto da rota no app e
-		# 500MB, e este numero precisa caber os dois.
-		request_body {
-			max_size 512MB
-		}
-
 		# `http.server` nao fecha conexao lenta sozinho. Estes fecham.
 		transport http {
 			read_timeout 120s
@@ -54,10 +61,19 @@ tinta.example.com {
 
 		# A troca que tira o Python do caminho dos bytes: o app responde vazio
 		# com o caminho interno, e o Caddy transmite o arquivo.
+		#
+		# O `route` fixa a ordem. Dentro de um sub-roteador o Caddy ordena pela
+		# ordem padrao das diretivas, e nao pela ordem escrita - sem ele o
+		# `strip_prefix` roda antes do `rewrite` e apaga o prefixo de um caminho
+		# que ainda nem foi reescrito.
 		@accel header X-Accel-Redirect *
 		handle_response @accel {
-			rewrite * {rp.header.X-Accel-Redirect}
-			file_server
+			route {
+				rewrite * {rp.header.X-Accel-Redirect}
+				uri strip_prefix /_internal
+				root * /app
+				file_server
+			}
 		}
 	}
 }

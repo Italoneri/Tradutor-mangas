@@ -455,12 +455,72 @@ trocar o número e ler o acervo do vizinho.
 ### 3.2 Entrega pelo proxy
 
 Depois de autorizar, responda com cabeçalho de redirecionamento interno
-(`X-Accel-Redirect` no nginx; no Caddy, a diretiva equivalente) apontando para um
-prefixo interno que o proxy serve e que **não** é alcançável de fora. O worker
-Python devolve uma resposta vazia e volta a atender.
+(`X-Accel-Redirect`) apontando para um prefixo que o proxy serve e que **não** é
+alcançável de fora. O worker Python devolve uma resposta vazia e volta a atender.
 
 Se preferir não depender disso no começo, transmita em pedaços pelo Python e
 anote como dívida — mas meça: 155 imagens por capítulo, 4 leitores simultâneos.
+
+#### 3.2.1 A armadilha do prefixo interno — leia antes de escrever o Caddyfile
+
+**Encontrada em auditoria, na primeira versão deste arquivo. Não é hipótese.**
+
+`internal` é diretiva do **nginx** (`location /interno/ { internal; }`), que marca
+uma rota como alcançável só por redirecionamento interno. **O Caddy não tem
+equivalente.** Escrever um bloco de primeiro nível confiando que existe produz
+isto, que parece certo e está aberto para a internet:
+
+```
+# ERRADO. Este bloco responde de fora.
+handle_path /_internal/* {
+	root * /app
+	file_server
+}
+```
+
+`handle_path` é uma rota exclusiva de primeiro nível no bloco do site: um pedido a
+`/_internal/qualquer/coisa` é atendido ali e **nunca chega ao `reverse_proxy`**.
+Nada restringe quem pede. Com `./data:/app/data` montado no contêiner do proxy, a
+sequência de exploração é curta:
+
+1. `GET /_internal/data/mangatl.db` — o banco inteiro: e-mail do dono, hash da
+   senha, todos os `user_id`, hashes de sessão;
+2. com os UUIDs, `GET /_internal/data/users/<uuid>/library/<serie>/001/p0001.jpg`
+   — qualquer arquivo de qualquer conta.
+
+Toda esta Fase 3 vira decoração, porque existe um caminho que não passa por ela. E
+como o repositório vai a público, `data/mangatl.db` deixa de ser adivinhação e
+passa a ser documentação.
+
+**O bloco de primeiro nível não é só perigoso: é desnecessário.** No Caddy o
+`handle_response` já roda dentro do `reverse_proxy` e não reentra nas rotas do
+site. A entrega mora ali dentro, e o prefixo nunca existe como rota pública:
+
+```
+@accel header X-Accel-Redirect *
+handle_response @accel {
+	route {
+		rewrite * {rp.header.X-Accel-Redirect}
+		uri strip_prefix /_internal
+		root * /app
+		file_server
+	}
+}
+```
+
+O `route` está ali para fixar a ordem: dentro de um sub-roteador o Caddy ordena
+diretiva pela ordem padrão dele, não pela ordem escrita, e `rewrite` precisa
+acontecer antes do `strip_prefix`.
+
+**A verificação não é reler a configuração, é o `curl` de fora** — ordenação de
+diretiva em `handle_response` é exatamente o tipo de coisa que se testa em vez de
+se deduzir. Está na bateria abaixo, casos 8 e 9.
+
+Vale a mesma desconfiança para qualquer comentário que afirme uma proteção: o
+buraco original vinha acompanhado de duas frases dizendo que ele não existia, uma
+no `Caddyfile` e outra no `panel.py`. **Comentário não é controle.** Se um
+comentário afirma que algo não é alcançável, ou existe um teste que prova, ou a
+frase sai.
 
 ### 3.3 O leitor muda de endereço
 
@@ -504,7 +564,25 @@ autorizar.
 6. Testador tentando `POST /api/jobs` com `engine=claude` → 403.
 7. Testador tentando rota de dono → 403.
 
+Os sete acima batem no app Python e podem rodar contra o handler direto, como o
+`isolation_test.py` faz. **Os dois seguintes não:** o buraco da seção 3.2.1 mora
+no proxy, e teste que não cruza a camada que falha não protege nada. Eles só
+valem contra o servidor real, **com o Caddy na frente**:
+
+8. `GET /_internal/data/mangatl.db` → 404.
+9. `GET /_internal/data/users/` e `/_internal/` → 404.
+
+E um de regressão, porque a correção mexe justamente no caminho de entrega:
+
+10. Logado, abrir um capítulo inteiro e confirmar que todas as imagens chegam,
+    com `X-Accel-Redirect` saindo do app e o Caddy transmitindo — não o Python.
+
 Relate cada um com a resposta observada. **Nenhum pode falhar.**
+
+Repita os casos 8, 9 e 10 na Fase 5, agora contra o domínio público e de outra
+rede. Em ambiente local o Caddy costuma nem estar de pé — o perfil `public` não
+sobe por padrão —, e um teste que não rodou passa com a mesma cara de um que
+passou.
 
 ---
 
@@ -552,6 +630,13 @@ afetado. Reinicie o contêiner no meio de um job e confirme que ele volta. Relat
 - Caddy na frente: HTTPS automático, `request_body max_size` compatível com o
   upload, timeouts de leitura e escrita, cabeçalhos de segurança
   (`Content-Security-Policy`, `X-Content-Type-Options`, `Referrer-Policy`).
+- **Reveja a seção 3.2.1 com o `Caddyfile` aberto do lado.** É o único lugar do
+  sistema onde um erro de configuração desfaz a Fase 3 inteira sem nenhum código
+  errado, e ele não aparece em teste local — o perfil `public` não sobe por
+  padrão, então o proxy costuma nem estar de pé quando o `pytest` passa.
+- O contêiner do proxy monta `data/` e `public/` **somente leitura**: ele entrega
+  bytes e nunca escreve no acervo. Monte só o que ele precisa servir; tudo que
+  for montado ali é alcançável se alguma rota vazar.
 - Segredos por variável de ambiente. **O `.env` do projeto não vai para a
   imagem** — confira com `docker history` que a chave não ficou numa camada.
 - Log estruturado sem dado pessoal e sem nome de arquivo do usuário.
@@ -620,27 +705,32 @@ máquina e de outra rede. Relate.
 
 ## Checklist
 
-- [ ] Fase 0: imagem construída, modelo embutido, RAM e segundos por fatia medidos e anotados
-- [ ] SQLite em WAL, migrações numeradas, hash do token de sessão (nunca o token)
-- [ ] `user_path` com a segunda tranca, testada contra symlink e caminho absoluto
-- [ ] Id de usuário é UUID do servidor e **não aparece em nenhuma URL**
-- [ ] `mangatl migrate-to-accounts` idempotente, acervo do dono preservado
-- [ ] Vitrine é `public/` estático, gerada na máquina do dono; o servidor hospedado nunca escreve lá
+- [x] Fase 0: imagem construída, modelo embutido, RAM e segundos por fatia medidos e anotados
+- [x] SQLite em WAL, migrações numeradas, hash do token de sessão (nunca o token)
+- [x] `user_path` com a segunda tranca, testada contra symlink e caminho absoluto
+- [x] Id de usuário é UUID do servidor e **não aparece em nenhuma URL**
+- [x] `mangatl migrate-to-accounts` idempotente, acervo do dono preservado
+- [x] Vitrine é `public/` estático, gerada na máquina do dono; o servidor hospedado nunca escreve lá
 - [ ] Conteúdo da vitrine é publicável, e a escolha está registrada no README
-- [ ] Vitrine abre sem cookie; sessão só nasce no primeiro upload
-- [ ] Vitrine usa o leitor e o seletor de motor de sempre, sem caminho de renderização próprio
-- [ ] Sessão anônima para testador; `scrypt` para o dono; 429 após 5 tentativas
-- [ ] CSRF por origem conferida, não só `SameSite`
-- [ ] `library/` e `output/` **não** são mais alcançáveis por caminho
-- [ ] Entrega por redirecionamento interno, ou dívida anotada e medida
-- [ ] `is_local_client` removido; papel `owner` nas rotas destrutivas
+- [x] Vitrine abre sem cookie; sessão só nasce no primeiro upload
+- [x] Vitrine usa o leitor e o seletor de motor de sempre, sem caminho de renderização próprio
+- [x] Sessão anônima para testador; `scrypt` para o dono; 429 após 5 tentativas
+- [x] CSRF por origem conferida, não só `SameSite`
+- [x] `library/` e `output/` **não** são mais alcançáveis por caminho
+- [x] Entrega por redirecionamento interno, ou dívida anotada e medida
+- [x] **Nenhum `handle_path /_internal/*` de primeiro nível no `Caddyfile`** — a entrega mora dentro do `handle_response` (seção 3.2.1)
+- [x] Proxy monta só `data/` e `public/`, somente leitura
+- [x] Nenhum comentário afirma proteção que não tenha teste provando
+- [x] `is_local_client` removido; papel `owner` nas rotas destrutivas
 - [ ] SW em v5, `/u/` e `/api/` fora do cache, cache limpo ao trocar de sessão
-- [ ] Testador não consegue selecionar `claude` — nem pela interface, nem pela API
-- [ ] Cotas aplicadas antes de gravar; 429 legível
-- [ ] Fila no banco; `running` volta a `pending` ao subir
-- [ ] Limpeza de testador vencido, e teto de disco com 507
+- [x] Testador não consegue selecionar `claude` — nem pela interface, nem pela API
+- [x] Cotas aplicadas antes de gravar; 429 legível
+- [x] Fila no banco; `running` volta a `pending` ao subir
+- [x] Limpeza de testador vencido, e teto de disco com 507
 - [ ] Chave da API fora da imagem, confirmado com `docker history`
-- [ ] `scripts/serve.py` apagado e o motivo escrito no README
+- [x] `scripts/serve.py` apagado e o motivo escrito no README
 - [ ] README com: rodar local com chave própria, custo medido, por que a instância pública é limitada, requisitos reais, e o que o projeto não é
-- [ ] Termos publicados, com prazo de expiração e endereço para remoção
-- [ ] **Os 7 testes da Fase 3.7 executados contra o domínio público, de outra rede**
+- [x] Termos publicados, com prazo de expiração e endereço para remoção
+- [x] Os 7 primeiros testes da Fase 3.7 passando contra o app
+- [x] Os casos 8, 9 e 10 executados com o Caddy na frente, localmente — `caddy_test.py`, 14 testes
+- [ ] **Os casos 8, 9 e 10 repetidos contra o domínio público, de outra rede**
