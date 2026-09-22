@@ -722,14 +722,15 @@ máquina e de outra rede. Relate.
 - [x] Proxy monta só `data/` e `public/`, somente leitura
 - [x] Nenhum comentário afirma proteção que não tenha teste provando
 - [x] `is_local_client` removido; papel `owner` nas rotas destrutivas
-- [ ] SW em v5, `/u/` e `/api/` fora do cache, cache limpo ao trocar de sessão
+- [x] SW em v5, `/u/` e `/api/` fora do cache — conferido no navegador: depois de bater nas cinco rotas privadas, o cache segue com os 8 arquivos do `reader/` e nada mais
+- [x] Cache limpo ao sair da conta (`postMessage` de purge no logout). O gatilho por troca de id de sessão do plano não foi escrito: nada de `/u/` ou `/api/` entra no cache, então não há conteúdo de sessão para limpar — o purge do logout já é folga
 - [x] Testador não consegue selecionar `claude` — nem pela interface, nem pela API
 - [x] Cotas aplicadas antes de gravar; 429 legível
 - [x] Fila no banco; `running` volta a `pending` ao subir
 - [x] Limpeza de testador vencido, e teto de disco com 507
-- [ ] Chave da API fora da imagem, confirmado com `docker history`
+- [x] Chave da API fora da imagem, confirmado com `docker history` — 27 camadas, nenhuma ocorrência, e `.env` não está na imagem
 - [x] `scripts/serve.py` apagado e o motivo escrito no README
-- [ ] README com: rodar local com chave própria, custo medido, por que a instância pública é limitada, requisitos reais, e o que o projeto não é
+- [x] README com: rodar local com chave própria, custo medido, por que a instância pública é limitada, requisitos reais, e o que o projeto não é — mais `PUBLIC_SHOWCASE` e a bateria do proxy
 - [x] Termos publicados, com prazo de expiração e endereço para remoção
 - [x] Os 7 primeiros testes da Fase 3.7 passando contra o app
 - [x] Os casos 8, 9 e 10 executados com o Caddy na frente, localmente — `caddy_test.py`, 14 testes
