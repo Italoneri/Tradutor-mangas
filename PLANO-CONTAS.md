@@ -946,6 +946,6 @@ todo dia, em ordem de valor.
 - [x] 7.4 Folga de disco reservada para o dono
 - [x] 7.5 `attempts` na fila; job que derruba o worker 3 vezes vira `failed`
 - [x] 7.6 Limpeza de `.upload` órfão e de `.incoming` abandonado
-- [ ] 7.7 Apagar capítulo pela sessão, e série pelo dono
+- [x] 7.7 Apagar capítulo pela sessão, e série pelo dono
 - [ ] 7.8 Menores: health enxuto, `src;C` apagada, README corrigido, seção 4 atualizada
 - [ ] Backup de `data/` implementado (`mangatl backup`), e não só pedido na Fase 5

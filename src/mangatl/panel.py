@@ -59,6 +59,7 @@ from .jobs import (
     Busy,
     enqueue,
     get as get_job,
+    has_active,
     queue_position,
     recent as recent_jobs,
 )
@@ -110,6 +111,7 @@ from .store import (
     load_glossary,
     load_series_meta,
     save_glossary,
+    save_library,
     save_series_meta,
 )
 
@@ -957,7 +959,9 @@ def _get_incoming(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[i
 def _delete_incoming(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
     """Descarta a area de espera.
 
-    E a unica remocao que o painel faz, e so apaga o que ele proprio escreveu.
+    E da sessao, e nao so do dono: a area vem do cookie e nao da URL, entao quem
+    pede so alcanca a propria. Sem isto, um testador com upload quebrado ficava
+    preso ate a sessao expirar.
     """
     _, incoming = _chapter_paths(ctx.cfg, groups[0], groups[1])
     if not incoming.is_dir():
@@ -966,6 +970,62 @@ def _delete_incoming(ctx: Context, groups: tuple[str, ...], body: bytes) -> tupl
     removed = len(_incoming_files(incoming))
     shutil.rmtree(incoming)
     return HTTPStatus.OK, {"removed": removed}
+
+
+def _existing_series_dir(cfg: Config, slug: str) -> Path | None:
+    """A pasta da serie nesta area, ou None - que vira 404, e nao 422.
+
+    Para apagar, "nao existe" e "nao e seu" precisam da mesma resposta, pelo mesmo
+    motivo das rotas `/u/`: a diferenca seria um indice do acervo alheio.
+    """
+    return _inside(cfg.library_dir, slug)
+
+
+def _delete_chapter(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Apaga um capitulo da area de quem pede: as paginas e a traducao.
+
+    E o que torna verdadeira a mensagem de cota do testador - "apague um para
+    subir outro" - que ate aqui mandava fazer algo que nao existia.
+    """
+    series, chapter = groups
+    directory = _existing_series_dir(ctx.cfg, series)
+    pages = _inside(ctx.cfg.library_dir, series, chapter)
+    if directory is None or pages is None or not pages.is_dir():
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+    if has_active(ctx.connection, ctx.user.id, directory.name, pages.name):
+        return HTTPStatus.CONFLICT, {"error": "este capitulo esta na fila; espere terminar"}
+
+    shutil.rmtree(pages)
+    translation = _inside(ctx.cfg.output_dir, series, chapter)
+    if translation is not None and translation.is_dir():
+        shutil.rmtree(translation)
+    _refresh_library(ctx.cfg)
+    return HTTPStatus.OK, {"deleted": f"{directory.name}/{pages.name}"}
+
+
+def _delete_series(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Apaga uma serie inteira. So o dono, e a tela pede confirmacao antes."""
+    directory = _existing_series_dir(ctx.cfg, groups[0])
+    if directory is None or not directory.is_dir():
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+    if has_active(ctx.connection, ctx.user.id, directory.name):
+        return HTTPStatus.CONFLICT, {"error": "esta serie tem capitulo na fila; espere terminar"}
+
+    shutil.rmtree(directory)
+    translation = _inside(ctx.cfg.output_dir, directory.name)
+    if translation is not None and translation.is_dir():
+        shutil.rmtree(translation)
+    _refresh_library(ctx.cfg)
+    return HTTPStatus.OK, {"deleted": directory.name}
+
+
+def _refresh_library(cfg: Config) -> None:
+    """Regrava o `library.json`, que o leitor local le em vez do disco.
+
+    Sem isto o capitulo apagado continua na estante ate o proximo job terminar.
+    """
+    if cfg.output_dir.is_dir():
+        save_library(cfg, build_library(cfg))
 
 
 def _commit_chapter(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
@@ -1259,16 +1319,22 @@ ROUTES: tuple[Route, ...] = (
         "DELETE",
         re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/incoming$"),
         _delete_incoming,
-        access="owner",
         writes=True,
     ),
+    Route(
+        "DELETE",
+        re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}$"),
+        _delete_chapter,
+        writes=True,
+    ),
+    Route("DELETE", re.compile(rf"^/api/series/{_SLUG}$"), _delete_series, access="owner", writes=True),
 )
 """Toda rota diz quem pode chama-la e se ela escreve.
 
-As `owner` sao as que destroem ou mudam o que vale para o acervo inteiro: apagar
-a area de espera, reescrever `series.json`, trocar a capa e editar o glossario.
-Um testador nao precisa de nenhuma delas para ver a ferramenta funcionando, e dar
-qualquer uma seria dar a ele a chave do acervo do dono."""
+As `owner` sao as que mudam o acervo inteiro: apagar uma serie, reescrever
+`series.json`, trocar a capa e editar o glossario. Apagar capitulo e area de
+espera e da sessao: a area vem do cookie, entao o testador so alcanca a propria,
+e sem essas duas ele nao tinha como sair da cota nem de um upload quebrado."""
 
 
 def request_path(target: str) -> str:

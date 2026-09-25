@@ -256,6 +256,26 @@ def requeue_running(connection: sqlite3.Connection) -> int:
     return cursor.rowcount
 
 
+def has_active(
+    connection: sqlite3.Connection, user_id: str, series: str, chapter: str | None = None
+) -> bool:
+    """Se esta pessoa tem job esperando ou rodando nesta serie - ou neste capitulo.
+
+    Apagar o que o worker esta lendo transformaria o job num erro de arquivo
+    sumido no meio do OCR; recusar a remocao enquanto ele vive e mais honesto.
+    """
+    row = connection.execute(
+        """
+        SELECT 1 FROM jobs
+        WHERE user_id = ? AND series = ? AND (? IS NULL OR chapter = ?)
+          AND state IN ('pending', 'running')
+        LIMIT 1
+        """,
+        (user_id, series, chapter, chapter),
+    ).fetchone()
+    return row is not None
+
+
 def get_any(connection: sqlite3.Connection, job_id: str) -> Job | None:
     """O job, sem filtrar por dono. So o worker usa: ele roda job de todo mundo."""
     row = connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()

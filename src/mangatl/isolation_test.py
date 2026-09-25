@@ -233,7 +233,7 @@ def test_never_offers_the_paid_engine_to_a_tester(server: Client):
         ("PUT", "/api/series/Minha/series.json"),
         ("PUT", "/api/series/Minha/glossary"),
         ("PUT", "/api/series/Minha/cover"),
-        ("DELETE", "/api/series/Minha/chapters/001/incoming"),
+        ("DELETE", "/api/series/Minha"),
     ],
 )
 def test_answers_403_for_an_owner_route_asked_by_a_tester(server: Client, method: str, path: str):
@@ -307,3 +307,69 @@ def test_opens_a_tester_session_only_when_the_showcase_is_public(
     assert got == status
     assert _user_count(tmp_path) - before == users_created
     assert (anonymous.cookie is not None) == bool(users_created)
+
+
+# ---------- 7.7 apagar alcanca so a propria area ----------
+
+
+def _tester_chapter(tester: Client, series: str, chapter: str) -> None:
+    """Sobe e promove um capitulo de uma pagina na area do testador."""
+    body = json.dumps({"slug": series}).encode("utf-8")
+    assert tester.send("POST", "/api/series", body)[0] in {201, 409}
+    base = f"/api/series/{series}/chapters"
+    assert tester.send("POST", base, json.dumps({"chapter": chapter}).encode())[0] == 201
+    assert tester.send("PUT", f"{base}/{chapter}/files/p0001.jpg", JPEG)[0] == 200
+    assert tester.send("POST", f"{base}/{chapter}/commit")[0] == 200
+
+
+def test_deletes_only_the_testers_chapter_with_the_owners_name(server: Client):
+    tester = _tester(server)
+    _tester_chapter(tester, "Segredo", "001")
+
+    status, _ = tester.send("DELETE", "/api/series/Segredo/chapters/001")
+
+    assert status == 200
+    assert tester.get("/u/library")[1].count(b'"001"') == 0
+    assert server.login() == 200
+    assert server.get("/u/pages/Segredo/001/p0001.jpg") == (200, JPEG)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/series/Segredo/chapters/001",
+        "/api/series/Minha/chapters/999",
+        "/api/series/Nenhuma/chapters/001",
+    ],
+)
+def test_answers_404_for_deleting_a_chapter_outside_the_own_area(server: Client, path: str):
+    tester = _tester(server)
+
+    assert tester.send("DELETE", path)[0] == 404
+
+
+def test_lets_a_tester_discard_their_own_incoming_area(server: Client):
+    tester = _tester(server)
+    base = "/api/series/Minha/chapters"
+    assert tester.send("POST", base, json.dumps({"chapter": "001"}).encode())[0] == 201
+    assert tester.send("PUT", f"{base}/001/files/p0001.jpg", JPEG)[0] == 200
+
+    assert tester.send("DELETE", f"{base}/001/incoming")[0] == 200
+    assert json.loads(tester.get(f"{base}/001/incoming")[1])["exists"] is False
+
+
+def test_refuses_to_delete_a_chapter_while_it_is_in_the_queue(server: Client):
+    tester = _tester(server)
+    _tester_chapter(tester, "Minha", "001")
+    job = json.dumps({"series": "Minha", "chapter": "001", "engine": "free"}).encode()
+    assert tester.send("POST", "/api/jobs", job)[0] == 202
+
+    assert tester.send("DELETE", "/api/series/Minha/chapters/001")[0] == 409
+
+
+def test_lets_the_owner_delete_a_whole_series(server: Client):
+    assert server.login() == 200
+
+    assert server.send("DELETE", "/api/series/Segredo")[0] == 200
+    assert server.get("/u/pages/Segredo/001/p0001.jpg")[0] == 404
+    assert server.get("/u/chapters/Segredo/001/chapter.free.json")[0] == 404

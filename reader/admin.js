@@ -8,9 +8,13 @@
    o painel. Quem sobe uma amostra sem conta nenhuma nao ve a de entrar - a sessao
    anonima nasce sozinha no primeiro upload.
 
-   O que esta tela deliberadamente nao faz: apagar obra, apagar capitulo,
-   renomear, reordenar pagina, editar traducao. Cada um e destrutivo ou grande, e
-   nenhum deles fica melhor escondido atras de um botao pequeno.
+   Apagar capitulo e obra pede dois cliques no mesmo botao, e nao um `confirm()`:
+   o dialogo do navegador bloqueia a pagina inteira, e o segundo clique no mesmo
+   lugar ja e a confirmacao. Obra inteira so aparece para o dono.
+
+   O que esta tela deliberadamente nao faz: renomear e reordenar pagina. Os dois
+   reescrevem caminhos gravados nos JSONs, e nenhum fica melhor escondido atras de
+   um botao pequeno.
 */
 
 const API = "/api";
@@ -56,6 +60,8 @@ const el = {
   glossaryRows: document.getElementById("glossary-rows"),
   glossaryAdd: document.getElementById("glossary-add"),
   glossarySave: document.getElementById("glossary-save"),
+  seriesDanger: document.getElementById("series-danger"),
+  seriesDelete: document.getElementById("series-delete"),
 
   uploadCard: document.getElementById("upload-card"),
   chapterNumber: document.getElementById("chapter-number"),
@@ -209,9 +215,51 @@ function renderChapters() {
         <div class="tags">${tags}${pending}</div>
         <span class="pages">${chapter.image_count} ${chapter.image_count === 1 ? "imagem" : "imagens"}</span>
         <button class="btn btn-secondary" data-translate="${escapeHtml(chapter.chapter)}">Traduzir</button>
+        <button class="btn btn-ghost" data-delete="${escapeHtml(chapter.chapter)}">Apagar</button>
       </div>`;
     })
     .join("");
+}
+
+const ARM_MS = 4000;
+
+/** Primeiro clique arma o botao, o segundo executa. Devolve se ja estava armado.
+ *
+ * Sem `confirm()`: o dialogo do navegador trava a pagina inteira, e o segundo
+ * clique no mesmo botao, com o texto trocado, ja pergunta "tem certeza?".
+ */
+function armed(button, question) {
+  if (button.dataset.armed) return true;
+  const label = button.textContent;
+  button.dataset.armed = "1";
+  button.textContent = question;
+  setTimeout(() => {
+    delete button.dataset.armed;
+    button.textContent = label;
+  }, ARM_MS);
+  return false;
+}
+
+async function deleteChapter(button) {
+  if (!armed(button, "Apagar mesmo?")) return;
+  const chapter = button.dataset.delete;
+  await api(`${seriesPath(state.selected)}/chapters/${encodeURIComponent(chapter)}`, {
+    method: "DELETE",
+  });
+  await loadSeries();
+  flash(`Capítulo ${chapter} apagado.`, "ok");
+}
+
+async function deleteSeries(button) {
+  if (!armed(button, "Apagar a obra e todos os capítulos?")) return;
+  const slug = state.selected;
+  await api(seriesPath(slug), { method: "DELETE" });
+  state.selected = null;
+  el.seriesCard.hidden = true;
+  el.uploadCard.hidden = true;
+  el.jobCard.hidden = true;
+  await loadSeries(false);
+  flash(`Obra ${slug} apagada.`, "ok");
 }
 
 function glossaryRowHtml(term = "", translation = "") {
@@ -242,6 +290,7 @@ async function selectSeries(slug) {
   el.seriesName.textContent = entry.title || entry.series;
   el.seriesSlug.textContent = `pasta: ${entry.series}`;
   el.seriesCard.hidden = false;
+  el.seriesDanger.hidden = state.session.kind !== "owner";
   el.uploadCard.hidden = false;
   el.jobCard.hidden = true;
   renderStaged();
@@ -512,6 +561,13 @@ function wire() {
   el.chapterList.onclick = (event) => {
     const button = event.target.closest("[data-translate]");
     if (button) openJob(button.dataset.translate);
+    const eraser = event.target.closest("[data-delete]");
+    if (eraser) guard(() => deleteChapter(eraser));
+  };
+
+  el.seriesDelete.onclick = (event) => {
+    event.preventDefault();
+    guard(() => deleteSeries(el.seriesDelete));
   };
 
   el.seriesMeta.onsubmit = (event) => {
