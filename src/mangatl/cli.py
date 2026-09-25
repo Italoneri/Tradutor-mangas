@@ -20,6 +20,7 @@ from .accounts import (
     password_hash_of,
     sole_owner,
 )
+from .backup import backup
 from .config import Config, load_config
 from .db import connect, migrate, transaction
 from .demo import DemoError, build_demo, demo_root
@@ -483,6 +484,27 @@ def _report_detector(cfg: Config) -> None:
         isinstance(try_to_load_from_cache(cfg.detect.rtdetr.model_id, "config.json"), str),
         "baixa sozinho na primeira extracao (~200MB)",
     )
+
+
+@app.command(name="backup")
+def backup_command(
+    out: Path = typer.Option(None, "--out", "-o", help="Pasta nova para a copia; padrao data/backups/<hora>"),
+) -> None:
+    """Copia o banco e o acervo de todas as contas. Roda com o servidor de pe."""
+    cfg = _load()
+    try:
+        result = backup(cfg, out)
+    except (FileNotFoundError, FileExistsError) as error:
+        typer.secho(str(error), fg=typer.colors.RED)
+        raise typer.Exit(code=1) from error
+
+    typer.secho(f"banco:  {result.database}", fg=typer.colors.GREEN)
+    if result.library is None:
+        typer.echo("acervo: nenhuma conta com arquivo ainda")
+    else:
+        size_mb = result.library.stat().st_size / (1024 * 1024)
+        typer.secho(f"acervo: {result.library} ({size_mb:.1f}MB)", fg=typer.colors.GREEN)
+    typer.echo("Guarde a pasta fora desta maquina: backup no mesmo disco nao sobrevive ao disco.")
 
 
 @app.command(name="reset-login")

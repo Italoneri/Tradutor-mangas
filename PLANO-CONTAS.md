@@ -964,4 +964,4 @@ todo dia, em ordem de valor.
 - [x] 7.6 Limpeza de `.upload` órfão e de `.incoming` abandonado
 - [x] 7.7 Apagar capítulo pela sessão, e série pelo dono
 - [x] 7.8 Menores: health enxuto, `src;C` apagada, README corrigido, seção 4 atualizada
-- [ ] Backup de `data/` implementado (`mangatl backup`), e não só pedido na Fase 5
+- [x] Backup de `data/` implementado (`mangatl backup`), e não só pedido na Fase 5
