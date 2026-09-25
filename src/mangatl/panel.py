@@ -140,6 +140,16 @@ e 9 de `caddy_test.py`, com o proxy de pe.
 Ausente, o Python transmite em pedacos. Funciona, e e divida anotada."""
 
 SHOWCASE_ENV = "PUBLIC_SHOWCASE"
+CONTACT_ENV = "CONTACT_EMAIL"
+
+
+def contact_email() -> str | None:
+    """Para onde vao os pedidos de remocao, se o responsavel pela instancia disse.
+
+    Vem do ambiente, e nao do HTML dos termos: o mesmo `reader/` serve toda
+    instancia, e cada uma tem o seu responsavel.
+    """
+    return os.environ.get(CONTACT_ENV, "").strip() or None
 
 
 def showcase_is_public() -> bool:
@@ -497,6 +507,14 @@ class RouteMatch(NamedTuple):
 
 
 def _health(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Se o servidor esta de pe. O resto so para o dono.
+
+    Publica porque monitor de uptime e o painel antes do login precisam dela. Mas
+    versao do Python e presenca da chave da API sao inventario do servidor, e uma
+    rota publica nao tem por que entrega-lo a quem so quer saber se ele responde.
+    """
+    if not ctx.is_owner:
+        return HTTPStatus.OK, {"ok": True}
     return HTTPStatus.OK, {
         "ok": True,
         "engines": available_engines(),
@@ -535,10 +553,12 @@ def _session_payload(session: Session | None) -> dict:
             "kind": None,
             "engines": [],
             "showcase": showcase_is_public(),
+            "contact": contact_email(),
         }
     return {
         "authenticated": True,
         "showcase": showcase_is_public(),
+        "contact": contact_email(),
         "kind": session.user.kind,
         "expires_at": session.expires_at,
         # O testador nunca ve `claude` na lista: a chave da API e do dono, e a

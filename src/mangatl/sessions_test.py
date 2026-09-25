@@ -386,3 +386,14 @@ def test_ignores_the_real_ip_header_from_a_peer_that_is_not_the_proxy(
     _fail_logins_from(server, "203.0.113.7")
 
     assert _login_from(server, "198.51.100.9") == 429
+
+
+@pytest.mark.parametrize(("configured", "expected"), [("", None), ("remocao@example.com", "remocao@example.com")])
+def test_tells_the_terms_page_where_removal_requests_go(
+    server: Client, monkeypatch, configured: str, expected: str | None
+):
+    monkeypatch.setenv("CONTACT_EMAIL", configured)
+
+    _, body, _ = server.raw("GET", "/api/session")
+
+    assert json.loads(body)["contact"] == expected

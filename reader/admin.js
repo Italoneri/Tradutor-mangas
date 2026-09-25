@@ -725,6 +725,10 @@ async function signOut() {
 }
 
 async function enterPanel() {
+  /* De novo, e agora com sessao: sem ela o `/health` so diz que o servidor esta
+     de pe, e o que falta aqui - detector, chave da API - e do dono. */
+  state.health = (await api("/health").catch(() => null)) || state.health;
+  el.health.textContent = state.health.detector ? `detector ${state.health.detector}` : "";
   el.login.hidden = true;
   el.panel.hidden = false;
   el.signOut.hidden = false;
@@ -742,8 +746,6 @@ async function main() {
     flash("Não consegui falar com o servidor. Suba o `mangatl serve` e recarregue.");
     return;
   }
-  el.health.textContent = `detector ${state.health.detector}`;
-
   state.session = await api("/session").catch(() => ({ authenticated: false }));
   if (state.session.authenticated) {
     await enterPanel();

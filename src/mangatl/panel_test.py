@@ -356,6 +356,15 @@ def test_reports_what_the_machine_can_do(panel_server: Client):
     assert isinstance(payload["has_api_key"], bool)
 
 
+def test_tells_an_anonymous_caller_only_that_it_is_up(panel_server: Client):
+    panel_server.forget()
+
+    status, body = panel_server.get("/api/health")
+
+    assert status == 200
+    assert json.loads(body) == {"ok": True}
+
+
 def test_never_answers_with_the_api_key(panel_server: Client):
     # A chave esta no ambiente do processo de teste ou nao; o que nao pode e o
     # valor sair numa resposta.
