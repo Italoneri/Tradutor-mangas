@@ -1314,9 +1314,17 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
             session = resolve(connection, token)
             issued: str | None = None
 
-            if session is None and route.writes and route.access != "public":
+            if (
+                session is None
+                and route.writes
+                and route.access != "public"
+                and showcase_is_public()
+            ):
                 # A sessao anonima nasce aqui, na primeira escrita, e nao no
                 # primeiro `GET`: a home e publica e robo de busca a visita.
+                # So com a vitrine ligada: sem ela a instalacao e de uma pessoa, e
+                # esconder o testador na tela enquanto a API o cria seria a flag
+                # decidir so a aparencia.
                 session, token = _open_tester_session(connection)
                 issued = token
 

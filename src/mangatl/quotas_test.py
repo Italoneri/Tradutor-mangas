@@ -141,7 +141,10 @@ def test_refuses_a_new_upload_once_the_disk_is_full(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def server(tmp_path: Path):
+def server(tmp_path: Path, monkeypatch):
+    """Com a vitrine ligada: e so nela que a primeira escrita sem sessao abre um
+    testador. Desligada, a mesma escrita leva 401 - e o que a Fase 7.1 corrigiu."""
+    monkeypatch.setenv("PUBLIC_SHOWCASE", "1")
     (tmp_path / "reader").mkdir()
     cfg = Config(root=tmp_path)
     migrate(cfg)

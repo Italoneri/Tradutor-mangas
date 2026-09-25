@@ -940,7 +940,7 @@ todo dia, em ordem de valor.
 - [x] Os 7 primeiros testes da Fase 3.7 passando contra o app
 - [x] Os casos 8, 9 e 10 executados com o Caddy na frente, localmente — `caddy_test.py`, 14 testes
 - [ ] **Os casos 8, 9 e 10 repetidos contra o domínio público, de outra rede**
-- [ ] 7.1 `PUBLIC_SHOWCASE=0` recusa escrita sem sessão na API (401, nenhum usuário criado)
+- [x] 7.1 `PUBLIC_SHOWCASE=0` recusa escrita sem sessão na API (401, nenhum usuário criado)
 - [ ] 7.2 IP real vindo do Caddy, aceito só do proxy; `mangatl reset-login`
 - [ ] 7.3 Cota do testador vale para o zip descompactado, para bytes mágicos por entrada e para uploads em paralelo
 - [ ] 7.4 Folga de disco reservada para o dono

@@ -28,8 +28,12 @@ JPEG = bytes.fromhex("ffd8ffe0") + b"0" * 32
 
 
 @pytest.fixture
-def server(tmp_path: Path):
-    """Servidor com o dono ja criado e um capitulo no acervo dele."""
+def server(tmp_path: Path, monkeypatch):
+    """Servidor com o dono ja criado e um capitulo no acervo dele.
+
+    Com a vitrine ligada: e so nela que a primeira escrita sem sessao abre um
+    testador. Desligada, a mesma escrita leva 401 - e o que a Fase 7.1 corrigiu."""
+    monkeypatch.setenv("PUBLIC_SHOWCASE", "1")
     (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-secreta\n", encoding="utf-8")
     (tmp_path / "reader").mkdir()
     (tmp_path / "reader" / "app.js").write_text("export const ok = 1;\n", encoding="utf-8")
@@ -266,3 +270,40 @@ def test_refuses_a_write_whose_origin_is_another_site(server: Client):
     )
 
     assert status == 403
+
+
+# ---------- 7.1 a vitrine desligada vale na API ----------
+
+
+def _user_count(root: Path) -> int:
+    with connect(Config(root=root)) as connection:
+        return connection.execute("SELECT count(*) AS n FROM users").fetchone()["n"]
+
+
+@pytest.mark.parametrize(
+    ("showcase", "status", "users_created"),
+    [
+        ("0", 401, 0),
+        ("1", 201, 1),
+    ],
+)
+def test_opens_a_tester_session_only_when_the_showcase_is_public(
+    server: Client,
+    tmp_path: Path,
+    monkeypatch,
+    showcase: str,
+    status: int,
+    users_created: int,
+):
+    """A flag decidia a tela e nao a API: sem vitrine, a escrita anonima ainda criava
+    usuario, gravava 40MB e enfileirava job. Agora a instalacao de uma pessoa so
+    recusa do mesmo jeito que recusa a leitura."""
+    monkeypatch.setenv("PUBLIC_SHOWCASE", showcase)
+    before = _user_count(tmp_path)
+
+    anonymous = Client(server.port)
+    got, _ = anonymous.send("POST", "/api/series", json.dumps({"slug": "Minha"}).encode("utf-8"))
+
+    assert got == status
+    assert _user_count(tmp_path) - before == users_created
+    assert (anonymous.cookie is not None) == bool(users_created)

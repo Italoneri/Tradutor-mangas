@@ -195,7 +195,10 @@ def test_recognises_something_shaped_like_an_email(value: str, expected: bool):
 
 
 @pytest.fixture
-def server(tmp_path: Path):
+def server(tmp_path: Path, monkeypatch):
+    """Com a vitrine ligada: e so nela que a primeira escrita sem sessao abre um
+    testador. Desligada, a mesma escrita leva 401 - e o que a Fase 7.1 corrigiu."""
+    monkeypatch.setenv("PUBLIC_SHOWCASE", "1")
     (tmp_path / "reader").mkdir()
     cfg = Config(root=tmp_path)
     migrate(cfg)
@@ -329,6 +332,8 @@ def test_reuses_that_session_instead_of_opening_another(server: Client, tmp_path
 
 
 def test_says_the_instance_is_private_by_default(server: Client, monkeypatch):
+    monkeypatch.delenv("PUBLIC_SHOWCASE")
+
     _, body, _ = server.raw("GET", "/api/session")
 
     assert json.loads(body)["showcase"] is False
