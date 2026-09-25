@@ -1,0 +1,55 @@
+# Os testes em todo push e PR, em Linux - que e onde o projeto roda de verdade.
+#
+# O Tesseract entra para o `ocr_test.py` nao pular o caso que le uma pagina real.
+# Torch e Argos ficam de fora: os testes do `rtdetr` e do `free` cobrem as funcoes
+# puras dos dois backends e nao carregam modelo nenhum, e instalar o torch aqui
+# custaria minutos por execucao sem testar nada a mais.
+#
+# A bateria do proxy (`caddy_test.py`) pula aqui, e isso e esperado: ela precisa
+# do Caddy de pe. Roda-la e o portao manual antes de apontar o dominio.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tesseract
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.12"
+
+      - name: Dependencias
+        run: uv sync --extra dev --frozen
+
+      - name: pytest
+        run: uv run --frozen python -m pytest
+
+  reader:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: overlay
+        run: node --test reader/overlay.test.js
