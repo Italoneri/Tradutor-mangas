@@ -308,6 +308,16 @@ def clear_login_attempts(connection: sqlite3.Connection, subjects: tuple[str, ..
         connection.execute("DELETE FROM login_attempts WHERE subject = ?", (subject.lower(),))
 
 
+def clear_every_login_attempt(connection: sqlite3.Connection) -> int:
+    """Zera o limite de tentativas inteiro. So a linha de comando chama isto.
+
+    E a porta dos fundos do dono: a chave `email:` existe para ninguem varrer a
+    senha dele, e por isso mesmo qualquer um pode tranca-la de proposito. Quem tem
+    shell na maquina nao precisa esperar quinze minutos para entrar.
+    """
+    return connection.execute("DELETE FROM login_attempts").rowcount
+
+
 def purge_old_login_attempts(connection: sqlite3.Connection) -> int:
     since = minutes_ago(LOGIN_ATTEMPT_WINDOW_MINUTES)
     cursor = connection.execute("DELETE FROM login_attempts WHERE at <= ?", (since,))

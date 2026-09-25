@@ -29,7 +29,9 @@ headless e quebra a cada mudanca de layout, entao a origem das imagens e upload.
 from __future__ import annotations
 
 import io
+import ipaddress
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -108,6 +110,8 @@ from .store import (
     save_series_meta,
 )
 
+log = logging.getLogger("mangatl.panel")
+
 API_PREFIX = "/api/"
 USER_PREFIX = "/u/"
 """Onde o conteudo do usuario e servido, depois de autorizado.
@@ -142,6 +146,55 @@ def showcase_is_public() -> bool:
     numa instancia que existe para demonstrar o pipeline a quem nao tem conta.
     """
     return os.environ.get(SHOWCASE_ENV, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+TRUSTED_PROXIES_ENV = "TRUSTED_PROXIES"
+REAL_IP_HEADER = "X-Real-IP"
+
+
+def trusted_proxies() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """As redes de onde um `X-Real-IP` e aceito, lidas de `TRUSTED_PROXIES`.
+
+    IP solto ou CIDR, separados por virgula. Vazio por padrao: sem proxy na frente,
+    quem escreve o cabecalho e o cliente, e aceita-lo seria deixar cada pedido
+    escolher o proprio IP - e com ele escapar do limite de tentativas de senha.
+    """
+    networks = []
+    for item in os.environ.get(TRUSTED_PROXIES_ENV, "").split(","):
+        if not item.strip():
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item.strip(), strict=False))
+        except ValueError:
+            # Entrada torta nao derruba o servidor, mas tambem nao some: sem ela o
+            # proxy deixa de ser confiavel e o limite de login volta a ser um so.
+            log.warning("operation=trusted_proxies invalid=%r", item.strip())
+    return tuple(networks)
+
+
+def client_ip(
+    peer: str,
+    real_ip: str | None,
+    trusted: Sequence[ipaddress.IPv4Network | ipaddress.IPv6Network],
+) -> str:
+    """O IP de quem pediu: o do cabecalho so quando quem conectou e o proxy.
+
+    Atras do Caddy todo pedido chega com o IP do Caddy, e a chave `ip:` do limite
+    de login virava uma so para o mundo inteiro - cinco senhas erradas de qualquer
+    pessoa trancavam o dono junto. O Caddy sobrescreve `X-Real-IP` com o endereco
+    do socket dele, entao o valor que chega por ele e o do cliente, e nao o que o
+    cliente escreveu.
+    """
+    try:
+        peer_address = ipaddress.ip_address(peer)
+    except ValueError:
+        return peer
+    if not real_ip or not any(peer_address in network for network in trusted):
+        return peer
+    try:
+        return str(ipaddress.ip_address(real_ip.strip()))
+    except ValueError:
+        return peer
 
 
 MAX_COMPONENT_CHARS = 120
@@ -347,11 +400,11 @@ class Context(NamedTuple):
     session: Session | None
     token: str | None = None
     client_ip: str = ""
-    """So para contar tentativa de senha, nunca para autorizar.
+    """So para contar tentativa de senha e testador novo, nunca para autorizar.
 
-    Atras de um proxy reverso este valor e o IP do proxy, a menos que alguem
-    confie explicitamente no `X-Forwarded-For` - e confiar num cabecalho que o
-    cliente escreve e o mesmo que nao ter regra nenhuma."""
+    Vem de `client_ip`: o `X-Real-IP` so vale quando a conexao chega de um
+    endereco em `TRUSTED_PROXIES`. Fora disso e o IP do socket - confiar num
+    cabecalho que o cliente escreve e o mesmo que nao ter regra nenhuma."""
 
     @property
     def user(self) -> User | None:
@@ -1287,6 +1340,7 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
 
             route = match.route
             if route.writes and not csrf_is_valid(self._csrf_headers()):
+                self._discard_small_body()
                 self._send_json(
                     HTTPStatus.FORBIDDEN,
                     {"error": f"pedido sem origem conferida; mande {REQUESTED_WITH}"},
@@ -1329,9 +1383,11 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
                 issued = token
 
             if session is None and route.access != "public":
+                self._discard_small_body()
                 self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "entre para continuar"})
                 return True
             if route.access == "owner" and (session is None or not session.is_owner):
+                self._discard_small_body()
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "so o dono faz isso"})
                 return True
 
@@ -1350,7 +1406,11 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
                 connection=connection,
                 session=session,
                 token=token,
-                client_ip=self.client_address[0] if self.client_address else "",
+                client_ip=client_ip(
+                    self.client_address[0] if self.client_address else "",
+                    self.headers.get(REAL_IP_HEADER),
+                    trusted_proxies(),
+                ),
             )
 
             # A sessao recem-aberta viaja no cookie ate nas respostas de erro. Sem
@@ -1468,6 +1528,22 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
             finally:
                 if isinstance(body, Path):
                     body.unlink(missing_ok=True)
+
+        def _discard_small_body(self) -> None:
+            """Le e joga fora um corpo pequeno antes de recusar o pedido.
+
+            Responder e fechar com bytes ainda nao lidos no socket faz o sistema
+            mandar RST em vez de FIN - no Windows o cliente perde a resposta e ve
+            "conexao anulada" no lugar do 401 ou 403. Corpo grande nao e drenado:
+            ler megabytes de quem vai ser recusado e o que as recusas existem para
+            evitar, e ai a conexao fecha de proposito.
+            """
+            raw = self.headers.get("Content-Length", "")
+            length = int(raw) if raw.isdigit() else 0
+            if 0 < length <= MAX_JSON_BYTES:
+                self.rfile.read(length)
+            elif length:
+                self.close_connection = True
 
         def _read_body(self, route: Route, ceiling: int | None) -> Body | None:
             """O corpo cru, ou None quando ja respondeu recusando.

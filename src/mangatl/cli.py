@@ -32,6 +32,7 @@ from .engines.base import TranslationError, UnknownEngineError, available_engine
 from .models import Progress, ProgressFn
 from .panel import serve_panel
 from .pipeline import ChapterNotFoundError, extract_chapter, translate_chapter
+from .sessions import clear_every_login_attempt
 from .slicing import is_tall, slice_stream
 from .store import IMAGE_SUFFIXES, build_library, discover_chapters, save_library
 from .worker import run_forever
@@ -482,6 +483,19 @@ def _report_detector(cfg: Config) -> None:
         isinstance(try_to_load_from_cache(cfg.detect.rtdetr.model_id, "config.json"), str),
         "baixa sozinho na primeira extracao (~200MB)",
     )
+
+
+@app.command(name="reset-login")
+def reset_login() -> None:
+    """Destranca o login: apaga todas as tentativas de senha registradas.
+
+    Para quando alguem trancou a conta do dono errando a senha dele de proposito.
+    """
+    cfg = _load()
+    migrate(cfg)
+    with connect(cfg) as connection:
+        removed = clear_every_login_attempt(connection)
+    typer.secho(f"{removed} tentativa(s) apagada(s); o login esta destrancado", fg=typer.colors.GREEN)
 
 
 @app.command()

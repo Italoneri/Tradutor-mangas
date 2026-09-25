@@ -50,18 +50,25 @@ services:
       # devolve o caminho; os bytes saem pelo proxy e o worker Python volta a
       # atender na hora.
       INTERNAL_REDIRECT_PREFIX: /_internal
+      # O unico endereco de onde o `X-Real-IP` vale: o do Caddy, fixo na rede
+      # `edge` abaixo. Quem chega pela porta publicada no loopback vem pelo
+      # gateway da rede, e nao e confiado.
+      TRUSTED_PROXIES: 172.28.0.10
+      CONTACT_EMAIL: ${CONTACT_EMAIL:-}
     expose:
       - "8000"
     # Publicada so no loopback: quem fala com a internet e o Caddy.
     ports:
       - "127.0.0.1:8000:8000"
     command: ["mangatl", "serve", "--port", "8000"]
+    networks: [edge]
     # O `app` nao carrega torch: ele so enfileira e le.
     mem_limit: 1g
 
   worker:
     <<: *app
     command: ["mangatl", "worker"]
+    networks: [edge]
     # O pico medido num capitulo de 155 fatias foi 575MB. A folga cobre o torch,
     # que pede alguns GB so para carregar o modelo.
     mem_limit: 6g
@@ -88,6 +95,10 @@ services:
       - caddy-data:/data
       - caddy-config:/config
     restart: unless-stopped
+    networks:
+      edge:
+        # Fixo porque o app confia no `X-Real-IP` deste endereco e so dele.
+        ipv4_address: 172.28.0.10
 
   # So para desenvolver: monta o codigo de fora por cima do que a imagem tem,
   # entao `docker compose run --rm dev python -m pytest` roda o que voce acabou
@@ -97,6 +108,7 @@ services:
     <<: *app
     profiles: ["dev"]
     restart: "no"
+    networks: [edge]
     volumes:
       - ./src:/app/src
       - ./reader:/app/reader
@@ -114,3 +126,11 @@ volumes:
   argos-data:
   caddy-data:
   caddy-config:
+
+networks:
+  # Sub-rede fixa para o Caddy ter endereco fixo: e ele que o app reconhece como
+  # proxy para acreditar no `X-Real-IP`.
+  edge:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

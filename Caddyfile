@@ -52,6 +52,13 @@
 	}
 
 	reverse_proxy app:8000 {
+		# O IP de quem conectou no Caddy, e nao o que o cliente escreveu: `header_up`
+		# sobrescreve o cabecalho que vier de fora. Sem isto o app so ve o IP do
+		# Caddy, e o limite de login vira um so para o mundo inteiro - cinco senhas
+		# erradas de qualquer pessoa trancam o dono. O app so acredita neste valor
+		# quando a conexao vem do endereco em `TRUSTED_PROXIES`.
+		header_up X-Real-IP {remote_host}
+
 		# `http.server` nao fecha conexao lenta sozinho. Estes fecham.
 		transport http {
 			read_timeout 120s

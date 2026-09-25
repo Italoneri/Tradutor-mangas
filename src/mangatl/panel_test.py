@@ -1001,3 +1001,23 @@ def test_reports_no_job_for_an_id_that_does_not_exist(panel_with_jobs):
     status, body = client.send("GET", "/api/jobs/naoexiste")
 
     assert status == 404
+
+
+@pytest.mark.parametrize(
+    ("name", "peer", "real_ip", "trusted", "expected"),
+    [
+        ("sem cabecalho fica o socket", "10.0.0.2", None, "10.0.0.2", "10.0.0.2"),
+        ("proxy confiavel repassa o cliente", "10.0.0.2", "203.0.113.7", "10.0.0.2", "203.0.113.7"),
+        ("rede confiavel em CIDR", "172.28.0.10", "203.0.113.7", "172.28.0.0/24", "203.0.113.7"),
+        ("peer fora da lista e ignorado", "198.51.100.1", "203.0.113.7", "10.0.0.2", "198.51.100.1"),
+        ("sem lista nada e confiavel", "10.0.0.2", "203.0.113.7", "", "10.0.0.2"),
+        ("cabecalho que nao e IP e ignorado", "10.0.0.2", "nao-e-ip", "10.0.0.2", "10.0.0.2"),
+        ("entrada torta na lista nao confia", "10.0.0.2", "203.0.113.7", "lixo", "10.0.0.2"),
+    ],
+)
+def test_trusts_the_real_ip_header_only_from_the_proxy(
+    monkeypatch, name: str, peer: str, real_ip: str | None, trusted: str, expected: str
+):
+    monkeypatch.setenv(panel.TRUSTED_PROXIES_ENV, trusted)
+
+    assert panel.client_ip(peer, real_ip, panel.trusted_proxies()) == expected, name

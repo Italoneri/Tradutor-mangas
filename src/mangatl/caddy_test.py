@@ -234,3 +234,43 @@ def test_hands_the_bytes_to_the_proxy_and_not_to_python(cookie: str):
     assert from_app == b"", "o Python transmitiu os bytes que o proxy deveria transmitir"
     assert len(from_proxy) > 0
     assert hashlib.sha256(from_proxy).digest(), "resposta ilegivel"
+
+
+# ---------- 7.2: o IP que o app ve e o que o Caddy escreveu ----------
+
+
+def _login_attempt(email: str, spoofed_ip: str) -> int:
+    request = Request(
+        f"{PROXY_URL}/api/login",
+        data=json.dumps({"email": email, "password": "errada"}).encode("utf-8"),
+        method="POST",
+    )
+    request.add_header("Content-Type", "application/json")
+    request.add_header("X-Requested-With", "fetch")
+    request.add_header("Origin", PROXY_URL)
+    request.add_header("X-Real-IP", spoofed_ip)
+    try:
+        with urlopen(request, timeout=30) as response:
+            return response.status
+    except HTTPError as error:
+        return error.code
+
+
+def test_overwrites_the_real_ip_header_the_client_sent():
+    """O cliente troca o `X-Real-IP` a cada tentativa, e o limite pega assim mesmo.
+
+    Se o Caddy repassasse o cabecalho do cliente, cada tentativa contaria para um
+    IP diferente e o limite nunca fecharia. Fecha porque o `header_up` sobrescreve
+    com o endereco do socket - o mesmo nas seis.
+
+    Tranca o IP de quem roda a bateria por quinze minutos. Rode por ultimo, e
+    depois `docker compose exec app mangatl reset-login`.
+    """
+    # Um e-mail por tentativa: com um so, a chave `email:` fecharia sozinha e o
+    # teste passaria sem dizer nada sobre o IP.
+    codes = [
+        _login_attempt(f"bateria-{n}@example.com", f"203.0.113.{n}") for n in range(1, 7)
+    ]
+
+    assert codes[:5] == [401] * 5
+    assert codes[5] == 429
