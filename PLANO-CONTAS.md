@@ -945,7 +945,7 @@ todo dia, em ordem de valor.
 - [x] 7.3 Cota do testador vale para o zip descompactado, para bytes mágicos por entrada e para uploads em paralelo
 - [x] 7.4 Folga de disco reservada para o dono
 - [x] 7.5 `attempts` na fila; job que derruba o worker 3 vezes vira `failed`
-- [ ] 7.6 Limpeza de `.upload` órfão e de `.incoming` abandonado
+- [x] 7.6 Limpeza de `.upload` órfão e de `.incoming` abandonado
 - [ ] 7.7 Apagar capítulo pela sessão, e série pelo dono
 - [ ] 7.8 Menores: health enxuto, `src;C` apagada, README corrigido, seção 4 atualizada
 - [ ] Backup de `data/` implementado (`mangatl backup`), e não só pedido na Fase 5
