@@ -159,12 +159,20 @@ def disk_ceiling() -> int:
     return int(raw)
 
 
-def check_disk(base: Config, incoming_bytes: int = 0) -> None:
-    """Se o servidor inteiro ainda tem espaco para este upload."""
+TESTER_DISK_SHARE = 0.8
+"""Fatia do teto global que os testadores, somados, podem ocupar.
+
+O resto e do dono. Sem ela, testadores que enchiam o volume faziam o upload do
+dono levar 507 - um limite pensado para protege-lo sendo usado contra ele."""
+
+
+def check_disk(base: Config, user: User, incoming_bytes: int = 0) -> None:
+    """Se o servidor inteiro ainda tem espaco para este upload, deste usuario."""
     from .accounts import users_root
 
+    ceiling = disk_ceiling() if user.is_owner else int(disk_ceiling() * TESTER_DISK_SHARE)
     used = directory_bytes(users_root(base))
-    if used + incoming_bytes > disk_ceiling():
+    if used + incoming_bytes > ceiling:
         raise OutOfSpace("o servidor esta sem espaco para uploads novos; tente mais tarde")
 
 

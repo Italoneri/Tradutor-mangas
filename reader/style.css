@@ -382,6 +382,50 @@ main { padding: var(--space-8) var(--space-8) 64px; max-width: 1180px; margin: 0
 
 body.hide-overlay .bubble { display: none; }
 
+/* ---------- correcao a mao ---------- */
+
+/* So no acervo da sessao. O cursor de texto e a pista de que o balao se edita. */
+.strip.editable .bubble .t { cursor: text; }
+.strip.editable .bubble .t[contenteditable="plaintext-only"] {
+  outline: 2px solid var(--accent-300);
+  outline-offset: 2px;
+  text-transform: none;
+}
+/* Um fio na cor de destaque marca a fala corrigida a mao: e ela que sobrevive a
+   uma retraducao, e quem le precisa saber qual e. */
+.strip.editable .bubble[data-edited] .t { box-shadow: 0 0 0 2px #fff, 0 0 0 3px var(--accent-700); }
+
+/* Discreto ate alguem apontar para a fatia; em tela de toque nao ha hover, e ai
+   ele fica sempre meio visivel. */
+.slice-tool {
+  position: absolute;
+  top: var(--space-4);
+  right: var(--space-4);
+  z-index: 2;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.slice:hover .slice-tool,
+.slice-tool:focus-visible { opacity: 1; }
+@media (hover: none) { .slice-tool { opacity: 0.75; } }
+body.hide-overlay .slice-tool { display: none; }
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: calc(var(--space-8) + env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  z-index: 10;
+  max-width: min(92vw, 480px);
+  padding: var(--space-4) var(--space-6);
+  border-radius: var(--radius-md);
+  background: var(--accent-900);
+  border: 1px solid var(--accent-700);
+  color: var(--ink);
+  font-size: 13.5px;
+}
+.toast[data-kind="erro"] { background: color-mix(in srgb, #d96b6b 18%, var(--surface)); border-color: #d96b6b; }
+
 /* ---------- fim do capitulo ---------- */
 
 .chapter-end {

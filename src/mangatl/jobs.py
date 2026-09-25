@@ -54,6 +54,16 @@ TESTER_PRIORITY = 1
 para poder usar a propria ferramenta."""
 
 
+MAX_ATTEMPTS = 3
+"""Subidas do worker que um job pode derrubar antes de desistirem dele.
+
+Um capitulo que estoura o `mem_limit` mata o worker por OOM; o Docker o reinicia,
+o job volta para a fila e mata de novo. Sem teto, a fila inteira fica parada atras
+desse capitulo, sem erro nenhum na tela."""
+
+CRASHED_ERROR = f"o worker caiu {MAX_ATTEMPTS} vezes neste capitulo; ele foi tirado da fila"
+
+
 class Busy(RuntimeError):
     """Esta pessoa ja tem um processamento na fila."""
 
@@ -74,6 +84,7 @@ class Job:
     error: str | None
     options: dict
     priority: int
+    attempts: int = 0
 
     def snapshot(self) -> dict:
         """O que a tela recebe.
@@ -112,6 +123,7 @@ def _to_job(row: sqlite3.Row) -> Job:
         error=row["error"],
         options=json.loads(row["options_json"] or "{}"),
         priority=row["priority"],
+        attempts=row["attempts"],
     )
 
 
@@ -125,6 +137,7 @@ def enqueue(
     priority: int,
     force: bool = False,
     dry_run: bool = False,
+    pages: tuple[str, ...] = (),
 ) -> Job:
     """Poe um job na fila, ou levanta `Busy`.
 
@@ -157,7 +170,7 @@ def enqueue(
                 json.dumps(Progress(phase="extract", detail="na fila").model_dump(mode="json")),
                 now(),
                 priority,
-                json.dumps({"force": force, "dry_run": dry_run}),
+                json.dumps({"force": force, "dry_run": dry_run, "pages": list(pages)}),
             ),
         )
     return get_any(connection, job_id)
@@ -190,7 +203,9 @@ def claim_next(connection: sqlite3.Connection) -> Job | None:
             return None
 
         connection.execute(
-            "UPDATE jobs SET state = 'running', started_at = ? WHERE id = ?", (now(), row["id"])
+            "UPDATE jobs SET state = 'running', started_at = ?, attempts = attempts + 1"
+            " WHERE id = ?",
+            (now(), row["id"]),
         )
     return get_any(connection, row["id"])
 
@@ -223,15 +238,43 @@ def finish(
 
 
 def requeue_running(connection: sqlite3.Connection) -> int:
-    """Devolve para a fila o que ficou marcado como rodando.
+    """Devolve para a fila o que ficou marcado como rodando, e desiste do reincidente.
 
     Chamado na subida do worker. Ninguem estava rodando durante o reinicio, e um
-    job preso em `running` e uma tela que nunca sai do lugar.
+    job preso em `running` e uma tela que nunca sai do lugar. Mas um job que ja
+    esteve rodando `MAX_ATTEMPTS` vezes quando o worker caiu e, com toda chance, a
+    causa da queda - devolve-lo seria derrubar o worker de novo.
     """
-    cursor = connection.execute(
-        "UPDATE jobs SET state = 'pending', started_at = NULL WHERE state = 'running'"
-    )
+    with transaction(connection):
+        connection.execute(
+            "UPDATE jobs SET state = 'failed', error = ?, finished_at = ?"
+            " WHERE state = 'running' AND attempts >= ?",
+            (CRASHED_ERROR, now(), MAX_ATTEMPTS),
+        )
+        cursor = connection.execute(
+            "UPDATE jobs SET state = 'pending', started_at = NULL WHERE state = 'running'"
+        )
     return cursor.rowcount
+
+
+def has_active(
+    connection: sqlite3.Connection, user_id: str, series: str, chapter: str | None = None
+) -> bool:
+    """Se esta pessoa tem job esperando ou rodando nesta serie - ou neste capitulo.
+
+    Apagar o que o worker esta lendo transformaria o job num erro de arquivo
+    sumido no meio do OCR; recusar a remocao enquanto ele vive e mais honesto.
+    """
+    row = connection.execute(
+        """
+        SELECT 1 FROM jobs
+        WHERE user_id = ? AND series = ? AND (? IS NULL OR chapter = ?)
+          AND state IN ('pending', 'running')
+        LIMIT 1
+        """,
+        (user_id, series, chapter, chapter),
+    ).fetchone()
+    return row is not None
 
 
 def get_any(connection: sqlite3.Connection, job_id: str) -> Job | None:

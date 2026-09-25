@@ -10,6 +10,7 @@
    router de verdade custaria mais do que resolve.
 */
 
+import { enableEditing } from "./editor.js";
 import { fitFontSize, fontCqw, overlayBox } from "./overlay.js";
 
 const ROOT = "..";
@@ -300,7 +301,7 @@ function pickEngine(entry, requested) {
   return entry.engines.includes("claude") ? "claude" : entry.engines[0];
 }
 
-function renderChapter(library, chapterData, entry, engine) {
+function renderChapter(library, chapterData, entry, engine, { editable = false } = {}) {
   const { series, chapter } = entry;
   const neighbours = neighboursOf(library, entry);
   const nextHref = neighbours.following
@@ -322,14 +323,19 @@ function renderChapter(library, chapterData, entry, engine) {
     .map((name) => `<option value="${escapeHtml(name)}"${name === engine ? " selected" : ""}>${escapeHtml(name)}</option>`)
     .join("");
 
-  const slices = chapterData.pages.map((page) => sliceHtml(library, series, chapter, page)).join("");
+  const slices = chapterData.pages
+    .map((page) => sliceHtml(library, series, chapter, page, editable))
+    .join("");
   el.main.className = "reading";
   el.main.innerHTML =
     `<div class="strip">${slices}</div>` +
     orphansHtml(chapterData.pages) +
-    chapterEndHtml(chapter, seriesHref(series), nextHref);
+    chapterEndHtml(chapter, seriesHref(series), nextHref, editable ? exportLinks(series, chapter, engine) : "");
 
   fitOnScroll();
+  if (editable) {
+    enableEditing(el.main.querySelector(".strip"), { series, chapter, engine }, fitSlice);
+  }
   setupPager(neighbours, engine, nextHref);
   trackProgress(chapterData.pages.length);
   restoreScroll(series, chapter);
@@ -357,27 +363,42 @@ function bubbleHtml(block, page) {
 
   // `data-size` guarda o tamanho pedido e `--size` o que foi aplicado. Sem separar
   // os dois, refazer o ajuste partiria do valor ja encolhido e so encolheria mais.
-  return `<span class="bubble" style="${box};--size:${round(size)}" data-size="${round(size)}" title="${escapeHtml(block.source_text)}"
+  // `data-page` e `data-block` sao o endereco da fala para a correcao a mao.
+  const address = `data-page="${Number(page.index)}" data-block="${escapeHtml(block.id)}"${block.edited ? ' data-edited="true"' : ""}`;
+  return `<span class="bubble" style="${box};--size:${round(size)}" data-size="${round(size)}" ${address} title="${escapeHtml(block.source_text)}"
       ><span class="t">${escapeHtml(block.text)}</span></span>`;
 }
 
 /* Fatia sem margem nem moldura. A fronteira entre fatias e detalhe do
    processamento: o capitulo e uma tira so, e e assim que ele deve aparecer. */
-function sliceHtml(library, series, chapter, page) {
+function sliceHtml(library, series, chapter, page, editable) {
   const bubbles = page.blocks
     .filter((block) => block.bbox)
     .map((block) => bubbleHtml(block, page))
     .join("");
+  const tool = editable
+    ? `<button class="btn btn-secondary slice-tool" data-retranslate="${escapeHtml(page.image)}">Retraduzir página</button>`
+    : "";
 
   return `<figure class="slice" id="fatia-${Number(page.index)}">
     <img src="${escapeHtml(pageImageUrl(library, series, chapter, page.image))}"
          width="${Number(page.width)}" height="${Number(page.height)}"
          alt="Trecho ${Number(page.index)} do capitulo" loading="lazy" decoding="async">
-    ${bubbles}
+    ${bubbles}${tool}
   </figure>`;
 }
 
-function chapterEndHtml(chapter, seriesUrl, nextHref) {
+/* Baixar o capitulo com a traducao escrita nas paginas, para ler fora daqui. So
+   no acervo da sessao: a rota gera o arquivo a partir da area de quem pede. */
+function exportLinks(series, chapter, engine) {
+  const base = `${ROOT}/api/series/${encodeURIComponent(series)}/chapters/${encodeURIComponent(chapter)}/export/${encodeURIComponent(engine)}`;
+  return `<div class="actions">
+      <a class="btn btn-ghost" href="${escapeHtml(base)}.cbz" download>Baixar CBZ</a>
+      <a class="btn btn-ghost" href="${escapeHtml(base)}.pdf" download>Baixar PDF</a>
+    </div>`;
+}
+
+function chapterEndHtml(chapter, seriesUrl, nextHref, exports = "") {
   const next = nextHref
     ? `<a class="btn btn-primary" href="${escapeHtml(nextHref)}">Ler o próximo capítulo</a>`
     : "";
@@ -389,6 +410,7 @@ function chapterEndHtml(chapter, seriesUrl, nextHref) {
       <a class="btn btn-secondary" href="${escapeHtml(seriesUrl)}">Voltar aos capítulos</a>
       ${next}
     </div>
+    ${exports}
   </div>`;
 }
 
@@ -680,7 +702,8 @@ async function main() {
 
   try {
     const chapterData = await fetchJson(chapterUrl(library, seriesName, chapterName, engine));
-    renderChapter(library, chapterData, entry, engine);
+    // Editavel so no acervo da sessao: a vitrine e estatica e nao ha onde gravar.
+    renderChapter(library, chapterData, entry, engine, { editable: !showcase });
   } catch {
     fail(`Nao consegui carregar a traducao '${engine}' de ${seriesName}/${chapterName}.`);
   }

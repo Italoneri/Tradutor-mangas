@@ -7,6 +7,7 @@
 <title>Termos · Tinta</title>
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="style.css">
+<script type="module" src="termos.js"></script>
 </head>
 <body>
 
@@ -66,10 +67,10 @@
     <div class="card-head"><h2>Remoção</h2></div>
     <p class="hint">
       Para pedir a remoção de qualquer coisa publicada aqui, escreva para
-      <!-- PREENCHER: o endereço de contato para pedidos de remoção. Sem ele esta
-           seção não cumpre o que promete, e é a única do documento que alguém de
-           fora precisa usar. -->
-      <code>contato@exemplo.com</code>. Pedidos são atendidos manualmente.
+      <!-- O endereço vem de CONTACT_EMAIL, no ambiente do servidor: o mesmo
+           arquivo serve toda instância, e cada uma tem o seu responsável. -->
+      <code id="contato">o endereço de contato que o responsável ainda não configurou</code>.
+      Pedidos são atendidos manualmente.
     </p>
   </section>
 

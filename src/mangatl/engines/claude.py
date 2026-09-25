@@ -20,11 +20,35 @@ import anthropic
 import cv2
 from pydantic import BaseModel, ConfigDict
 
-from ..config import Config
+from ..config import Config, ModelPricing
 from ..models import ExtractedPage, Progress, ProgressFn, TranslatedBlock, TranslatedPage, report
 from .base import TranslationError
 
 log = logging.getLogger("mangatl.claude")
+
+AVERAGE_INPUT_TOKENS_PER_PAGE = 1200
+AVERAGE_OUTPUT_TOKENS_PER_PAGE = 135
+"""Tokens medios por pagina, para estimar o custo antes de enfileirar.
+
+Calibrados pela unica medicao que este projeto tem: ~US$ 0,15 por capitulo de 40
+paginas com `claude-sonnet-5`, que e o numero do README. A divisao entre entrada
+e saida segue o formato da chamada - a imagem da pagina pesa na entrada, e a
+resposta e uma lista curta de falas. Quando o motor rodar contra a API real de
+novo, o log `operation=translate_chunk` traz os tokens de verdade: troque estes
+dois numeros pela media dele."""
+
+
+def estimate_usd(pricing: ModelPricing, pages: int) -> float:
+    """Quanto um capitulo de `pages` paginas deve custar com estes precos.
+
+    Estimativa, e o painel diz isso: fatiar uma captura alta aumenta o numero de
+    paginas depois do upload, e fala densa sobe a saida.
+    """
+    per_million = (
+        AVERAGE_INPUT_TOKENS_PER_PAGE * pricing.input
+        + AVERAGE_OUTPUT_TOKENS_PER_PAGE * pricing.output
+    )
+    return round(pages * per_million / 1_000_000, 4)
 
 SYSTEM_RULES = """Voce traduz quadrinhos (mangas e mahuas) do ingles para o portugues brasileiro.
 

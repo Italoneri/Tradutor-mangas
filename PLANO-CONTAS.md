@@ -183,6 +183,16 @@ Caddy (HTTPS, limites de corpo, timeouts)
   └── disco: data/users/<user_id>/{library,output}/...
 ```
 
+> **Decisão tomada na implementação (revisão de 24/09):** no lugar de `gunicorn` +
+> WSGI ficou o `ThreadingHTTPServer` da stdlib atrás do Caddy, e o worker é um
+> contêiner próprio, não um processo no mesmo contêiner. A troca não é etapa
+> faltando: o Caddy segura o que o `http.server` não segura sozinho (corpo máximo,
+> timeouts de leitura, slowloris), a entrega dos bytes já sai do Python pelo
+> `X-Accel-Redirect`, e o que sobra no app é autorizar e enfileirar — trabalho de
+> milissegundos, que uma thread por conexão atende. Se um dia o app precisar de
+> vários processos, a fila e a sessão já moram no banco e nada precisa mudar além
+> do servidor HTTP.
+
 Três pontos que decidem o resto:
 
 **O app autoriza, o proxy entrega.** Um capítulo são 155 JPEGs. Se cada imagem
@@ -620,6 +630,12 @@ Tarefa periódica: apaga usuário `tester` vencido, a área dele em disco, e as
 sessões. Loga quanto liberou. Um teto global de disco que, ao ser atingido,
 recusa upload novo com 507 em vez de encher o volume.
 
+A limpeza roda no laço do worker (`cleanup.sweep`, a cada 15 min), e desde a Fase
+7.6 também apaga `.upload` órfão com mais de uma hora e área de espera parada há
+mais de sete dias. Com o worker parado, ou no meio de um capítulo longo, ela
+também para; é aceito, porque os prazos são de horas e dias. A alternativa, se um
+dia pesar, é uma thread própria no `app`.
+
 **PARE.** Suba dois testadores, estoure a cota de um, confirme que o outro não é
 afetado. Reinicie o contêiner no meio de um job e confirme que ele volta. Relate.
 
@@ -690,6 +706,211 @@ máquina e de outra rede. Relate.
 
 ---
 
+## FASE 7 — Furos achados na revisão de 24/09/2026
+
+Revisão do código feita com as fases 0 a 5 prontas localmente e antes do deploy
+público. **Nenhum destes furos aparece no `pytest`**: cada um mora na combinação
+de duas peças que, separadas, funcionam e estão testadas. Esse é o mesmo padrão
+do `handle_path /_internal/*` da seção 3.2.1, e por isso cada item abaixo vem
+com o teste que teria pegado o furo.
+
+A ordem é a prioridade. De 7.1 a 7.5, faça antes de apontar o domínio.
+
+### 7.1 `PUBLIC_SHOWCASE=0` precisa valer na API, e não só na tela
+
+**Onde:** `panel.py`, em `_dispatch`. `showcase_is_public()` só é lida em
+`_session_payload`.
+
+**O furo:** a flag decide o que a tela mostra, mas o `_dispatch` abre sessão
+anônima de testador em qualquer escrita sem cookie, esteja a flag ligada ou
+desligada. A instalação "de uma pessoa só" esconde o fluxo de testador na
+interface e continua aceitando esse fluxo pela API: cria usuário, grava 40MB e
+enfileira job.
+
+**Fazer:** só chamar `_open_tester_session` quando `showcase_is_public()` for
+verdadeiro. Sem vitrine, escrita sem sessão responde 401, igual à leitura.
+
+**Teste:** com `PUBLIC_SHOWCASE=0`, um `POST /api/series` sem cookie (com CSRF
+válido) leva 401 e a tabela `users` não ganha linha nenhuma. Com `1`, o
+comportamento atual continua igual.
+
+### 7.2 O IP do limite de login é sempre o do proxy
+
+**Onde:** `Context.client_ip = self.client_address[0]`, em `_dispatch`.
+
+**O furo:** atrás do Caddy, todo pedido chega com o IP do Caddy. A chave `ip:`
+do `login_is_throttled` vira uma só para o mundo inteiro: cinco senhas erradas
+de qualquer pessoa trancam o login de todos, **dono incluso**, por quinze
+minutos. A docstring de `client_ip` já registra a ressalva, mas a consequência
+dela não foi tirada.
+
+**Fazer:**
+
+- No `Caddyfile`, dentro do `reverse_proxy`, usar `header_up X-Real-IP {remote_host}`.
+  Isso sobrescreve o valor que o cliente tiver mandado.
+- No app, ler `X-Real-IP` **só** quando `client_address` for o proxy (a rede
+  do compose, ou uma variável `TRUSTED_PROXY`). Fora disso, o cabeçalho é
+  ignorado, porque sem proxy quem o escreve é o cliente.
+- Criar o comando `mangatl reset-login`, que limpa `login_attempts` pela máquina.
+  É a porta dos fundos do dono quando alguém tranca a conta dele pela chave
+  `email:`, como a seção 2.2 já previa que pode acontecer.
+
+**Teste:** com dois IPs simulados, cinco erros de um não trancam o outro. Um
+`X-Real-IP` que chega por uma conexão que não vem do proxy é ignorado. Pôr um
+caso no `caddy_test.py` que confira o cabeçalho com o proxy de pé.
+
+### 7.3 A cota do testador vaza por quatro lados
+
+A seção 4.1 pede "cotas aplicadas antes de gravar", e isso vale para página
+avulsa. O zip e a concorrência escapam dessa regra:
+
+- **Zip que cresce ao extrair.** `check_upload_bytes` confere o tamanho
+  *compactado*, e a extração só tem o teto global de 2GB
+  (`MAX_ARCHIVE_EXPANDED_BYTES`). Um zip que cabe nos 40MB pode ocupar muito
+  mais depois de extraído. Passar `upload_headroom` do usuário como teto do
+  descompactado em `_extract_from`, e recusar a entrada cujo `file_size` passe
+  de `MAX_PAGE_BYTES`.
+- **Página de zip que não passa pelos bytes mágicos.** `_put_page` confere
+  `image_suffix`; a extração só confere a extensão do nome. Ler o começo de cada
+  entrada antes de gravar. Uma entrada que não é imagem condena o arquivo
+  inteiro, pelo mesmo raciocínio do caminho de fuga.
+- **Teto de páginas por zip, e não por capítulo.** `limit` conta as entradas
+  do zip e ignora o que já está na área de espera. Somar as duas coisas.
+- **Uploads em paralelo.** O servidor é `ThreadingHTTPServer`, e "conferir a
+  cota e gravar" não é atômico: N `PUT` simultâneos passam todos pela conferência
+  antes de qualquer um gravar. Pôr um `threading.Lock` por `user_id` em volta de
+  conferir e gravar em `_put_page`, `_put_archive` e `_create_chapter`.
+
+**Teste:** um zip de poucos MB que se expande acima da folga leva 429, e a área
+de espera some. Um zip com um arquivo que não é imagem renomeado para `.jpg`
+leva 422. Dez `PUT` paralelos que, somados, passam da cota deixam a área final
+dentro da cota.
+
+### 7.4 O teto global de disco também tranca o dono
+
+**Onde:** `check_disk(ctx.base)` vale para toda sessão.
+
+**O furo:** testadores que enchem o teto global fazem o upload do dono levar
+507. É o mesmo desenho do 7.2: um limite pensado para proteger o dono acaba
+sendo usado contra ele.
+
+**Fazer:** reservar uma folga para o dono. Por exemplo, testador para em 80% do
+teto e dono vai até 100%. Somar a isso um limite de testadores novos por IP por
+hora, que depende do 7.2 estar feito.
+
+**Teste:** com um teto baixo, encher o disco com testadores. O dono continua
+subindo.
+
+### 7.5 Job que derruba o worker entra em laço
+
+**Onde:** `jobs.requeue_running`, chamado toda vez que o worker sobe.
+
+**O furo:** um capítulo que estoura o `mem_limit: 6g` mata o worker por OOM. O
+Docker reinicia o worker, o job volta para `pending`, o worker pega o job de
+novo e morre de novo. A fila inteira fica parada atrás desse capítulo, sem erro
+nenhum na tela.
+
+**Fazer:** uma migração com a coluna `attempts`. O `claim_next` incrementa o
+contador. O `requeue_running` marca o job como `failed`, com uma mensagem legível
+("o worker caiu 3 vezes neste capítulo"), quando `attempts >= 3`.
+
+**Teste:** três subidas seguidas com o mesmo job em `running` deixam esse job em
+`failed`, e o próximo job da fila roda.
+
+### 7.6 A limpeza não varre tudo que pode sobrar
+
+A seção 4.3 cobre testador vencido e sessão vencida. Ficaram de fora:
+
+- `data/uploads/*.upload` órfãos, que sobram quando o processo morre no meio
+  de `_spool_body`. O `finally` do `_run` só roda se o processo continuar vivo.
+  Apagar os que tiverem `mtime` com mais de uma hora.
+- Pastas `*.incoming` abandonadas, inclusive as do dono. Apagar depois de N
+  dias, ou pelo menos mostrar no painel que estão lá.
+- A limpeza roda no laço do worker. Com o worker parado, ou no meio de um
+  capítulo de quatro minutos, a limpeza também para. Isso é aceitável, mas fica
+  anotado aqui; a alternativa é uma thread própria no `app`.
+
+**Teste:** no `sweep`, um `.upload` velho some e um recente fica.
+
+### 7.7 Remoção que falta
+
+A mensagem de cota do testador diz "Apague um para subir outro", e não existe
+rota que apague. Além disso, `DELETE .../incoming` é só do dono, então um
+testador com upload quebrado fica preso até a sessão expirar.
+
+**Fazer:**
+
+- `DELETE /api/series/<s>/chapters/<c>`: apaga o capítulo em `library/` e em
+  `output/` na área de quem pede, com CSRF. Recusa quando há job `pending` ou
+  `running` para esse capítulo.
+- Liberar `DELETE .../incoming` para a sessão. A marca `owner` existia para
+  proteger o acervo do dono, mas a área vem do cookie e não da URL: o testador
+  só alcança a própria área. Mantenha como `owner` só o que muda o acervo
+  *inteiro* (glossário, `series.json`, capa).
+- `DELETE /api/series/<s>`, só para o dono, com confirmação na interface.
+
+**Teste (isolamento):** um testador que apaga um capítulo com o mesmo nome de
+um capítulo do dono apaga só o seu, e o do dono continua lá. Apagar um capítulo
+que não existe na própria área leva 404.
+
+### 7.8 Menores
+
+- `/api/health` é público e responde a versão do Python e `has_api_key`. Na
+  instância pública, responder só `ok`, e deixar o resto para a sessão do dono.
+- `Strict-Transport-Security ... includeSubDomains` vale para todos os
+  subdomínios do domínio escolhido. Confirmar antes de ligar.
+- A seção 4 descreve `gunicorn` + WSGI, e o que foi implementado é
+  `ThreadingHTTPServer` atrás do Caddy. Anotar a decisão na seção 4, para o
+  próximo leitor não achar que falta uma etapa.
+- Há uma pasta vazia `src;C` na raiz, resto de um comando com caminho do
+  Windows. Apagar. `.claude/` está fora do `.gitignore`.
+- README: a tabela de calibração da heurística foi cortada pelo parágrafo do
+  `min_letters`, e as três últimas linhas ficaram soltas. `--profile local` não
+  existe no `docker-compose.yml`; funciona só porque `app` e `worker` não têm
+  perfil.
+- O checklist marcava "termos com endereço para remoção" como feito, mas
+  `reader/termos.html` ainda diz `contato@exemplo.com`. O item foi desmarcado
+  abaixo.
+
+**PARE.** Rode a bateria inteira, e rode o `caddy_test.py` com os casos novos e
+o proxy de pé. Relate o que falhou antes de corrigir.
+
+---
+
+## FASE 8 — O que mais falta no uso
+
+Não são furos. É o que a revisão achou que mais pesa para quem usa a ferramenta
+todo dia, em ordem de valor.
+
+1. **Corrigir uma fala à mão, no leitor.** Hoje, um erro de OCR ou de tradução
+   só se corrige retraduzindo o capítulo inteiro. A ideia: clicar no balão,
+   editar e gravar em `chapter.<motor>.json` pela área da sessão, validando pelo
+   modelo. Marcar a edição (`edited: true`) para que uma retradução não apague o
+   que foi corrigido à mão.
+2. **Retraduzir uma página só.** Um job com `pages=[...]`. O `extract.json` já é
+   por página, com sha256, então a peça que falta é a rota e o botão.
+3. **Estimar o custo antes de um job `claude`.** Os preços já estão em
+   `[pricing]`: páginas × tokens médios medidos, mostrado no painel antes de
+   confirmar.
+4. **Exercitar o motor `claude` contra a API real.** O README admite que isso
+   nunca foi feito. Rodar um capítulo curto e conferir schema, `effort`,
+   `stop_reason` e o custo medido contra `[pricing]`. Registrar o número no
+   README.
+5. **`mangatl backup`.** A Fase 5 pede backup de `data/` e nada o implementa.
+   Usar `sqlite3.Connection.backup`, porque copiar o arquivo com o WAL aberto
+   não é backup, mais um tar de `data/users/`.
+6. **Trocar a senha do dono sem reiniciar, e "sair de todas as sessões"**
+   (`DELETE FROM sessions WHERE user_id = ?`). Hoje a senha só muda via `.env`
+   e reinício.
+7. **Exportar o capítulo traduzido** como CBZ ou PDF, com o texto renderizado
+   na imagem. O Pillow já está no worker.
+8. **CI.** GitHub Actions rodando o `pytest`, com os testes de `rtdetr` e
+   `argos` atrás de marcador, e o `node --test reader/overlay.test.js`.
+9. **Inpainting simples em balão colorido**, o primeiro limite conhecido do
+   README. É opcional: meça com `scripts/report_overlay.py` antes de decidir.
+
+---
+
 ## 5. Fora de escopo (anote, não implemente)
 
 - Qualquer tela que liste o acervo de outro usuário. A vitrine da Fase 1.5 é a
@@ -731,7 +952,24 @@ máquina e de outra rede. Relate.
 - [x] Chave da API fora da imagem, confirmado com `docker history` — 27 camadas, nenhuma ocorrência, e `.env` não está na imagem
 - [x] `scripts/serve.py` apagado e o motivo escrito no README
 - [x] README com: rodar local com chave própria, custo medido, por que a instância pública é limitada, requisitos reais, e o que o projeto não é — mais `PUBLIC_SHOWCASE` e a bateria do proxy
-- [x] Termos publicados, com prazo de expiração e endereço para remoção
+- [x] Termos publicados, com prazo de expiração e endereço para remoção — o endereço vem de `CONTACT_EMAIL`; sem ele a página diz que ainda não foi configurado, em vez de mostrar um falso
 - [x] Os 7 primeiros testes da Fase 3.7 passando contra o app
 - [x] Os casos 8, 9 e 10 executados com o Caddy na frente, localmente — `caddy_test.py`, 14 testes
 - [ ] **Os casos 8, 9 e 10 repetidos contra o domínio público, de outra rede**
+- [x] 7.1 `PUBLIC_SHOWCASE=0` recusa escrita sem sessão na API (401, nenhum usuário criado)
+- [x] 7.2 IP real vindo do Caddy, aceito só do proxy; `mangatl reset-login`
+- [x] 7.3 Cota do testador vale para o zip descompactado, para bytes mágicos por entrada e para uploads em paralelo
+- [x] 7.4 Folga de disco reservada para o dono
+- [x] 7.5 `attempts` na fila; job que derruba o worker 3 vezes vira `failed`
+- [x] 7.6 Limpeza de `.upload` órfão e de `.incoming` abandonado
+- [x] 7.7 Apagar capítulo pela sessão, e série pelo dono
+- [x] 7.8 Menores: health enxuto, `src;C` apagada, README corrigido, seção 4 atualizada
+- [x] Backup de `data/` implementado (`mangatl backup`), e não só pedido na Fase 5
+- [x] 8.1 Fala corrigida à mão no leitor, marcada `edited`, sobrevive a retradução — conferido contra o worker real: retraduzir a página e o capítulo inteiro devolvem a correção
+- [x] 8.2 Retraduzir uma página (`pages` no job; relê e retraduz só ela)
+- [x] 8.3 Estimativa de custo antes do job `claude` — calibrada pelo número do README, não por tokens medidos (depende do 8.4)
+- [ ] 8.4 Motor `claude` contra a API real — fora desta execução, gasta a chave
+- [x] 8.6 Trocar a senha do dono sem reiniciar, `mangatl set-password`, e sair de todas as sessões; o `.env` não desfaz a troca
+- [x] 8.7 Exportar CBZ e PDF com a fala escrita na página
+- [x] 8.8 CI no GitHub Actions. Os testes de `rtdetr` e `argos` não precisaram de marcador: cobrem funções puras e rodam sem torch nem Argos instalados
+- [ ] 8.9 Inpainting em balão colorido — fora desta execução; medir com `scripts/report_overlay.py` antes

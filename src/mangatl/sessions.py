@@ -220,6 +220,20 @@ def revoke(connection: sqlite3.Connection, token: str | None) -> None:
         connection.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash(token),))
 
 
+def revoke_all(connection: sqlite3.Connection, user_id: str, *, keep: str | None = None) -> int:
+    """Encerra todas as sessoes desta pessoa, menos a do token `keep`, se houver.
+
+    E o "sair de todos os aparelhos": o celular esquecido logado, ou a sessao que
+    alguem abriu com a senha antiga, deixam de valer na hora - e nao quando o
+    cookie vencer daqui a um mes.
+    """
+    kept = token_hash(keep) if keep else ""
+    cursor = connection.execute(
+        "DELETE FROM sessions WHERE user_id = ? AND token_hash != ?", (user_id, kept)
+    )
+    return cursor.rowcount
+
+
 def purge_expired_sessions(connection: sqlite3.Connection) -> int:
     cursor = connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (now(),))
     return cursor.rowcount
@@ -306,6 +320,49 @@ def clear_login_attempts(connection: sqlite3.Connection, subjects: tuple[str, ..
     continuaria a um erro do bloqueio pelos quinze minutos seguintes."""
     for subject in subjects:
         connection.execute("DELETE FROM login_attempts WHERE subject = ?", (subject.lower(),))
+
+
+def clear_every_login_attempt(connection: sqlite3.Connection) -> int:
+    """Zera o limite de tentativas inteiro. So a linha de comando chama isto.
+
+    E a porta dos fundos do dono: a chave `email:` existe para ninguem varrer a
+    senha dele, e por isso mesmo qualquer um pode tranca-la de proposito. Quem tem
+    shell na maquina nao precisa esperar quinze minutos para entrar.
+    """
+    return connection.execute("DELETE FROM login_attempts").rowcount
+
+
+TESTER_SIGNUPS_PER_IP_PER_HOUR = 5
+"""Sessoes de teste novas que um mesmo endereco abre por hora.
+
+Sem teto, a cota por sessao nao limita nada: quem apaga o cookie ganha outra
+sessao, outros 40MB e outro lugar na fila. Cinco cobrem uma casa com varios
+aparelhos atras do mesmo roteador."""
+
+
+def _ip_hash(ip: str) -> str:
+    """O IP como hash: o banco conta, mas nao guarda endereco de ninguem."""
+    return hashlib.sha256(ip.encode("utf-8")).hexdigest()
+
+
+def tester_signup_allowed(connection: sqlite3.Connection, ip: str) -> bool:
+    row = connection.execute(
+        "SELECT count(*) AS n FROM tester_signups WHERE ip_hash = ? AND at > ?",
+        (_ip_hash(ip), minutes_ago(60)),
+    ).fetchone()
+    return row["n"] < TESTER_SIGNUPS_PER_IP_PER_HOUR
+
+
+def record_tester_signup(connection: sqlite3.Connection, ip: str) -> None:
+    connection.execute(
+        "INSERT INTO tester_signups (ip_hash, at) VALUES (?, ?)", (_ip_hash(ip), now())
+    )
+
+
+def purge_old_tester_signups(connection: sqlite3.Connection) -> int:
+    return connection.execute(
+        "DELETE FROM tester_signups WHERE at <= ?", (minutes_ago(60),)
+    ).rowcount
 
 
 def purge_old_login_attempts(connection: sqlite3.Connection) -> int:

@@ -195,7 +195,10 @@ def test_recognises_something_shaped_like_an_email(value: str, expected: bool):
 
 
 @pytest.fixture
-def server(tmp_path: Path):
+def server(tmp_path: Path, monkeypatch):
+    """Com a vitrine ligada: e so nela que a primeira escrita sem sessao abre um
+    testador. Desligada, a mesma escrita leva 401 - e o que a Fase 7.1 corrigiu."""
+    monkeypatch.setenv("PUBLIC_SHOWCASE", "1")
     (tmp_path / "reader").mkdir()
     cfg = Config(root=tmp_path)
     migrate(cfg)
@@ -329,6 +332,8 @@ def test_reuses_that_session_instead_of_opening_another(server: Client, tmp_path
 
 
 def test_says_the_instance_is_private_by_default(server: Client, monkeypatch):
+    monkeypatch.delenv("PUBLIC_SHOWCASE")
+
     _, body, _ = server.raw("GET", "/api/session")
 
     assert json.loads(body)["showcase"] is False
@@ -346,3 +351,49 @@ def test_says_the_instance_shows_a_showcase_when_asked(server: Client, monkeypat
     _, body, _ = server.raw("GET", "/api/session")
 
     assert json.loads(body)["showcase"] is True
+
+
+# ---------- 7.2 o IP de verdade atras do proxy ----------
+
+
+def _fail_logins_from(server: Client, address: str) -> None:
+    """Cinco erros com um e-mail que nao e o do dono: so a chave `ip:` enche."""
+    wrong = json.dumps({"email": "varredor@example.com", "password": "errada"}).encode("utf-8")
+    for _ in range(LOGIN_ATTEMPT_LIMIT):
+        server.send("POST", "/api/login", wrong, headers={"X-Real-IP": address})
+
+
+def _login_from(server: Client, address: str) -> int:
+    payload = json.dumps({"email": OWNER_EMAIL, "password": OWNER_PASSWORD}).encode("utf-8")
+    return server.send("POST", "/api/login", payload, headers={"X-Real-IP": address})[0]
+
+
+def test_does_not_lock_one_client_out_for_anothers_mistakes(server: Client, monkeypatch):
+    """Atras do proxy, cinco erros de um desconhecido trancavam o dono junto."""
+    monkeypatch.setenv("TRUSTED_PROXIES", "127.0.0.1")
+    _fail_logins_from(server, "203.0.113.7")
+
+    assert _login_from(server, "203.0.113.7") == 429
+    assert _login_from(server, "198.51.100.9") == 200
+
+
+def test_ignores_the_real_ip_header_from_a_peer_that_is_not_the_proxy(
+    server: Client, monkeypatch
+):
+    """Sem proxy confiavel, quem escreve o cabecalho e o cliente - trocar o valor
+    a cada pedido nao pode ser a forma de escapar do limite."""
+    monkeypatch.delenv("TRUSTED_PROXIES", raising=False)
+    _fail_logins_from(server, "203.0.113.7")
+
+    assert _login_from(server, "198.51.100.9") == 429
+
+
+@pytest.mark.parametrize(("configured", "expected"), [("", None), ("remocao@example.com", "remocao@example.com")])
+def test_tells_the_terms_page_where_removal_requests_go(
+    server: Client, monkeypatch, configured: str, expected: str | None
+):
+    monkeypatch.setenv("CONTACT_EMAIL", configured)
+
+    _, body, _ = server.raw("GET", "/api/session")
+
+    assert json.loads(body)["contact"] == expected

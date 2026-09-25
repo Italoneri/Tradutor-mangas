@@ -8,9 +8,13 @@
    o painel. Quem sobe uma amostra sem conta nenhuma nao ve a de entrar - a sessao
    anonima nasce sozinha no primeiro upload.
 
-   O que esta tela deliberadamente nao faz: apagar obra, apagar capitulo,
-   renomear, reordenar pagina, editar traducao. Cada um e destrutivo ou grande, e
-   nenhum deles fica melhor escondido atras de um botao pequeno.
+   Apagar capitulo e obra pede dois cliques no mesmo botao, e nao um `confirm()`:
+   o dialogo do navegador bloqueia a pagina inteira, e o segundo clique no mesmo
+   lugar ja e a confirmacao. Obra inteira so aparece para o dono.
+
+   O que esta tela deliberadamente nao faz: renomear e reordenar pagina. Os dois
+   reescrevem caminhos gravados nos JSONs, e nenhum fica melhor escondido atras de
+   um botao pequeno.
 */
 
 const API = "/api";
@@ -38,6 +42,11 @@ const el = {
   testerPath: document.getElementById("tester-path"),
   signOut: document.getElementById("sign-out"),
   panel: document.getElementById("panel"),
+  accountCard: document.getElementById("account-card"),
+  passwordForm: document.getElementById("password-form"),
+  passwordCurrent: document.getElementById("password-current"),
+  passwordNew: document.getElementById("password-new"),
+  signOutEverywhere: document.getElementById("sign-out-everywhere"),
 
   seriesList: document.getElementById("series-list"),
   toggleNewSeries: document.getElementById("toggle-new-series"),
@@ -56,6 +65,8 @@ const el = {
   glossaryRows: document.getElementById("glossary-rows"),
   glossaryAdd: document.getElementById("glossary-add"),
   glossarySave: document.getElementById("glossary-save"),
+  seriesDanger: document.getElementById("series-danger"),
+  seriesDelete: document.getElementById("series-delete"),
 
   uploadCard: document.getElementById("upload-card"),
   chapterNumber: document.getElementById("chapter-number"),
@@ -209,9 +220,51 @@ function renderChapters() {
         <div class="tags">${tags}${pending}</div>
         <span class="pages">${chapter.image_count} ${chapter.image_count === 1 ? "imagem" : "imagens"}</span>
         <button class="btn btn-secondary" data-translate="${escapeHtml(chapter.chapter)}">Traduzir</button>
+        <button class="btn btn-ghost" data-delete="${escapeHtml(chapter.chapter)}">Apagar</button>
       </div>`;
     })
     .join("");
+}
+
+const ARM_MS = 4000;
+
+/** Primeiro clique arma o botao, o segundo executa. Devolve se ja estava armado.
+ *
+ * Sem `confirm()`: o dialogo do navegador trava a pagina inteira, e o segundo
+ * clique no mesmo botao, com o texto trocado, ja pergunta "tem certeza?".
+ */
+function armed(button, question) {
+  if (button.dataset.armed) return true;
+  const label = button.textContent;
+  button.dataset.armed = "1";
+  button.textContent = question;
+  setTimeout(() => {
+    delete button.dataset.armed;
+    button.textContent = label;
+  }, ARM_MS);
+  return false;
+}
+
+async function deleteChapter(button) {
+  if (!armed(button, "Apagar mesmo?")) return;
+  const chapter = button.dataset.delete;
+  await api(`${seriesPath(state.selected)}/chapters/${encodeURIComponent(chapter)}`, {
+    method: "DELETE",
+  });
+  await loadSeries();
+  flash(`Capítulo ${chapter} apagado.`, "ok");
+}
+
+async function deleteSeries(button) {
+  if (!armed(button, "Apagar a obra e todos os capítulos?")) return;
+  const slug = state.selected;
+  await api(seriesPath(slug), { method: "DELETE" });
+  state.selected = null;
+  el.seriesCard.hidden = true;
+  el.uploadCard.hidden = true;
+  el.jobCard.hidden = true;
+  await loadSeries(false);
+  flash(`Obra ${slug} apagada.`, "ok");
 }
 
 function glossaryRowHtml(term = "", translation = "") {
@@ -242,6 +295,7 @@ async function selectSeries(slug) {
   el.seriesName.textContent = entry.title || entry.series;
   el.seriesSlug.textContent = `pasta: ${entry.series}`;
   el.seriesCard.hidden = false;
+  el.seriesDanger.hidden = state.session.kind !== "owner";
   el.uploadCard.hidden = false;
   el.jobCard.hidden = true;
   renderStaged();
@@ -386,6 +440,7 @@ async function uploadStaged() {
 
 function openJob(chapter) {
   state.chapter = chapter;
+  disarmCost();
   el.jobCard.hidden = false;
   el.jobTarget.textContent = `${state.selected} · capítulo ${chapter}`;
   el.jobView.hidden = true;
@@ -460,7 +515,34 @@ async function restoreJob() {
   if (LIVE_STATES.includes(job.state)) pollJob(job.id);
 }
 
+/** O custo estimado de um job `claude`, pedido antes do clique que enfileira.
+ *
+ * O primeiro clique em "Traduzir" com `claude` so mostra o numero e troca o
+ * texto do botao; o segundo confirma. Trocar de motor ou de capitulo desarma.
+ */
+async function confirmCost() {
+  if (el.jobEngine.value !== "claude") return true;
+  const key = `${state.selected}/${state.chapter}`;
+  if (el.jobStart.dataset.confirmed === key) return true;
+
+  const path = `${seriesPath(state.selected)}/chapters/${encodeURIComponent(state.chapter)}/estimate/claude`;
+  const estimate = await api(path);
+  const cost = estimate.usd === null ? "custo desconhecido (modelo sem preço no config.toml)" : `~US$ ${estimate.usd.toFixed(2)}`;
+  el.engineNote.hidden = false;
+  el.engineNote.textContent = `Estimativa: ${estimate.pages} páginas com ${estimate.model}, ${cost}. É estimativa: captura alta vira mais páginas ao fatiar.`;
+  el.jobStart.dataset.confirmed = key;
+  el.jobStart.textContent = `Confirmar (${cost})`;
+  return false;
+}
+
+function disarmCost() {
+  delete el.jobStart.dataset.confirmed;
+  el.jobStart.textContent = "Traduzir";
+}
+
 async function startJob() {
+  if (!(await confirmCost())) return;
+  disarmCost();
   const job = await api("/jobs", {
     method: "POST",
     body: {
@@ -512,6 +594,13 @@ function wire() {
   el.chapterList.onclick = (event) => {
     const button = event.target.closest("[data-translate]");
     if (button) openJob(button.dataset.translate);
+    const eraser = event.target.closest("[data-delete]");
+    if (eraser) guard(() => deleteChapter(eraser));
+  };
+
+  el.seriesDelete.onclick = (event) => {
+    event.preventDefault();
+    guard(() => deleteSeries(el.seriesDelete));
   };
 
   el.seriesMeta.onsubmit = (event) => {
@@ -605,8 +694,11 @@ function wire() {
     event.preventDefault();
     guard(startJob);
   };
+  el.jobEngine.onchange = disarmCost;
 
   el.loginForm.onsubmit = signIn;
+  el.passwordForm.onsubmit = changePassword;
+  el.signOutEverywhere.onclick = () => guard(signOutEverywhere);
   el.signOut.onclick = () => guard(signOut);
 
   /* Entrar como testador nao chama rota nenhuma: a sessao nasce no servidor na
@@ -660,6 +752,26 @@ async function signIn(event) {
   await enterPanel();
 }
 
+async function changePassword(event) {
+  event.preventDefault();
+  await guard(async () => {
+    const result = await api("/account/password", {
+      method: "POST",
+      body: { current: el.passwordCurrent.value, new: el.passwordNew.value },
+    });
+    el.passwordCurrent.value = el.passwordNew.value = "";
+    const closed = result.other_sessions_closed;
+    flash(`Senha trocada. ${closed} ${closed === 1 ? "sessão encerrada" : "sessões encerradas"} em outros aparelhos.`, "ok");
+  });
+}
+
+async function signOutEverywhere() {
+  if (!armed(el.signOutEverywhere, "Sair de todos, inclusive daqui?")) return;
+  await api("/account/sessions/revoke", { method: "POST" });
+  navigator.serviceWorker?.controller?.postMessage({ type: "purge" });
+  location.reload();
+}
+
 async function signOut() {
   await api("/logout", { method: "POST" }).catch(() => null);
   /* O cache e por origem, nao por conta: sem esta limpeza a proxima pessoa a
@@ -669,8 +781,13 @@ async function signOut() {
 }
 
 async function enterPanel() {
+  /* De novo, e agora com sessao: sem ela o `/health` so diz que o servidor esta
+     de pe, e o que falta aqui - detector, chave da API - e do dono. */
+  state.health = (await api("/health").catch(() => null)) || state.health;
+  el.health.textContent = state.health.detector ? `detector ${state.health.detector}` : "";
   el.login.hidden = true;
   el.panel.hidden = false;
+  el.accountCard.hidden = state.session.kind !== "owner";
   el.signOut.hidden = false;
   renderEngines();
   await guard(() => loadSeries(false));
@@ -686,8 +803,6 @@ async function main() {
     flash("Não consegui falar com o servidor. Suba o `mangatl serve` e recarregue.");
     return;
   }
-  el.health.textContent = `detector ${state.health.detector}`;
-
   state.session = await api("/session").catch(() => ({ authenticated: false }));
   if (state.session.authenticated) {
     await enterPanel();

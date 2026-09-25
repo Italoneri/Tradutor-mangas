@@ -29,7 +29,9 @@ headless e quebra a cada mudanca de layout, entao a origem das imagens e upload.
 from __future__ import annotations
 
 import io
+import ipaddress
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -37,16 +39,24 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import traceback
 import zipfile
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from http import HTTPStatus
 from pathlib import Path, PurePosixPath
 from typing import IO, Literal, NamedTuple
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
-from .accounts import User, area_config, create_user, find_owner, password_hash_of
+from .accounts import (
+    User,
+    area_config,
+    change_owner_password,
+    create_user,
+    find_owner,
+    password_hash_of,
+)
 from .config import Config
 from .db import connect, in_hours
 from .engines.base import available_engines
@@ -56,10 +66,11 @@ from .jobs import (
     Busy,
     enqueue,
     get as get_job,
+    has_active,
     queue_position,
     recent as recent_jobs,
 )
-from .models import SeriesMeta
+from .models import Chapter, SeriesMeta
 from .quotas import (
     TESTER_MAX_PAGES_PER_CHAPTER,
     OutOfSpace,
@@ -86,8 +97,11 @@ from .sessions import (
     issue,
     login_is_throttled,
     record_login_attempt,
+    record_tester_signup,
     resolve,
     revoke,
+    revoke_all,
+    tester_signup_allowed,
     token_from_cookies,
     verify_password,
 )
@@ -103,10 +117,15 @@ from .store import (
     discover_series,
     list_page_images,
     load_glossary,
+    load_chapter,
     load_series_meta,
+    save_chapter,
     save_glossary,
+    save_library,
     save_series_meta,
 )
+
+log = logging.getLogger("mangatl.panel")
 
 API_PREFIX = "/api/"
 USER_PREFIX = "/u/"
@@ -131,6 +150,16 @@ e 9 de `caddy_test.py`, com o proxy de pe.
 Ausente, o Python transmite em pedacos. Funciona, e e divida anotada."""
 
 SHOWCASE_ENV = "PUBLIC_SHOWCASE"
+CONTACT_ENV = "CONTACT_EMAIL"
+
+
+def contact_email() -> str | None:
+    """Para onde vao os pedidos de remocao, se o responsavel pela instancia disse.
+
+    Vem do ambiente, e nao do HTML dos termos: o mesmo `reader/` serve toda
+    instancia, e cada uma tem o seu responsavel.
+    """
+    return os.environ.get(CONTACT_ENV, "").strip() or None
 
 
 def showcase_is_public() -> bool:
@@ -142,6 +171,55 @@ def showcase_is_public() -> bool:
     numa instancia que existe para demonstrar o pipeline a quem nao tem conta.
     """
     return os.environ.get(SHOWCASE_ENV, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+TRUSTED_PROXIES_ENV = "TRUSTED_PROXIES"
+REAL_IP_HEADER = "X-Real-IP"
+
+
+def trusted_proxies() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """As redes de onde um `X-Real-IP` e aceito, lidas de `TRUSTED_PROXIES`.
+
+    IP solto ou CIDR, separados por virgula. Vazio por padrao: sem proxy na frente,
+    quem escreve o cabecalho e o cliente, e aceita-lo seria deixar cada pedido
+    escolher o proprio IP - e com ele escapar do limite de tentativas de senha.
+    """
+    networks = []
+    for item in os.environ.get(TRUSTED_PROXIES_ENV, "").split(","):
+        if not item.strip():
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item.strip(), strict=False))
+        except ValueError:
+            # Entrada torta nao derruba o servidor, mas tambem nao some: sem ela o
+            # proxy deixa de ser confiavel e o limite de login volta a ser um so.
+            log.warning("operation=trusted_proxies invalid=%r", item.strip())
+    return tuple(networks)
+
+
+def client_ip(
+    peer: str,
+    real_ip: str | None,
+    trusted: Sequence[ipaddress.IPv4Network | ipaddress.IPv6Network],
+) -> str:
+    """O IP de quem pediu: o do cabecalho so quando quem conectou e o proxy.
+
+    Atras do Caddy todo pedido chega com o IP do Caddy, e a chave `ip:` do limite
+    de login virava uma so para o mundo inteiro - cinco senhas erradas de qualquer
+    pessoa trancavam o dono junto. O Caddy sobrescreve `X-Real-IP` com o endereco
+    do socket dele, entao o valor que chega por ele e o do cliente, e nao o que o
+    cliente escreveu.
+    """
+    try:
+        peer_address = ipaddress.ip_address(peer)
+    except ValueError:
+        return peer
+    if not real_ip or not any(peer_address in network for network in trusted):
+        return peer
+    try:
+        return str(ipaddress.ip_address(real_ip.strip()))
+    except ValueError:
+        return peer
 
 
 MAX_COMPONENT_CHARS = 120
@@ -324,6 +402,14 @@ class Raw(NamedTuple):
 
     path: Path
     content_type: str
+    download_name: str | None = None
+    """Nome sugerido para salvar. Presente, a resposta vira download."""
+
+    temporary: bool = False
+    """Arquivo gerado para este pedido: sai pelo Python e e apagado depois.
+
+    Nao vai pelo proxy de proposito - o Caddy transmitiria depois de o Python ja
+    ter respondido, e nao haveria momento certo para apagar."""
 
 
 class Context(NamedTuple):
@@ -347,11 +433,11 @@ class Context(NamedTuple):
     session: Session | None
     token: str | None = None
     client_ip: str = ""
-    """So para contar tentativa de senha, nunca para autorizar.
+    """So para contar tentativa de senha e testador novo, nunca para autorizar.
 
-    Atras de um proxy reverso este valor e o IP do proxy, a menos que alguem
-    confie explicitamente no `X-Forwarded-For` - e confiar num cabecalho que o
-    cliente escreve e o mesmo que nao ter regra nenhuma."""
+    Vem de `client_ip`: o `X-Real-IP` so vale quando a conexao chega de um
+    endereco em `TRUSTED_PROXIES`. Fora disso e o IP do socket - confiar num
+    cabecalho que o cliente escreve e o mesmo que nao ter regra nenhuma."""
 
     @property
     def user(self) -> User | None:
@@ -410,6 +496,14 @@ class Route(NamedTuple):
     recebe b"" e recusa com 422 pela propria validacao, em vez de aceitar lixo.
     """
 
+    user_locked: bool = False
+    """Se a rota roda sozinha entre as rotas marcadas do mesmo usuario.
+
+    O servidor e uma thread por conexao, e "conferir e gravar" nao e atomico: dez
+    `PUT` simultaneos passavam todos pela conferencia antes de qualquer um gravar,
+    e a area terminava acima da cota. Marcada nas rotas que ocupam disco e na que
+    reescreve a traducao - duas correcoes ao mesmo tempo perderiam uma delas."""
+
     stream: bool = False
     """Se o corpo desce para um arquivo em vez de virar `bytes`.
 
@@ -432,6 +526,14 @@ class RouteMatch(NamedTuple):
 
 
 def _health(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Se o servidor esta de pe. O resto so para o dono.
+
+    Publica porque monitor de uptime e o painel antes do login precisam dela. Mas
+    versao do Python e presenca da chave da API sao inventario do servidor, e uma
+    rota publica nao tem por que entrega-lo a quem so quer saber se ele responde.
+    """
+    if not ctx.is_owner:
+        return HTTPStatus.OK, {"ok": True}
     return HTTPStatus.OK, {
         "ok": True,
         "engines": available_engines(),
@@ -470,10 +572,12 @@ def _session_payload(session: Session | None) -> dict:
             "kind": None,
             "engines": [],
             "showcase": showcase_is_public(),
+            "contact": contact_email(),
         }
     return {
         "authenticated": True,
         "showcase": showcase_is_public(),
+        "contact": contact_email(),
         "kind": session.user.kind,
         "expires_at": session.expires_at,
         # O testador nunca ve `claude` na lista: a chave da API e do dono, e a
@@ -532,6 +636,42 @@ def _logout(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, ob
     valendo para quem o tiver copiado - sair tem que significar sair.
     """
     revoke(ctx.connection, ctx.token)
+    return HTTPStatus.OK, _Cleared({"authenticated": False, "kind": None, "engines": []})
+
+
+def _change_password(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Troca a senha do dono sem reiniciar, e derruba as outras sessoes dele.
+
+    Pede a senha atual: um cookie roubado ja da acesso a tudo, mas nao pode dar
+    tambem o direito de trancar o dono de verdade para fora. Errar a atual conta
+    como tentativa de login, pelo mesmo motivo - esta e outra porta de varredura.
+    """
+    payload = json_body(body)
+    if not isinstance(payload, dict):
+        raise Invalid("esperava um objeto com current e new")
+    current, new = payload.get("current"), payload.get("new")
+    if not isinstance(current, str) or not isinstance(new, str):
+        raise Invalid("mande current e new como texto")
+
+    subjects = (f"ip:{ctx.client_ip}", f"email:{ctx.user.email or ''}")
+    if login_is_throttled(ctx.connection, subjects):
+        return HTTPStatus.TOO_MANY_REQUESTS, {"error": "tentativas demais; espere alguns minutos"}
+    if not verify_password(current, password_hash_of(ctx.connection, ctx.user.id)):
+        for subject in subjects:
+            record_login_attempt(ctx.connection, subject)
+        return HTTPStatus.FORBIDDEN, {"error": "a senha atual nao confere"}
+
+    try:
+        change_owner_password(ctx.connection, ctx.user.id, new)
+    except ValueError as error:
+        raise Invalid(str(error)) from error
+    revoked = revoke_all(ctx.connection, ctx.user.id, keep=ctx.token)
+    return HTTPStatus.OK, {"changed": True, "other_sessions_closed": revoked}
+
+
+def _sign_out_everywhere(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Encerra todas as sessoes desta pessoa, inclusive a deste navegador."""
+    revoke_all(ctx.connection, ctx.user.id)
     return HTTPStatus.OK, _Cleared({"authenticated": False, "kind": None, "engines": []})
 
 
@@ -675,7 +815,10 @@ def _page_limit(user: User) -> int:
 
 
 def extract_archive(
-    data: bytes | Path, target: Path, limit: int = MAX_PAGES_PER_CHAPTER
+    data: bytes | Path,
+    target: Path,
+    limit: int = MAX_PAGES_PER_CHAPTER,
+    byte_ceiling: int | None = None,
 ) -> list[str]:
     """Grava as paginas do zip na area de espera, uma entrada por vez.
 
@@ -687,6 +830,11 @@ def extract_archive(
     O teto do descompactado e conferido duas vezes de proposito: o `file_size`
     declarado antes de abrir, porque um zip de 1MB pode dizer 100GB, e os bytes
     realmente escritos durante a copia, porque quem escreve o declarado e o zip.
+
+    `byte_ceiling` e a folga da cota de quem sobe. O zip de 40MB que cabia na cota
+    podia ocupar gigabytes depois de aberto, porque so o compactado era conferido.
+    Passar dela e `QuotaExceeded`, e nao `Invalid`: o arquivo e legitimo, quem nao
+    tem espaco e a sessao.
     """
     # `zipfile` so precisa de algo que leia e posicione, e um arquivo aberto serve
     # tao bem quanto um buffer - com a diferenca de que o zip de 160MB fica no disco
@@ -695,7 +843,7 @@ def extract_archive(
         if not zipfile.is_zipfile(buffer):
             raise Invalid("o corpo nao e um zip; .cbz tambem e zip, o nome nao decide")
         buffer.seek(0)
-        return _extract_from(buffer, target, limit)
+        return _extract_from(buffer, target, limit, byte_ceiling)
 
 
 @contextmanager
@@ -707,7 +855,26 @@ def _archive_source(data: bytes | Path) -> Iterator[IO[bytes]]:
     yield io.BytesIO(data)
 
 
-def _extract_from(buffer: IO[bytes], target: Path, limit: int) -> list[str]:
+MAGIC_PREFIX_BYTES = 16
+"""O suficiente para `image_suffix` reconhecer todos os formatos, webp incluso."""
+
+
+def _refuse_expansion(total: int, byte_ceiling: int | None) -> None:
+    """Levanta se `total` passou do teto que vale para esta extracao."""
+    if byte_ceiling is not None and byte_ceiling < MAX_ARCHIVE_EXPANDED_BYTES:
+        if total > byte_ceiling:
+            raise QuotaExceeded(
+                f"o arquivo descompactado passa de {byte_ceiling // (1024 * 1024)}MB,"
+                " que e o que esta sessao ainda aceita."
+            )
+        return
+    if total > MAX_ARCHIVE_EXPANDED_BYTES:
+        raise Invalid(f"o descompactado passa do teto de {MAX_ARCHIVE_EXPANDED_BYTES} bytes")
+
+
+def _extract_from(
+    buffer: IO[bytes], target: Path, limit: int, byte_ceiling: int | None = None
+) -> list[str]:
     with zipfile.ZipFile(buffer) as archive:
         infos = archive.infolist()
         entries = safe_archive_entries([info.filename for info in infos])
@@ -716,7 +883,11 @@ def _extract_from(buffer: IO[bytes], target: Path, limit: int) -> list[str]:
         if not entries:
             raise Invalid("o arquivo nao tem nenhuma imagem")
         if len(entries) > limit:
-            raise Invalid(f"{len(entries)} paginas; o teto e {limit}")
+            raise Invalid(f"{len(entries)} paginas; este capitulo aceita mais {max(limit, 0)}")
+
+        oversized = [name for index, name in entries if infos[index].file_size > MAX_PAGE_BYTES]
+        if oversized:
+            raise Invalid(f"{oversized[0]!r} passa de {MAX_PAGE_BYTES} bytes, o teto de uma pagina")
 
         names = [name for _, name in entries]
         if len(set(names)) != len(names):
@@ -724,20 +895,22 @@ def _extract_from(buffer: IO[bytes], target: Path, limit: int) -> list[str]:
             # faria uma apagar a outra, e o capitulo perderia pagina em silencio.
             raise Invalid("duas entradas do arquivo tem o mesmo nome de pagina")
 
-        declared = sum(infos[index].file_size for index, _ in entries)
-        if declared > MAX_ARCHIVE_EXPANDED_BYTES:
-            raise Invalid(
-                f"o arquivo declara {declared} bytes descompactados;"
-                f" o teto e {MAX_ARCHIVE_EXPANDED_BYTES}"
-            )
+        _refuse_expansion(sum(infos[index].file_size for index, _ in entries), byte_ceiling)
+
+        # Os bytes magicos de todas antes de gravar qualquer uma: uma entrada que
+        # nao e imagem com nome de `.jpg` condena o arquivo pelo mesmo raciocinio do
+        # caminho de fuga, e recusar no meio deixaria meio capitulo escrito.
+        for index, name in entries:
+            with archive.open(infos[index]) as source:
+                if image_suffix(source.read(MAGIC_PREFIX_BYTES)) is None:
+                    raise Invalid(f"{name!r} nao e jpeg, png, webp nem bmp; nada foi extraido")
 
         written = 0
         for index, name in entries:
             with archive.open(infos[index]) as source, (target / name).open("wb") as sink:
                 while chunk := source.read(64 * 1024):
                     written += len(chunk)
-                    if written > MAX_ARCHIVE_EXPANDED_BYTES:
-                        raise Invalid("o descompactado passou do teto no meio da extracao")
+                    _refuse_expansion(written, byte_ceiling)
                     sink.write(chunk)
 
     return sorted(names, key=_natural_key)
@@ -762,7 +935,7 @@ def _create_chapter(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple
     # Antes de criar a pasta, e nao depois: area de espera aberta ja e disco
     # ocupado, e recusar depois deixaria o lixo para a limpeza varrer.
     check_new_chapter(ctx.cfg, ctx.user)
-    check_disk(ctx.base)
+    check_disk(ctx.base, ctx.user)
 
     chapter, incoming = _chapter_paths(ctx.cfg, directory.name, asked)
     if chapter.is_dir():
@@ -803,7 +976,7 @@ def _put_page(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, 
     adding = 0 if (incoming / name).exists() else 1
     check_incoming_pages(ctx.cfg, ctx.user, incoming, adding)
     check_upload_bytes(ctx.cfg, ctx.user, len(body))
-    check_disk(ctx.base, len(body))
+    check_disk(ctx.base, ctx.user, len(body))
 
     (incoming / name).write_bytes(body)
     record_usage(ctx.connection, ctx.user.id, pages=adding, bytes_=len(body))
@@ -826,13 +999,19 @@ def _put_archive(ctx: Context, groups: tuple[str, ...], body: Body) -> tuple[int
 
     size = body.stat().st_size if isinstance(body, Path) else len(body)
 
-    # O zip comprime, entao o corpo nao diz quanto vai ocupar; o que o teto de
-    # paginas garante e que o descompactado tambem cabe.
     check_upload_bytes(ctx.cfg, ctx.user, size)
-    check_disk(ctx.base, size)
+    check_disk(ctx.base, ctx.user, size)
 
+    # O zip comprime, entao o corpo nao diz quanto vai ocupar: a folga da cota vira
+    # teto do descompactado, e o teto de paginas conta o que ja esta na espera.
+    already = len(_incoming_files(incoming))
     try:
-        names = extract_archive(body, incoming, limit=_page_limit(ctx.user))
+        names = extract_archive(
+            body,
+            incoming,
+            limit=_page_limit(ctx.user) - already,
+            byte_ceiling=upload_headroom(ctx.cfg, ctx.user),
+        )
     except Exception:
         shutil.rmtree(incoming, ignore_errors=True)
         raise
@@ -855,7 +1034,9 @@ def _get_incoming(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[i
 def _delete_incoming(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
     """Descarta a area de espera.
 
-    E a unica remocao que o painel faz, e so apaga o que ele proprio escreveu.
+    E da sessao, e nao so do dono: a area vem do cookie e nao da URL, entao quem
+    pede so alcanca a propria. Sem isto, um testador com upload quebrado ficava
+    preso ate a sessao expirar.
     """
     _, incoming = _chapter_paths(ctx.cfg, groups[0], groups[1])
     if not incoming.is_dir():
@@ -864,6 +1045,62 @@ def _delete_incoming(ctx: Context, groups: tuple[str, ...], body: bytes) -> tupl
     removed = len(_incoming_files(incoming))
     shutil.rmtree(incoming)
     return HTTPStatus.OK, {"removed": removed}
+
+
+def _existing_series_dir(cfg: Config, slug: str) -> Path | None:
+    """A pasta da serie nesta area, ou None - que vira 404, e nao 422.
+
+    Para apagar, "nao existe" e "nao e seu" precisam da mesma resposta, pelo mesmo
+    motivo das rotas `/u/`: a diferenca seria um indice do acervo alheio.
+    """
+    return _inside(cfg.library_dir, slug)
+
+
+def _delete_chapter(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Apaga um capitulo da area de quem pede: as paginas e a traducao.
+
+    E o que torna verdadeira a mensagem de cota do testador - "apague um para
+    subir outro" - que ate aqui mandava fazer algo que nao existia.
+    """
+    series, chapter = groups
+    directory = _existing_series_dir(ctx.cfg, series)
+    pages = _inside(ctx.cfg.library_dir, series, chapter)
+    if directory is None or pages is None or not pages.is_dir():
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+    if has_active(ctx.connection, ctx.user.id, directory.name, pages.name):
+        return HTTPStatus.CONFLICT, {"error": "este capitulo esta na fila; espere terminar"}
+
+    shutil.rmtree(pages)
+    translation = _inside(ctx.cfg.output_dir, series, chapter)
+    if translation is not None and translation.is_dir():
+        shutil.rmtree(translation)
+    _refresh_library(ctx.cfg)
+    return HTTPStatus.OK, {"deleted": f"{directory.name}/{pages.name}"}
+
+
+def _delete_series(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Apaga uma serie inteira. So o dono, e a tela pede confirmacao antes."""
+    directory = _existing_series_dir(ctx.cfg, groups[0])
+    if directory is None or not directory.is_dir():
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+    if has_active(ctx.connection, ctx.user.id, directory.name):
+        return HTTPStatus.CONFLICT, {"error": "esta serie tem capitulo na fila; espere terminar"}
+
+    shutil.rmtree(directory)
+    translation = _inside(ctx.cfg.output_dir, directory.name)
+    if translation is not None and translation.is_dir():
+        shutil.rmtree(translation)
+    _refresh_library(ctx.cfg)
+    return HTTPStatus.OK, {"deleted": directory.name}
+
+
+def _refresh_library(cfg: Config) -> None:
+    """Regrava o `library.json`, que o leitor local le em vez do disco.
+
+    Sem isto o capitulo apagado continua na estante ate o proximo job terminar.
+    """
+    if cfg.output_dir.is_dir():
+        save_library(cfg, build_library(cfg))
 
 
 def _commit_chapter(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
@@ -910,6 +1147,7 @@ def _create_job(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int
     directory, _ = _chapter_paths(ctx.cfg, series, chapter)
     if not directory.is_dir():
         raise Invalid(f"capitulo {series}/{chapter} nao existe; promova a area de espera antes")
+    pages = _pages_to_retranslate(ctx.cfg, directory, engine, payload.get("pages"))
 
     try:
         job = enqueue(
@@ -921,11 +1159,164 @@ def _create_job(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int
             priority=OWNER_PRIORITY if ctx.is_owner else TESTER_PRIORITY,
             force=bool(payload.get("force")),
             dry_run=bool(payload.get("dry_run")),
+            pages=pages,
         )
     except Busy as error:
         return HTTPStatus.CONFLICT, {"error": str(error)}
 
     return HTTPStatus.ACCEPTED, {"job_id": job.id, "job": _job_payload(ctx, job)}
+
+
+MAX_PAGES_PER_RETRANSLATION = 20
+"""Acima disso nao e corrigir paginas, e retraduzir o capitulo - que tem botao proprio."""
+
+
+def _pages_to_retranslate(
+    cfg: Config, directory: Path, engine: str, asked: object
+) -> tuple[str, ...]:
+    """As paginas de um pedido de retraducao parcial, conferidas, ou `()` para todas.
+
+    Parcial so faz sentido sobre uma traducao que ja existe neste motor: o
+    resultado e ela com as paginas pedidas trocadas, e sem ela uma pagina sozinha
+    viraria um capitulo de uma pagina.
+    """
+    if asked is None:
+        return ()
+    if not isinstance(asked, list) or not asked or len(asked) > MAX_PAGES_PER_RETRANSLATION:
+        raise Invalid(f"pages e uma lista de 1 a {MAX_PAGES_PER_RETRANSLATION} nomes de pagina")
+
+    names: list[str] = []
+    for item in asked:
+        name = safe_page_name(item) if isinstance(item, str) else None
+        if name is None or not (directory / name).is_file():
+            raise Invalid(f"pagina {item!r} nao existe neste capitulo")
+        names.append(name)
+
+    if load_chapter(cfg, directory.parent.name, directory.name, engine) is None:
+        raise Invalid(f"traduza o capitulo inteiro com {engine!r} antes de retraduzir uma pagina")
+    return tuple(dict.fromkeys(names))
+
+
+MAX_EDITED_TEXT_CHARS = 2000
+"""Fala de balao passa raramente de duzentos caracteres; dois mil ja e colagem errada."""
+
+
+def _put_block(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Corrige uma fala a mao, na traducao de um motor, e marca que foi a mao.
+
+    E o conserto que faltava para erro de OCR ou de traducao: antes, uma fala
+    errada so saia retraduzindo o capitulo inteiro. A marca `edited` e o que faz
+    uma retraducao posterior devolver esta fala em vez de apaga-la.
+    """
+    series, chapter, engine = groups
+    payload = json_body(body)
+    if not isinstance(payload, dict):
+        raise Invalid("esperava um objeto com page, block e text")
+    page_index, block_id, text = payload.get("page"), payload.get("block"), payload.get("text")
+    if not isinstance(page_index, int) or not isinstance(block_id, str) or not isinstance(text, str):
+        raise Invalid("page e numero, block e text sao texto")
+    if not text.strip() or len(text) > MAX_EDITED_TEXT_CHARS:
+        raise Invalid(f"a fala precisa ter de 1 a {MAX_EDITED_TEXT_CHARS} caracteres")
+
+    stored = _translation_of(ctx.cfg, series, chapter, engine)
+    if stored is None:
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+    if has_active(ctx.connection, ctx.user.id, stored.series, stored.chapter):
+        return HTTPStatus.CONFLICT, {"error": "este capitulo esta na fila; espere terminar"}
+
+    updated = _with_edited_block(stored, page_index, block_id, text.strip())
+    if updated is None:
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+    save_chapter(ctx.cfg, updated)
+    return HTTPStatus.OK, {"page": page_index, "block": block_id, "text": text.strip(), "edited": True}
+
+
+def _translation_of(cfg: Config, series: str, chapter: str, engine: str) -> Chapter | None:
+    """A traducao deste motor na area de quem pede, ou None - que vira 404."""
+    if engine not in available_engines():
+        return None
+    path = _inside(cfg.output_dir, series, chapter, chapter_filename(engine))
+    if path is None or not path.is_file():
+        return None
+    return load_chapter(cfg, series, chapter, engine)
+
+
+def _with_edited_block(
+    stored: Chapter, page_index: int, block_id: str, text: str
+) -> Chapter | None:
+    """O capitulo com a fala trocada, ou None se a pagina ou o bloco nao existem."""
+    page = next((item for item in stored.pages if item.index == page_index), None)
+    if page is None or all(block.id != block_id for block in page.blocks):
+        return None
+    blocks = tuple(
+        block.model_copy(update={"text": text, "edited": True}) if block.id == block_id else block
+        for block in page.blocks
+    )
+    pages = tuple(
+        item.model_copy(update={"blocks": blocks}) if item.index == page_index else item
+        for item in stored.pages
+    )
+    return stored.model_copy(update={"pages": pages})
+
+
+def _estimate(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Quanto um job deste motor neste capitulo deve custar, antes de enfileirar.
+
+    So `claude` custa; o `free` responde zero para a tela nao precisar de dois
+    caminhos. O motor vem no caminho, e nao na query, porque o roteador casa o
+    caminho sem ela.
+    """
+    series, chapter, engine = groups
+    if engine not in available_engines():
+        raise Invalid(f"motor {engine!r} nao existe; ha {', '.join(available_engines())}")
+    directory, _ = _chapter_paths(ctx.cfg, series, chapter)
+    if not directory.is_dir():
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+
+    pages = len(list_page_images(directory))
+    if engine != "claude":
+        return HTTPStatus.OK, {"engine": engine, "pages": pages, "usd": 0.0, "model": None}
+
+    from .engines.claude import estimate_usd
+
+    model = ctx.cfg.translation.model
+    pricing = ctx.cfg.pricing_for(model)
+    usd = None if pricing is None else estimate_usd(pricing, pages)
+    return HTTPStatus.OK, {"engine": engine, "pages": pages, "usd": usd, "model": model}
+
+
+def _export(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """O capitulo traduzido como CBZ ou PDF, com a fala escrita nas paginas.
+
+    Gerado na hora e apagado depois de enviado: guardar a exportacao seria uma
+    segunda copia do capitulo ocupando a cota, e ela se refaz em segundos. Roda
+    na thread do pedido - o capitulo do testador tem 12 paginas, e o do dono e
+    pedido por uma pessoa so.
+    """
+    from .export import CONTENT_TYPES, WRITERS
+
+    series, chapter, engine, kind = groups
+    stored = _translation_of(ctx.cfg, series, chapter, engine)
+    pages_dir = _inside(ctx.cfg.library_dir, series, chapter)
+    if stored is None or pages_dir is None or not pages_dir.is_dir():
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+
+    spool = ctx.base.data_dir / "uploads"
+    spool.mkdir(parents=True, exist_ok=True)
+    handle, name = tempfile.mkstemp(dir=spool, suffix=".export")
+    os.close(handle)
+    target = Path(name)
+    try:
+        WRITERS[kind](stored, pages_dir, target)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    return HTTPStatus.OK, Raw(
+        target,
+        CONTENT_TYPES[kind],
+        download_name=f"{stored.series} {stored.chapter} ({engine}).{kind}",
+        temporary=True,
+    )
 
 
 def _job_payload(ctx: Context, job) -> dict:  # noqa: ANN001 - `Job` importado tardiamente
@@ -1079,6 +1470,15 @@ ROUTES: tuple[Route, ...] = (
         body_required=True,
     ),
     Route("POST", re.compile(r"^/api/logout$"), _logout, access="public", writes=True),
+    Route(
+        "POST",
+        re.compile(r"^/api/account/password$"),
+        _change_password,
+        access="owner",
+        writes=True,
+        body_required=True,
+    ),
+    Route("POST", re.compile(r"^/api/account/sessions/revoke$"), _sign_out_everywhere, writes=True),
     # O conteudo do usuario. Nenhuma recebe id: ele vem da sessao.
     Route("GET", re.compile(r"^/u/library$"), _user_library),
     Route("GET", re.compile(rf"^/u/pages/{_SLUG}/{_SLUG}/{_SLUG}$"), _user_page),
@@ -1117,7 +1517,13 @@ ROUTES: tuple[Route, ...] = (
         writes=True,
         body_required=True,
     ),
-    Route("POST", re.compile(rf"^/api/series/{_SLUG}/chapters$"), _create_chapter, writes=True),
+    Route(
+        "POST",
+        re.compile(rf"^/api/series/{_SLUG}/chapters$"),
+        _create_chapter,
+        writes=True,
+        user_locked=True,
+    ),
     Route(
         "PUT",
         re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/files/{_SLUG}$"),
@@ -1125,6 +1531,7 @@ ROUTES: tuple[Route, ...] = (
         MAX_PAGE_BYTES,
         writes=True,
         body_required=True,
+        user_locked=True,
     ),
     Route(
         "POST",
@@ -1134,6 +1541,7 @@ ROUTES: tuple[Route, ...] = (
         writes=True,
         body_required=True,
         stream=True,
+        user_locked=True,
     ),
     Route(
         "POST",
@@ -1142,6 +1550,24 @@ ROUTES: tuple[Route, ...] = (
         writes=True,
     ),
     Route("GET", re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/incoming$"), _get_incoming),
+    Route(
+        "PUT",
+        re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/translations/{_SLUG}/blocks$"),
+        _put_block,
+        writes=True,
+        body_required=True,
+        user_locked=True,
+    ),
+    Route(
+        "GET",
+        re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/estimate/{_SLUG}$"),
+        _estimate,
+    ),
+    Route(
+        "GET",
+        re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/export/([a-z]+)\.(cbz|pdf)$"),
+        _export,
+    ),
     Route("GET", re.compile(r"^/api/jobs$"), _list_jobs),
     Route("POST", re.compile(r"^/api/jobs$"), _create_job, writes=True, body_required=True),
     Route("GET", re.compile(rf"^/api/jobs/{_SLUG}$"), _get_job),
@@ -1149,16 +1575,22 @@ ROUTES: tuple[Route, ...] = (
         "DELETE",
         re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/incoming$"),
         _delete_incoming,
-        access="owner",
         writes=True,
     ),
+    Route(
+        "DELETE",
+        re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}$"),
+        _delete_chapter,
+        writes=True,
+    ),
+    Route("DELETE", re.compile(rf"^/api/series/{_SLUG}$"), _delete_series, access="owner", writes=True),
 )
 """Toda rota diz quem pode chama-la e se ela escreve.
 
-As `owner` sao as que destroem ou mudam o que vale para o acervo inteiro: apagar
-a area de espera, reescrever `series.json`, trocar a capa e editar o glossario.
-Um testador nao precisa de nenhuma delas para ver a ferramenta funcionando, e dar
-qualquer uma seria dar a ele a chave do acervo do dono."""
+As `owner` sao as que mudam o acervo inteiro: apagar uma serie, reescrever
+`series.json`, trocar a capa e editar o glossario. Apagar capitulo e area de
+espera e da sessao: a area vem do cookie, entao o testador so alcanca a propria,
+e sem essas duas ele nao tinha como sair da cota nem de um upload quebrado."""
 
 
 def request_path(target: str) -> str:
@@ -1228,6 +1660,29 @@ def _internal_redirect(cfg: Config, path: Path) -> str | None:
     return f"{prefix.rstrip('/')}/{relative.as_posix()}"
 
 
+class UserLocks:
+    """Uma trava por usuario, para conferir a cota e gravar sem outra thread no meio.
+
+    Por usuario e nao global: o upload de um testador nao espera o do outro, que
+    nao disputa a mesma cota. Vive dentro de um handler, e nao no modulo: estado
+    vivo em variavel de modulo vaza entre dois servidores na mesma sessao de teste.
+
+    O dicionario ganha um item por usuario que subiu algo neste processo. Sao
+    dezenas de bytes por testador, e o processo reinicia a cada deploy.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._locks: dict[str, threading.Lock] = {}
+
+    @contextmanager
+    def hold(self, user_id: str) -> Iterator[None]:
+        with self._guard:
+            lock = self._locks.setdefault(user_id, threading.Lock())
+        with lock:
+            yield
+
+
 def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
     """Handler que serve o leitor e, para a propria maquina, tambem o painel.
 
@@ -1237,6 +1692,8 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
     Nao ha registro de jobs aqui: a fila mora no banco e quem a roda e o
     `mangatl worker`, noutro processo. Este handler so enfileira e le.
     """
+
+    user_locks = UserLocks()
 
     class PanelHandler(ReaderHandler):
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -1287,6 +1744,7 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
 
             route = match.route
             if route.writes and not csrf_is_valid(self._csrf_headers()):
+                self._discard_small_body()
                 self._send_json(
                     HTTPStatus.FORBIDDEN,
                     {"error": f"pedido sem origem conferida; mande {REQUESTED_WITH}"},
@@ -1313,17 +1771,40 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
             token = token_from_cookies(self.headers.get("Cookie"))
             session = resolve(connection, token)
             issued: str | None = None
+            requester_ip = client_ip(
+                self.client_address[0] if self.client_address else "",
+                self.headers.get(REAL_IP_HEADER),
+                trusted_proxies(),
+            )
 
-            if session is None and route.writes and route.access != "public":
+            if (
+                session is None
+                and route.writes
+                and route.access != "public"
+                and showcase_is_public()
+            ):
                 # A sessao anonima nasce aqui, na primeira escrita, e nao no
                 # primeiro `GET`: a home e publica e robo de busca a visita.
+                # So com a vitrine ligada: sem ela a instalacao e de uma pessoa, e
+                # esconder o testador na tela enquanto a API o cria seria a flag
+                # decidir so a aparencia.
+                if not tester_signup_allowed(connection, requester_ip):
+                    self._discard_small_body()
+                    self._send_json(
+                        HTTPStatus.TOO_MANY_REQUESTS,
+                        {"error": "sessoes de teste demais deste endereco; tente daqui a uma hora"},
+                    )
+                    return True
                 session, token = _open_tester_session(connection)
+                record_tester_signup(connection, requester_ip)
                 issued = token
 
             if session is None and route.access != "public":
+                self._discard_small_body()
                 self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "entre para continuar"})
                 return True
             if route.access == "owner" and (session is None or not session.is_owner):
+                self._discard_small_body()
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "so o dono faz isso"})
                 return True
 
@@ -1342,7 +1823,7 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
                 connection=connection,
                 session=session,
                 token=token,
-                client_ip=self.client_address[0] if self.client_address else "",
+                client_ip=requester_ip,
             )
 
             # A sessao recem-aberta viaja no cookie ate nas respostas de erro. Sem
@@ -1421,7 +1902,19 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
             transmite, e o worker volta a atender na hora. Sem ele, transmite em
             pedacos daqui - funciona, e e divida anotada.
             """
-            internal = _internal_redirect(cfg, raw.path)
+            if raw.download_name:
+                # `filename*` porque nome de obra tem acento, e `filename` e ASCII.
+                headers["Content-Disposition"] = (
+                    f"attachment; filename*=UTF-8''{quote(raw.download_name)}"
+                )
+            try:
+                self._transmit(raw, headers)
+            finally:
+                if raw.temporary:
+                    raw.path.unlink(missing_ok=True)
+
+        def _transmit(self, raw: Raw, headers: dict[str, str]) -> None:
+            internal = None if raw.temporary else _internal_redirect(cfg, raw.path)
             if internal is not None:
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", raw.content_type)
@@ -1455,11 +1948,29 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
             ocupa o mesmo disco que um que passa, e so o caminho de sucesso limpar
             transformaria cada erro em lixo permanente.
             """
+            locked = route.user_locked and context.user is not None
             try:
-                return route.handler(context, groups, body)
+                with user_locks.hold(context.user.id) if locked else nullcontext():
+                    return route.handler(context, groups, body)
             finally:
                 if isinstance(body, Path):
                     body.unlink(missing_ok=True)
+
+        def _discard_small_body(self) -> None:
+            """Le e joga fora um corpo pequeno antes de recusar o pedido.
+
+            Responder e fechar com bytes ainda nao lidos no socket faz o sistema
+            mandar RST em vez de FIN - no Windows o cliente perde a resposta e ve
+            "conexao anulada" no lugar do 401 ou 403. Corpo grande nao e drenado:
+            ler megabytes de quem vai ser recusado e o que as recusas existem para
+            evitar, e ai a conexao fecha de proposito.
+            """
+            raw = self.headers.get("Content-Length", "")
+            length = int(raw) if raw.isdigit() else 0
+            if 0 < length <= MAX_JSON_BYTES:
+                self.rfile.read(length)
+            elif length:
+                self.close_connection = True
 
         def _read_body(self, route: Route, ceiling: int | None) -> Body | None:
             """O corpo cru, ou None quando ja respondeu recusando.

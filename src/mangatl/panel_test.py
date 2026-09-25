@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import threading
+import time
 from unittest import mock
 import zipfile
 from http.client import HTTPConnection
@@ -354,6 +355,15 @@ def test_reports_what_the_machine_can_do(panel_server: Client):
     assert payload["ok"] is True
     assert "free" in payload["engines"]
     assert isinstance(payload["has_api_key"], bool)
+
+
+def test_tells_an_anonymous_caller_only_that_it_is_up(panel_server: Client):
+    panel_server.forget()
+
+    status, body = panel_server.get("/api/health")
+
+    assert status == 200
+    assert json.loads(body) == {"ok": True}
 
 
 def test_never_answers_with_the_api_key(panel_server: Client):
@@ -731,9 +741,9 @@ def test_never_holds_the_whole_archive_in_memory(panel_server: Client, tmp_path:
     received: list[object] = []
     original = panel.extract_archive
 
-    def spy(data, target, limit=panel.MAX_PAGES_PER_CHAPTER):
+    def spy(data, target, limit=panel.MAX_PAGES_PER_CHAPTER, byte_ceiling=None):
         received.append(data)
-        return original(data, target, limit)
+        return original(data, target, limit, byte_ceiling)
 
     slug = series_with(panel_server)
     stage(panel_server, slug, "001")
@@ -1001,3 +1011,257 @@ def test_reports_no_job_for_an_id_that_does_not_exist(panel_with_jobs):
     status, body = client.send("GET", "/api/jobs/naoexiste")
 
     assert status == 404
+
+
+@pytest.mark.parametrize(
+    ("name", "peer", "real_ip", "trusted", "expected"),
+    [
+        ("sem cabecalho fica o socket", "10.0.0.2", None, "10.0.0.2", "10.0.0.2"),
+        ("proxy confiavel repassa o cliente", "10.0.0.2", "203.0.113.7", "10.0.0.2", "203.0.113.7"),
+        ("rede confiavel em CIDR", "172.28.0.10", "203.0.113.7", "172.28.0.0/24", "203.0.113.7"),
+        ("peer fora da lista e ignorado", "198.51.100.1", "203.0.113.7", "10.0.0.2", "198.51.100.1"),
+        ("sem lista nada e confiavel", "10.0.0.2", "203.0.113.7", "", "10.0.0.2"),
+        ("cabecalho que nao e IP e ignorado", "10.0.0.2", "nao-e-ip", "10.0.0.2", "10.0.0.2"),
+        ("entrada torta na lista nao confia", "10.0.0.2", "203.0.113.7", "lixo", "10.0.0.2"),
+    ],
+)
+def test_trusts_the_real_ip_header_only_from_the_proxy(
+    monkeypatch, name: str, peer: str, real_ip: str | None, trusted: str, expected: str
+):
+    monkeypatch.setenv(panel.TRUSTED_PROXIES_ENV, trusted)
+
+    assert panel.client_ip(peer, real_ip, panel.trusted_proxies()) == expected, name
+
+
+# ---------- 8.1 corrigir fala a mao, 8.2 retraduzir uma pagina ----------
+
+
+def translated_chapter(tmp_path: Path, slug: str = "Obra", chapter: str = "001") -> None:
+    """Um capitulo de duas paginas ja traduzido com `free`, na area do dono."""
+    pages_dir = owner_area(tmp_path, "library") / slug / chapter
+    pages_dir.mkdir(parents=True)
+    for image in ("p1.jpg", "p2.jpg"):
+        (pages_dir / image).write_bytes(JPEG)
+    output = owner_area(tmp_path, "output") / slug / chapter
+    output.mkdir(parents=True)
+    def page(index: int, image: str) -> dict:
+        return {
+            "index": index, "image": image, "width": 10, "height": 10,
+            "blocks": [{"id": "b1", "source_text": "HI", "text": "oi"}],
+        }
+
+    (output / "chapter.free.json").write_text(
+        json.dumps({
+            "series": slug, "chapter": chapter, "engine": "free", "pipeline_version": 4,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "pages": [page(1, "p1.jpg"), page(2, "p2.jpg")],
+        }),
+        encoding="utf-8",
+    )
+
+
+BLOCKS = "/api/series/Obra/chapters/001/translations/free/blocks"
+
+
+def test_saves_a_hand_corrected_line_and_marks_it(panel_server: Client, tmp_path: Path):
+    translated_chapter(tmp_path)
+
+    status, body = _put_json(panel_server, BLOCKS, {"page": 2, "block": "b1", "text": " ola "})
+
+    assert status == 200, body
+    stored = json.loads(
+        (owner_area(tmp_path, "output") / "Obra" / "001" / "chapter.free.json").read_text("utf-8")
+    )
+    assert stored["pages"][1]["blocks"][0] == {**stored["pages"][1]["blocks"][0], "text": "ola", "edited": True}
+    assert stored["pages"][0]["blocks"][0]["text"] == "oi"
+
+
+@pytest.mark.parametrize(
+    ("name", "path", "payload", "status"),
+    [
+        ("pagina que nao existe", BLOCKS, {"page": 9, "block": "b1", "text": "x"}, 404),
+        ("bloco que nao existe", BLOCKS, {"page": 1, "block": "zz", "text": "x"}, 404),
+        ("motor sem traducao", BLOCKS.replace("free", "claude"), {"page": 1, "block": "b1", "text": "x"}, 404),
+        ("capitulo de outra pasta", BLOCKS.replace("001", "002"), {"page": 1, "block": "b1", "text": "x"}, 404),
+        ("fala vazia", BLOCKS, {"page": 1, "block": "b1", "text": "  "}, 422),
+        ("pagina que nao e numero", BLOCKS, {"page": "1", "block": "b1", "text": "x"}, 422),
+    ],
+)
+def test_refuses_a_correction_that_points_nowhere(
+    panel_server: Client, tmp_path: Path, name: str, path: str, payload: dict, status: int
+):
+    translated_chapter(tmp_path)
+
+    assert _put_json(panel_server, path, payload)[0] == status, name
+
+
+def _retranslate(client: Client, pages: object) -> tuple[int, bytes]:
+    body = {"series": "Obra", "chapter": "001", "engine": "free", "pages": pages}
+    return client.send("POST", "/api/jobs", json.dumps(body).encode("utf-8"))
+
+
+def test_queues_a_retranslation_of_just_one_page(panel_server: Client, tmp_path: Path):
+    translated_chapter(tmp_path)
+
+    status, body = _retranslate(panel_server, ["p2.jpg"])
+
+    assert status == 202, body
+    with connect(Config(root=tmp_path)) as connection:
+        job = get_any(connection, json.loads(body)["job_id"])
+    assert job.options["pages"] == ["p2.jpg"]
+
+
+@pytest.mark.parametrize(
+    ("name", "pages"),
+    [
+        ("pagina que nao existe", ["p9.jpg"]),
+        ("caminho no lugar do nome", ["../p1.jpg"]),
+        ("lista vazia", []),
+        ("nao e lista", "p1.jpg"),
+    ],
+)
+def test_refuses_a_retranslation_of_pages_that_are_not_there(
+    panel_server: Client, tmp_path: Path, name: str, pages: object
+):
+    translated_chapter(tmp_path)
+
+    assert _retranslate(panel_server, pages)[0] == 422, name
+
+
+def test_refuses_to_retranslate_a_page_of_a_chapter_never_translated(
+    panel_server: Client, tmp_path: Path
+):
+    translated_chapter(tmp_path)
+    (owner_area(tmp_path, "output") / "Obra" / "001" / "chapter.free.json").unlink()
+
+    status, body = _retranslate(panel_server, ["p1.jpg"])
+
+    assert status == 422
+    assert b"inteiro" in body
+
+
+@pytest.mark.parametrize(
+    ("name", "engine", "usd"),
+    [
+        # O `Config` do teste nao tem `[pricing]`: sem preco, a tela diz que nao
+        # sabe em vez de inventar. A conta com preco esta em `claude_test.py`.
+        ("claude sem preco no config responde que nao sabe", "claude", None),
+        ("free nunca custa", "free", 0.0),
+    ],
+)
+def test_estimates_a_job_before_it_is_queued(
+    panel_server: Client, tmp_path: Path, name: str, engine: str, usd: float | None
+):
+    translated_chapter(tmp_path)
+
+    status, body = panel_server.get(f"/api/series/Obra/chapters/001/estimate/{engine}")
+    payload = json.loads(body)
+
+    assert status == 200
+    assert payload["pages"] == 2
+    assert payload["usd"] == usd, name
+
+
+def test_answers_404_for_estimating_a_chapter_that_is_not_there(panel_server: Client):
+    series_with(panel_server)
+
+    assert panel_server.get("/api/series/Obra/chapters/404/estimate/claude")[0] == 404
+
+
+# ---------- 8.6 trocar a senha e sair de todas as sessoes ----------
+
+NEW_PASSWORD = "outra-senha-bem-comprida"
+
+
+def _change(client: Client, current: str, new: str) -> tuple[int, bytes]:
+    body = json.dumps({"current": current, "new": new}).encode("utf-8")
+    return client.send("POST", "/api/account/password", body)
+
+
+def test_changes_the_owner_password_without_a_restart(panel_server: Client):
+    status, body = _change(panel_server, OWNER_PASSWORD, NEW_PASSWORD)
+
+    assert status == 200, body
+    assert Client(panel_server.port).login(password=NEW_PASSWORD) == 200
+    assert Client(panel_server.port).login(password=OWNER_PASSWORD) == 401
+
+
+def test_closes_the_other_sessions_and_keeps_this_one(panel_server: Client):
+    phone = Client(panel_server.port)
+    assert phone.login() == 200
+
+    assert _change(panel_server, OWNER_PASSWORD, NEW_PASSWORD)[0] == 200
+
+    assert panel_server.get("/api/series")[0] == 200
+    assert phone.get("/api/series")[0] == 401
+
+
+@pytest.mark.parametrize(
+    ("name", "current", "new", "status"),
+    [
+        ("senha atual errada", "chute", NEW_PASSWORD, 403),
+        ("senha nova curta", OWNER_PASSWORD, "curta", 422),
+    ],
+)
+def test_refuses_a_password_change_that_should_not_happen(
+    panel_server: Client, name: str, current: str, new: str, status: int
+):
+    assert _change(panel_server, current, new)[0] == status, name
+    assert Client(panel_server.port).login() == 200, "a senha antiga tinha que continuar valendo"
+
+
+def test_signs_out_every_session_including_this_one(panel_server: Client):
+    phone = Client(panel_server.port)
+    assert phone.login() == 200
+
+    status, _, headers = panel_server.raw("POST", "/api/account/sessions/revoke")
+
+    assert status == 200
+    assert "Max-Age=0" in headers.get("set-cookie", "")
+    assert phone.get("/api/series")[0] == 401
+    panel_server.cookie = phone.cookie
+    assert panel_server.get("/api/series")[0] == 401
+
+
+# ---------- 8.7 exportar CBZ e PDF ----------
+
+
+def _real_pages(tmp_path: Path) -> None:
+    """Troca os JPEGs de mentira do capitulo por imagens que o Pillow abre."""
+    from PIL import Image
+
+    for image in ("p1.jpg", "p2.jpg"):
+        Image.new("RGB", (10, 10), (40, 40, 40)).save(owner_area(tmp_path, "library") / "Obra" / "001" / image)
+
+
+@pytest.mark.parametrize(("kind", "magic"), [("cbz", b"PK"), ("pdf", b"%PDF")])
+def test_downloads_the_chapter_as_a_file(panel_server: Client, tmp_path: Path, kind: str, magic: bytes):
+    translated_chapter(tmp_path)
+    _real_pages(tmp_path)
+
+    status, body, headers = panel_server.raw("GET", f"/api/series/Obra/chapters/001/export/free.{kind}")
+
+    assert status == 200
+    assert body.startswith(magic)
+    assert "attachment" in headers["content-disposition"]
+    # O servidor apaga depois de escrever o ultimo byte, e o cliente pode terminar
+    # de ler antes disso: espera um pouco em vez de correr com a thread dele.
+    spool = tmp_path / "data" / "uploads"
+    deadline = time.monotonic() + 5
+    while list(spool.glob("*.export")) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not list(spool.glob("*.export")), "o arquivo gerado ficou no disco depois de enviado"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/series/Obra/chapters/001/export/claude.cbz",
+        "/api/series/Obra/chapters/999/export/free.cbz",
+        "/api/series/Outra/chapters/001/export/free.pdf",
+    ],
+)
+def test_answers_404_for_exporting_what_is_not_there(panel_server: Client, tmp_path: Path, path: str):
+    translated_chapter(tmp_path)
+
+    assert panel_server.get(path)[0] == 404

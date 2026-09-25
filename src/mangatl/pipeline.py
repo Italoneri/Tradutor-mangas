@@ -30,6 +30,7 @@ from .models import (
     Extraction,
     Progress,
     ProgressFn,
+    TranslatedPage,
     report,
 )
 from .ocr import BlockReading, is_usable, read_block
@@ -48,6 +49,7 @@ from .store import (
     image_sha256,
     is_page_current,
     list_page_images,
+    load_chapter,
     load_extraction,
     load_glossary,
     save_chapter,
@@ -308,8 +310,13 @@ def extract_chapter(
     debug_boxes: bool = False,
     detector_name: str | None = None,
     progress: ProgressFn | None = None,
+    force_pages: frozenset[str] = frozenset(),
 ) -> ExtractionReport:
-    """Detecta e OCRa as paginas do capitulo, pulando as que nao mudaram."""
+    """Detecta e OCRa as paginas do capitulo, pulando as que nao mudaram.
+
+    `force_pages` refaz so as paginas com esses nomes: retraduzir uma pagina e
+    tambem reler ela, porque o erro que motivou o pedido quase sempre veio do OCR.
+    """
     chapter_dir = chapter_input_dir(cfg, series, chapter)
     images = list_page_images(chapter_dir)
     if not images:
@@ -338,7 +345,8 @@ def extract_chapter(
     reused = 0
     for index, path in enumerate(images, start=1):
         cached = previous.page_by_image(path.name) if previous else None
-        if cached is not None and is_page_current(previous, path, PIPELINE_VERSION) and not debug_boxes:
+        current = cached is not None and is_page_current(previous, path, PIPELINE_VERSION)
+        if current and not debug_boxes and path.name not in force_pages:
             pages.append(cached.model_copy(update={"index": index}))
             reused += 1
             continue
@@ -388,16 +396,71 @@ def extract_chapter(
     )
 
 
+def keep_manual_edits(
+    previous: Chapter | None, pages: Sequence[TranslatedPage]
+) -> list[TranslatedPage]:
+    """As paginas novas, com as falas corrigidas a mao por cima da traducao nova.
+
+    Casa por imagem e id de bloco. Um bloco editado que a nova extracao nao trouxe
+    volta como estava: a correcao e trabalho de alguem, e sumir com ela porque o
+    OCR mudou de ideia seria perde-la sem ninguem ter pedido.
+    """
+    if previous is None:
+        return list(pages)
+    edited = {
+        page.image: {block.id: block for block in page.blocks if block.edited}
+        for page in previous.pages
+    }
+
+    merged: list[TranslatedPage] = []
+    for page in pages:
+        kept = edited.get(page.image, {})
+        if not kept:
+            merged.append(page)
+            continue
+        blocks = [kept.get(block.id, block) for block in page.blocks]
+        present = {block.id for block in page.blocks}
+        blocks.extend(block for block_id, block in kept.items() if block_id not in present)
+        merged.append(page.model_copy(update={"blocks": tuple(blocks)}))
+    return merged
+
+
+def _splice(
+    extraction: Extraction, previous: Chapter, fresh: Sequence[TranslatedPage]
+) -> list[TranslatedPage]:
+    """O capitulo anterior com as paginas retraduzidas no lugar, na ordem da extracao."""
+    by_image = {page.image: page for page in previous.pages}
+    by_image.update({page.image: page for page in fresh})
+    return [
+        by_image[page.image].model_copy(update={"index": page.index})
+        for page in extraction.pages
+        if page.image in by_image
+    ]
+
+
 def translate_chapter(
     cfg: Config,
     extraction: Extraction,
     engine: TranslationEngine,
     progress: ProgressFn | None = None,
+    only_pages: frozenset[str] = frozenset(),
 ) -> Chapter:
+    """Traduz o capitulo, ou so `only_pages` dele, preservando as correcoes a mao.
+
+    So as paginas pedidas quando ja existe traducao deste motor para costurar o
+    resto; sem ela, uma pagina sozinha viraria um capitulo de uma pagina.
+    """
     chapter_dir = chapter_input_dir(cfg, extraction.series, extraction.chapter)
     glossary = load_glossary(cfg, extraction.series)
+    previous = load_chapter(cfg, extraction.series, extraction.chapter, engine.name)
 
-    pages = engine.translate_chapter(extraction.pages, glossary, chapter_dir, progress)
+    partial = bool(only_pages) and previous is not None
+    targets = [page for page in extraction.pages if page.image in only_pages] if partial else extraction.pages
+
+    fresh = keep_manual_edits(
+        previous, engine.translate_chapter(targets, glossary, chapter_dir, progress)
+    )
+    pages = _splice(extraction, previous, fresh) if partial and previous is not None else fresh
 
     chapter = Chapter(
         series=extraction.series,

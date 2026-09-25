@@ -22,7 +22,7 @@ O jeito curto, em qualquer sistema:
 
 ```bash
 cp .env.example .env          # preencha OWNER_EMAIL, OWNER_PASSWORD e, se tiver, a chave
-docker compose --profile local up -d app worker
+docker compose up -d app worker
 ```
 
 O leitor fica em `http://localhost:8000/reader/`. O `worker` é um processo separado
@@ -335,13 +335,13 @@ colorido e balão sem borda são invisíveis para ele por construção.
 | Perdeu balão de contorno claro | suba `INK_THRESHOLD` em `detect.py` |
 | Fala boa descartada (aparece vermelha) | baixe `min_confidence` em `[ocr]` |
 | Muito ruído de arte virando fala | suba `min_confidence` ou `min_letters` |
+| Balão partido em vários | suba `merge_iou` |
+| Texto estilizado ou SFX perdido | baixe `min_interior_brightness` |
+| Ordem errada entre balões lado a lado | ajuste `band_overlap` em `[reading_order]` |
 
 `min_letters` conta **letras seguidas**, não letras somadas: `"I I"` tem duas letras e
 nenhuma palavra. Toda fala real tem ao menos uma palavra, então subir esse valor
 rejeita ruído sem poder descartar diálogo.
-| Balão partido em vários | suba `merge_iou` |
-| Texto estilizado ou SFX perdido | baixe `min_interior_brightness` |
-| Ordem errada entre balões lado a lado | ajuste `band_overlap` em `[reading_order]` |
 
 Balões sem borda e SFX estilizado escapam da heurística. Com o motor `claude` isso é
 recuperável: ele vê a página e devolve a fala com `bbox` nulo — sem coordenada não há
@@ -439,10 +439,21 @@ node --test reader/overlay.test.js
 
 ## Ler no celular
 
-O contêiner escuta em `0.0.0.0`, então o celular alcança o PC direto:
+O `docker-compose.yml` publica o app só no loopback (`127.0.0.1:8000`), porque na
+instância pública quem fala com a rede é o Caddy. Para o celular da mesma rede
+alcançar o PC, abra a porta num `docker-compose.override.yml`, que o compose lê
+sozinho e fica fora do repositório:
+
+```yaml
+services:
+  app:
+    ports: !override ["8000:8000"]   # troca a lista, em vez de somar a ela
+    environment:
+      COOKIE_SECURE: "0"   # http na rede de casa; cookie Secure nunca voltaria
+```
 
 ```bash
-docker compose --profile local up -d app worker
+docker compose up -d app worker
 ```
 
 Abra `http://<ip-do-pc>:8000/reader/` no celular (`ipconfig` mostra o IP) e use
@@ -495,8 +506,16 @@ vigia mora no `Caddyfile`, fora do alcance do app:
 
 ```bash
 SITE_ADDRESS=":80" CADDY_HTTP_PORT=18080 ACME_EMAIL=a@b.com     docker compose --profile public up -d
-docker run --rm --network traduo_default -v "$PWD/src:/app/src" -w /app     -e MANGATL_PROXY_URL=http://caddy:80 -e MANGATL_APP_URL=http://app:8000     -e MANGATL_PROXY_EMAIL=... -e MANGATL_PROXY_PASSWORD=...     mangatl:dev python -m pytest src/mangatl/caddy_test.py
+docker run --rm --network traduo_edge -v "$PWD/src:/app/src" -w /app     -e MANGATL_PROXY_URL=http://caddy:80 -e MANGATL_APP_URL=http://app:8000     -e MANGATL_PROXY_EMAIL=... -e MANGATL_PROXY_PASSWORD=...     mangatl:dev python -m pytest src/mangatl/caddy_test.py
+docker compose exec app mangatl reset-login
 ```
+
+O último caso da bateria erra a senha seis vezes de propósito, trocando o
+`X-Real-IP` a cada uma, para provar que o Caddy sobrescreve o cabeçalho: o limite
+fecha porque o IP que o app vê é o do socket, e não o que o cliente escreveu. Isso
+tranca o IP de quem roda a bateria por quinze minutos — daí o `reset-login` no fim.
+O mesmo comando destranca o dono se alguém fechar a conta dele errando a senha de
+propósito.
 
 São os casos 8, 9 e 10 do plano: o prefixo interno não responde de fora, os
 caminhos crus continuam 404, e o capítulo inteiro chega com o Caddy transmitindo
@@ -541,7 +560,8 @@ vitrine fora do ar e mostre a ferramenta por vídeo; a engenharia aparece igual.
 
 ## Estado atual
 
-478 testes passando. O pipeline está completo ponta a ponta: detecção → ordem de
+586 testes passando em Linux, e o CI (`.github/workflows/ci.yml`) roda a mesma
+bateria em todo push. O pipeline está completo ponta a ponta: detecção → ordem de
 leitura → OCR → `extract.json` → motor → `chapter.<motor>.json` → leitor.
 
 A detecção é o `rtdetr` por padrão. Medido no capítulo `manhwa/001` contra a
@@ -564,6 +584,32 @@ cliente dublê, mas ainda não foi exercitado contra a API real — falta a chav
 - cota de testador e teto global de disco;
 - vitrine pública, estática e imutável, servida sem cookie.
 
+### O que a revisão de 24/09 fechou
+
+- vitrine desligada recusa escrita anônima na API, e não só na tela;
+- o IP que o limite de login vê é o do cliente (`X-Real-IP` escrito pelo Caddy,
+  aceito só de `TRUSTED_PROXIES`); `mangatl reset-login` destranca o dono;
+- a cota do testador vale para o zip depois de aberto, para cada entrada pelos
+  bytes mágicos e para uploads em paralelo;
+- 20% do teto de disco é do dono, e cada endereço abre no máximo 5 sessões de
+  teste por hora;
+- job que derruba o worker três vezes sai da fila como `failed`;
+- a limpeza apaga `.upload` órfão e área de espera parada há uma semana;
+- apagar capítulo (sessão) e obra inteira (dono).
+
+### Uso diário
+
+- **corrigir uma fala no leitor:** clique no texto do balão, edite, Enter grava.
+  A correção fica marcada e sobrevive a retraduzir a página ou o capítulo;
+- **retraduzir uma página:** botão no canto da fatia; relê e retraduz só ela;
+- **custo antes de gastar:** com `claude`, o primeiro clique em Traduzir mostra a
+  estimativa e o segundo confirma;
+- **baixar CBZ ou PDF** com a tradução escrita na página, no fim do capítulo;
+- **`mangatl backup`:** banco pela API de backup do sqlite (copiar o arquivo com o
+  WAL aberto não é backup) e `tar.gz` de `data/users/`, em `data/backups/<hora>/`;
+- **trocar a senha** no painel ou com `mangatl set-password`, e "sair de todos os
+  aparelhos". Depois da troca, o `OWNER_PASSWORD` do `.env` deixa de valer.
+
 A bateria de isolamento (`src/mangatl/isolation_test.py`) roda as sete checagens
 que decidem se o servidor guarda o acervo de cada um: acervo alheio dá 404, caminho
 direto dá 404, fuga de caminho dá 404 nas cinco formas, sem cookie dá 401, sessão
@@ -574,5 +620,7 @@ vencida dá 401, testador pedindo `claude` dá 429 e rota de dono dá 403.
 - **rodar a bateria contra o domínio público, de outra rede.** Ela passa contra o
   servidor local; o plano pede a mesma bateria contra o endereço real, e essa
   execução só é possível depois do deploy;
-- escolher o conteúdo da vitrine e preencher o contato nos termos;
+- escolher o conteúdo da vitrine, e definir `CONTACT_EMAIL` na instância pública;
+- rodar o motor `claude` contra a API real e trocar a calibração da estimativa de
+  custo pelos tokens medidos;
 - medir a entrega por `X-Accel-Redirect` com quatro leitores simultâneos.
