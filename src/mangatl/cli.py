@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 from .accounts import (
     MigrationRefused,
+    change_owner_password,
     ensure_owner,
     migrate_to_accounts,
     owner_config,
@@ -33,7 +34,7 @@ from .engines.base import TranslationError, UnknownEngineError, available_engine
 from .models import Progress, ProgressFn
 from .panel import serve_panel
 from .pipeline import ChapterNotFoundError, extract_chapter, translate_chapter
-from .sessions import clear_every_login_attempt
+from .sessions import clear_every_login_attempt, revoke_all
 from .slicing import is_tall, slice_stream
 from .store import IMAGE_SUFFIXES, build_library, discover_chapters, save_library
 from .worker import run_forever
@@ -505,6 +506,30 @@ def backup_command(
         size_mb = result.library.stat().st_size / (1024 * 1024)
         typer.secho(f"acervo: {result.library} ({size_mb:.1f}MB)", fg=typer.colors.GREEN)
     typer.echo("Guarde a pasta fora desta maquina: backup no mesmo disco nao sobrevive ao disco.")
+
+
+@app.command(name="set-password")
+def set_password() -> None:
+    """Troca a senha do dono e derruba todas as sessoes dele.
+
+    Depois disto o `OWNER_PASSWORD` do `.env` deixa de valer: reinicio nenhum
+    desfaz a troca. Apague a variavel do `.env` para ninguem confundir as duas.
+    """
+    cfg = _load()
+    migrate(cfg)
+    password = typer.prompt("senha nova", hide_input=True, confirmation_prompt=True)
+    with connect(cfg) as connection, transaction(connection):
+        owner = sole_owner(connection)
+        if owner is None:
+            typer.secho("nao ha dono; defina OWNER_EMAIL e OWNER_PASSWORD e suba o servidor", fg=typer.colors.RED)
+            raise typer.Exit(code=1)
+        try:
+            change_owner_password(connection, owner.id, password)
+        except ValueError as error:
+            typer.secho(str(error), fg=typer.colors.RED)
+            raise typer.Exit(code=1) from error
+        closed = revoke_all(connection, owner.id)
+    typer.secho(f"senha trocada; {closed} sessao(oes) encerrada(s)", fg=typer.colors.GREEN)
 
 
 @app.command(name="reset-login")

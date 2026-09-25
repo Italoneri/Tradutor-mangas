@@ -15,6 +15,7 @@ acontecer, e por isso ele tem duas trancas em vez de uma.
 
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 import sqlite3
@@ -25,6 +26,8 @@ from typing import Literal
 
 from .config import Config
 from .db import now
+
+log = logging.getLogger("mangatl.accounts")
 
 UserKind = Literal["owner", "tester"]
 
@@ -203,6 +206,11 @@ def ensure_owner(connection: sqlite3.Connection, email: str | None, password: st
     regrava o mesmo hash com sal novo, que e inofensivo; rodar com senha nova e
     como se troca a senha do dono.
 
+    Exceto quando a senha foi trocada pelo painel ou por `mangatl set-password`:
+    ai o `.env` perdeu a autoridade sobre ela, e reaplica-lo a cada reinicio
+    desfaria a troca em silencio - justamente a troca que se faz quando a senha
+    antiga vazou.
+
     Sem e-mail e sem senha nao cria nada: a instancia sobe servindo a vitrine, e o
     painel fica sem dono ate alguem definir as duas variaveis.
     """
@@ -215,15 +223,62 @@ def ensure_owner(connection: sqlite3.Connection, email: str | None, password: st
 
     owner = sole_owner(connection)
     if owner is None:
-        return create_user(
+        created = create_user(
             connection, kind="owner", email=email, password_hash=hash_password(password)
         )
+        _set_password_origin(connection, created.id, "env")
+        return created
+
+    if password_origin_of(connection, owner.id) == "panel":
+        log.warning(
+            "operation=ensure_owner OWNER_PASSWORD ignorada: a senha foi trocada pelo painel"
+        )
+        connection.execute(
+            "UPDATE users SET email = ? WHERE id = ?", (email.strip().lower(), owner.id)
+        )
+        return get_user(connection, owner.id)
 
     connection.execute(
-        "UPDATE users SET email = ?, password_hash = ? WHERE id = ?",
+        "UPDATE users SET email = ?, password_hash = ?, password_origin = 'env' WHERE id = ?",
         (email.strip().lower(), hash_password(password), owner.id),
     )
     return get_user(connection, owner.id)
+
+
+PasswordOrigin = Literal["env", "panel"]
+
+
+def password_origin_of(connection: sqlite3.Connection, user_id: str) -> PasswordOrigin | None:
+    row = connection.execute(
+        "SELECT password_origin FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    return None if row is None else row["password_origin"]
+
+
+def _set_password_origin(
+    connection: sqlite3.Connection, user_id: str, origin: PasswordOrigin
+) -> None:
+    connection.execute("UPDATE users SET password_origin = ? WHERE id = ?", (origin, user_id))
+
+
+MIN_PASSWORD_CHARS = 12
+"""Senha que protege o acervo e a chave da API. Doze e o piso, nao a meta."""
+
+
+def change_owner_password(connection: sqlite3.Connection, user_id: str, password: str) -> None:
+    """Troca a senha do dono e tira do `.env` a autoridade sobre ela.
+
+    Nao revoga sessao nenhuma: quem chama decide quais sobrevivem - o painel
+    mantem a de quem acabou de trocar, a linha de comando derruba todas.
+    """
+    from .sessions import hash_password
+
+    if len(password) < MIN_PASSWORD_CHARS:
+        raise ValueError(f"a senha precisa de pelo menos {MIN_PASSWORD_CHARS} caracteres")
+    connection.execute(
+        "UPDATE users SET password_hash = ?, password_origin = 'panel' WHERE id = ?",
+        (hash_password(password), user_id),
+    )
 
 
 def expired_testers(connection: sqlite3.Connection, moment: str | None = None) -> list[User]:

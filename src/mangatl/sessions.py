@@ -220,6 +220,20 @@ def revoke(connection: sqlite3.Connection, token: str | None) -> None:
         connection.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash(token),))
 
 
+def revoke_all(connection: sqlite3.Connection, user_id: str, *, keep: str | None = None) -> int:
+    """Encerra todas as sessoes desta pessoa, menos a do token `keep`, se houver.
+
+    E o "sair de todos os aparelhos": o celular esquecido logado, ou a sessao que
+    alguem abriu com a senha antiga, deixam de valer na hora - e nao quando o
+    cookie vencer daqui a um mes.
+    """
+    kept = token_hash(keep) if keep else ""
+    cursor = connection.execute(
+        "DELETE FROM sessions WHERE user_id = ? AND token_hash != ?", (user_id, kept)
+    )
+    return cursor.rowcount
+
+
 def purge_expired_sessions(connection: sqlite3.Connection) -> int:
     cursor = connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (now(),))
     return cursor.rowcount

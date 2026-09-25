@@ -1165,3 +1165,58 @@ def test_answers_404_for_estimating_a_chapter_that_is_not_there(panel_server: Cl
     series_with(panel_server)
 
     assert panel_server.get("/api/series/Obra/chapters/404/estimate/claude")[0] == 404
+
+
+# ---------- 8.6 trocar a senha e sair de todas as sessoes ----------
+
+NEW_PASSWORD = "outra-senha-bem-comprida"
+
+
+def _change(client: Client, current: str, new: str) -> tuple[int, bytes]:
+    body = json.dumps({"current": current, "new": new}).encode("utf-8")
+    return client.send("POST", "/api/account/password", body)
+
+
+def test_changes_the_owner_password_without_a_restart(panel_server: Client):
+    status, body = _change(panel_server, OWNER_PASSWORD, NEW_PASSWORD)
+
+    assert status == 200, body
+    assert Client(panel_server.port).login(password=NEW_PASSWORD) == 200
+    assert Client(panel_server.port).login(password=OWNER_PASSWORD) == 401
+
+
+def test_closes_the_other_sessions_and_keeps_this_one(panel_server: Client):
+    phone = Client(panel_server.port)
+    assert phone.login() == 200
+
+    assert _change(panel_server, OWNER_PASSWORD, NEW_PASSWORD)[0] == 200
+
+    assert panel_server.get("/api/series")[0] == 200
+    assert phone.get("/api/series")[0] == 401
+
+
+@pytest.mark.parametrize(
+    ("name", "current", "new", "status"),
+    [
+        ("senha atual errada", "chute", NEW_PASSWORD, 403),
+        ("senha nova curta", OWNER_PASSWORD, "curta", 422),
+    ],
+)
+def test_refuses_a_password_change_that_should_not_happen(
+    panel_server: Client, name: str, current: str, new: str, status: int
+):
+    assert _change(panel_server, current, new)[0] == status, name
+    assert Client(panel_server.port).login() == 200, "a senha antiga tinha que continuar valendo"
+
+
+def test_signs_out_every_session_including_this_one(panel_server: Client):
+    phone = Client(panel_server.port)
+    assert phone.login() == 200
+
+    status, _, headers = panel_server.raw("POST", "/api/account/sessions/revoke")
+
+    assert status == 200
+    assert "Max-Age=0" in headers.get("set-cookie", "")
+    assert phone.get("/api/series")[0] == 401
+    panel_server.cookie = phone.cookie
+    assert panel_server.get("/api/series")[0] == 401

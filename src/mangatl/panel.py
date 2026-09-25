@@ -49,7 +49,14 @@ from pathlib import Path, PurePosixPath
 from typing import IO, Literal, NamedTuple
 from urllib.parse import unquote
 
-from .accounts import User, area_config, create_user, find_owner, password_hash_of
+from .accounts import (
+    User,
+    area_config,
+    change_owner_password,
+    create_user,
+    find_owner,
+    password_hash_of,
+)
 from .config import Config
 from .db import connect, in_hours
 from .engines.base import available_engines
@@ -93,6 +100,7 @@ from .sessions import (
     record_tester_signup,
     resolve,
     revoke,
+    revoke_all,
     tester_signup_allowed,
     token_from_cookies,
     verify_password,
@@ -620,6 +628,42 @@ def _logout(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, ob
     valendo para quem o tiver copiado - sair tem que significar sair.
     """
     revoke(ctx.connection, ctx.token)
+    return HTTPStatus.OK, _Cleared({"authenticated": False, "kind": None, "engines": []})
+
+
+def _change_password(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Troca a senha do dono sem reiniciar, e derruba as outras sessoes dele.
+
+    Pede a senha atual: um cookie roubado ja da acesso a tudo, mas nao pode dar
+    tambem o direito de trancar o dono de verdade para fora. Errar a atual conta
+    como tentativa de login, pelo mesmo motivo - esta e outra porta de varredura.
+    """
+    payload = json_body(body)
+    if not isinstance(payload, dict):
+        raise Invalid("esperava um objeto com current e new")
+    current, new = payload.get("current"), payload.get("new")
+    if not isinstance(current, str) or not isinstance(new, str):
+        raise Invalid("mande current e new como texto")
+
+    subjects = (f"ip:{ctx.client_ip}", f"email:{ctx.user.email or ''}")
+    if login_is_throttled(ctx.connection, subjects):
+        return HTTPStatus.TOO_MANY_REQUESTS, {"error": "tentativas demais; espere alguns minutos"}
+    if not verify_password(current, password_hash_of(ctx.connection, ctx.user.id)):
+        for subject in subjects:
+            record_login_attempt(ctx.connection, subject)
+        return HTTPStatus.FORBIDDEN, {"error": "a senha atual nao confere"}
+
+    try:
+        change_owner_password(ctx.connection, ctx.user.id, new)
+    except ValueError as error:
+        raise Invalid(str(error)) from error
+    revoked = revoke_all(ctx.connection, ctx.user.id, keep=ctx.token)
+    return HTTPStatus.OK, {"changed": True, "other_sessions_closed": revoked}
+
+
+def _sign_out_everywhere(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Encerra todas as sessoes desta pessoa, inclusive a deste navegador."""
+    revoke_all(ctx.connection, ctx.user.id)
     return HTTPStatus.OK, _Cleared({"authenticated": False, "kind": None, "engines": []})
 
 
@@ -1384,6 +1428,15 @@ ROUTES: tuple[Route, ...] = (
         body_required=True,
     ),
     Route("POST", re.compile(r"^/api/logout$"), _logout, access="public", writes=True),
+    Route(
+        "POST",
+        re.compile(r"^/api/account/password$"),
+        _change_password,
+        access="owner",
+        writes=True,
+        body_required=True,
+    ),
+    Route("POST", re.compile(r"^/api/account/sessions/revoke$"), _sign_out_everywhere, writes=True),
     # O conteudo do usuario. Nenhuma recebe id: ele vem da sessao.
     Route("GET", re.compile(r"^/u/library$"), _user_library),
     Route("GET", re.compile(rf"^/u/pages/{_SLUG}/{_SLUG}/{_SLUG}$"), _user_page),

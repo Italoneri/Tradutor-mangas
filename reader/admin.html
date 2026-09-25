@@ -186,6 +186,34 @@
     </div>
   </section>
 
+  <!-- So para o dono. A senha deixa de depender do .env e de reinicio, e "sair de
+       todos os aparelhos" e o que se faz quando um deles some. -->
+  <section class="card" id="account-card" hidden>
+    <div class="card-head">
+      <h2>Conta</h2>
+    </div>
+
+    <form class="row" id="password-form">
+      <label class="field">
+        <span>senha atual</span>
+        <input id="password-current" type="password" autocomplete="current-password" required>
+      </label>
+      <label class="field">
+        <span>senha nova (12 ou mais)</span>
+        <input id="password-new" type="password" autocomplete="new-password" minlength="12" required>
+      </label>
+      <button class="btn btn-primary" type="submit">Trocar senha</button>
+    </form>
+    <p class="hint">
+      Trocar a senha encerra as sessões dos outros aparelhos. Depois da troca, o
+      <code>OWNER_PASSWORD</code> do <code>.env</code> deixa de valer.
+    </p>
+
+    <div class="row">
+      <button class="btn btn-secondary" id="sign-out-everywhere">Sair de todos os aparelhos</button>
+    </div>
+  </section>
+
   </div><!-- #panel -->
 
 </main>

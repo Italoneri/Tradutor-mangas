@@ -146,6 +146,11 @@ MIGRATIONS: tuple[str, ...] = (
 
     CREATE INDEX tester_signups_ip_hash ON tester_signups (ip_hash, at);
     """,
+    # 5 - de onde veio a senha do dono, para o reinicio nao desfazer a troca
+    """
+    ALTER TABLE users ADD COLUMN password_origin TEXT
+        CHECK (password_origin IS NULL OR password_origin IN ('env', 'panel'));
+    """,
 )
 """Scripts aplicados em ordem, uma vez cada.
 

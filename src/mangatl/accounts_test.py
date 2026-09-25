@@ -6,6 +6,9 @@ import pytest
 
 from .accounts import (
     MigrationRefused,
+    change_owner_password,
+    ensure_owner,
+    password_hash_of,
     area_config,
     config_for_user,
     create_user,
@@ -250,3 +253,37 @@ def test_never_sends_a_tester_to_the_project_root(cfg):
         tester = create_user(connection, kind="tester")
 
     assert area_config(cfg, tester).library_dir == user_path(cfg, tester.id, "library")
+
+
+# ---------- 8.6 o .env nao desfaz a troca de senha ----------
+
+
+@pytest.mark.parametrize(
+    ("name", "changed_in_panel", "valid_after_restart"),
+    [
+        ("sem troca pelo painel, o .env manda", False, "do-env-nova-e-comprida"),
+        ("depois da troca pelo painel, o .env nao manda mais", True, "do-painel-bem-comprida"),
+    ],
+)
+def test_lets_a_restart_reapply_the_env_password_only_until_the_panel_changes_it(
+    cfg, name: str, changed_in_panel: bool, valid_after_restart: str
+):
+    from .sessions import verify_password
+
+    migrate(cfg)
+    with connect(cfg) as connection:
+        owner = ensure_owner(connection, "dono@example.com", "do-env-original-comprida")
+        if changed_in_panel:
+            change_owner_password(connection, owner.id, "do-painel-bem-comprida")
+
+        ensure_owner(connection, "dono@example.com", "do-env-nova-e-comprida")
+
+        assert verify_password(valid_after_restart, password_hash_of(connection, owner.id)), name
+
+
+def test_refuses_a_short_owner_password(cfg):
+    migrate(cfg)
+    with connect(cfg) as connection:
+        owner = ensure_owner(connection, "dono@example.com", "do-env-original-comprida")
+        with pytest.raises(ValueError):
+            change_owner_password(connection, owner.id, "curta")

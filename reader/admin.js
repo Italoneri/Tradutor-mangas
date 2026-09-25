@@ -42,6 +42,11 @@ const el = {
   testerPath: document.getElementById("tester-path"),
   signOut: document.getElementById("sign-out"),
   panel: document.getElementById("panel"),
+  accountCard: document.getElementById("account-card"),
+  passwordForm: document.getElementById("password-form"),
+  passwordCurrent: document.getElementById("password-current"),
+  passwordNew: document.getElementById("password-new"),
+  signOutEverywhere: document.getElementById("sign-out-everywhere"),
 
   seriesList: document.getElementById("series-list"),
   toggleNewSeries: document.getElementById("toggle-new-series"),
@@ -692,6 +697,8 @@ function wire() {
   el.jobEngine.onchange = disarmCost;
 
   el.loginForm.onsubmit = signIn;
+  el.passwordForm.onsubmit = changePassword;
+  el.signOutEverywhere.onclick = () => guard(signOutEverywhere);
   el.signOut.onclick = () => guard(signOut);
 
   /* Entrar como testador nao chama rota nenhuma: a sessao nasce no servidor na
@@ -745,6 +752,26 @@ async function signIn(event) {
   await enterPanel();
 }
 
+async function changePassword(event) {
+  event.preventDefault();
+  await guard(async () => {
+    const result = await api("/account/password", {
+      method: "POST",
+      body: { current: el.passwordCurrent.value, new: el.passwordNew.value },
+    });
+    el.passwordCurrent.value = el.passwordNew.value = "";
+    const closed = result.other_sessions_closed;
+    flash(`Senha trocada. ${closed} ${closed === 1 ? "sessão encerrada" : "sessões encerradas"} em outros aparelhos.`, "ok");
+  });
+}
+
+async function signOutEverywhere() {
+  if (!armed(el.signOutEverywhere, "Sair de todos, inclusive daqui?")) return;
+  await api("/account/sessions/revoke", { method: "POST" });
+  navigator.serviceWorker?.controller?.postMessage({ type: "purge" });
+  location.reload();
+}
+
 async function signOut() {
   await api("/logout", { method: "POST" }).catch(() => null);
   /* O cache e por origem, nao por conta: sem esta limpeza a proxima pessoa a
@@ -760,6 +787,7 @@ async function enterPanel() {
   el.health.textContent = state.health.detector ? `detector ${state.health.detector}` : "";
   el.login.hidden = true;
   el.panel.hidden = false;
+  el.accountCard.hidden = state.session.kind !== "owner";
   el.signOut.hidden = false;
   renderEngines();
   await guard(() => loadSeries(false));
