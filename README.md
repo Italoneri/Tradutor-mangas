@@ -560,7 +560,8 @@ vitrine fora do ar e mostre a ferramenta por vídeo; a engenharia aparece igual.
 
 ## Estado atual
 
-478 testes passando. O pipeline está completo ponta a ponta: detecção → ordem de
+586 testes passando em Linux, e o CI (`.github/workflows/ci.yml`) roda a mesma
+bateria em todo push. O pipeline está completo ponta a ponta: detecção → ordem de
 leitura → OCR → `extract.json` → motor → `chapter.<motor>.json` → leitor.
 
 A detecção é o `rtdetr` por padrão. Medido no capítulo `manhwa/001` contra a
@@ -583,6 +584,32 @@ cliente dublê, mas ainda não foi exercitado contra a API real — falta a chav
 - cota de testador e teto global de disco;
 - vitrine pública, estática e imutável, servida sem cookie.
 
+### O que a revisão de 24/09 fechou
+
+- vitrine desligada recusa escrita anônima na API, e não só na tela;
+- o IP que o limite de login vê é o do cliente (`X-Real-IP` escrito pelo Caddy,
+  aceito só de `TRUSTED_PROXIES`); `mangatl reset-login` destranca o dono;
+- a cota do testador vale para o zip depois de aberto, para cada entrada pelos
+  bytes mágicos e para uploads em paralelo;
+- 20% do teto de disco é do dono, e cada endereço abre no máximo 5 sessões de
+  teste por hora;
+- job que derruba o worker três vezes sai da fila como `failed`;
+- a limpeza apaga `.upload` órfão e área de espera parada há uma semana;
+- apagar capítulo (sessão) e obra inteira (dono).
+
+### Uso diário
+
+- **corrigir uma fala no leitor:** clique no texto do balão, edite, Enter grava.
+  A correção fica marcada e sobrevive a retraduzir a página ou o capítulo;
+- **retraduzir uma página:** botão no canto da fatia; relê e retraduz só ela;
+- **custo antes de gastar:** com `claude`, o primeiro clique em Traduzir mostra a
+  estimativa e o segundo confirma;
+- **baixar CBZ ou PDF** com a tradução escrita na página, no fim do capítulo;
+- **`mangatl backup`:** banco pela API de backup do sqlite (copiar o arquivo com o
+  WAL aberto não é backup) e `tar.gz` de `data/users/`, em `data/backups/<hora>/`;
+- **trocar a senha** no painel ou com `mangatl set-password`, e "sair de todos os
+  aparelhos". Depois da troca, o `OWNER_PASSWORD` do `.env` deixa de valer.
+
 A bateria de isolamento (`src/mangatl/isolation_test.py`) roda as sete checagens
 que decidem se o servidor guarda o acervo de cada um: acervo alheio dá 404, caminho
 direto dá 404, fuga de caminho dá 404 nas cinco formas, sem cookie dá 401, sessão
@@ -593,5 +620,7 @@ vencida dá 401, testador pedindo `claude` dá 429 e rota de dono dá 403.
 - **rodar a bateria contra o domínio público, de outra rede.** Ela passa contra o
   servidor local; o plano pede a mesma bateria contra o endereço real, e essa
   execução só é possível depois do deploy;
-- escolher o conteúdo da vitrine e preencher o contato nos termos;
+- escolher o conteúdo da vitrine, e definir `CONTACT_EMAIL` na instância pública;
+- rodar o motor `claude` contra a API real e trocar a calibração da estimativa de
+  custo pelos tokens medidos;
 - medir a entrega por `X-Accel-Redirect` com quatro leitores simultâneos.

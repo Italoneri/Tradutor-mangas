@@ -965,3 +965,11 @@ todo dia, em ordem de valor.
 - [x] 7.7 Apagar capítulo pela sessão, e série pelo dono
 - [x] 7.8 Menores: health enxuto, `src;C` apagada, README corrigido, seção 4 atualizada
 - [x] Backup de `data/` implementado (`mangatl backup`), e não só pedido na Fase 5
+- [x] 8.1 Fala corrigida à mão no leitor, marcada `edited`, sobrevive a retradução — conferido contra o worker real: retraduzir a página e o capítulo inteiro devolvem a correção
+- [x] 8.2 Retraduzir uma página (`pages` no job; relê e retraduz só ela)
+- [x] 8.3 Estimativa de custo antes do job `claude` — calibrada pelo número do README, não por tokens medidos (depende do 8.4)
+- [ ] 8.4 Motor `claude` contra a API real — fora desta execução, gasta a chave
+- [x] 8.6 Trocar a senha do dono sem reiniciar, `mangatl set-password`, e sair de todas as sessões; o `.env` não desfaz a troca
+- [x] 8.7 Exportar CBZ e PDF com a fala escrita na página
+- [x] 8.8 CI no GitHub Actions. Os testes de `rtdetr` e `argos` não precisaram de marcador: cobrem funções puras e rodam sem torch nem Argos instalados
+- [ ] 8.9 Inpainting em balão colorido — fora desta execução; medir com `scripts/report_overlay.py` antes
