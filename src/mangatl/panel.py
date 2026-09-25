@@ -63,7 +63,7 @@ from .jobs import (
     queue_position,
     recent as recent_jobs,
 )
-from .models import SeriesMeta
+from .models import Chapter, SeriesMeta
 from .quotas import (
     TESTER_MAX_PAGES_PER_CHAPTER,
     OutOfSpace,
@@ -109,7 +109,9 @@ from .store import (
     discover_series,
     list_page_images,
     load_glossary,
+    load_chapter,
     load_series_meta,
+    save_chapter,
     save_glossary,
     save_library,
     save_series_meta,
@@ -478,12 +480,13 @@ class Route(NamedTuple):
     recebe b"" e recusa com 422 pela propria validacao, em vez de aceitar lixo.
     """
 
-    quota_locked: bool = False
-    """Se conferir a cota e gravar precisam ser indivisiveis para este usuario.
+    user_locked: bool = False
+    """Se a rota roda sozinha entre as rotas marcadas do mesmo usuario.
 
     O servidor e uma thread por conexao, e "conferir e gravar" nao e atomico: dez
     `PUT` simultaneos passavam todos pela conferencia antes de qualquer um gravar,
-    e a area terminava acima da cota. Marcada so nas rotas que ocupam disco."""
+    e a area terminava acima da cota. Marcada nas rotas que ocupam disco e na que
+    reescreve a traducao - duas correcoes ao mesmo tempo perderiam uma delas."""
 
     stream: bool = False
     """Se o corpo desce para um arquivo em vez de virar `bytes`.
@@ -1092,6 +1095,7 @@ def _create_job(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int
     directory, _ = _chapter_paths(ctx.cfg, series, chapter)
     if not directory.is_dir():
         raise Invalid(f"capitulo {series}/{chapter} nao existe; promova a area de espera antes")
+    pages = _pages_to_retranslate(ctx.cfg, directory, engine, payload.get("pages"))
 
     try:
         job = enqueue(
@@ -1103,11 +1107,104 @@ def _create_job(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int
             priority=OWNER_PRIORITY if ctx.is_owner else TESTER_PRIORITY,
             force=bool(payload.get("force")),
             dry_run=bool(payload.get("dry_run")),
+            pages=pages,
         )
     except Busy as error:
         return HTTPStatus.CONFLICT, {"error": str(error)}
 
     return HTTPStatus.ACCEPTED, {"job_id": job.id, "job": _job_payload(ctx, job)}
+
+
+MAX_PAGES_PER_RETRANSLATION = 20
+"""Acima disso nao e corrigir paginas, e retraduzir o capitulo - que tem botao proprio."""
+
+
+def _pages_to_retranslate(
+    cfg: Config, directory: Path, engine: str, asked: object
+) -> tuple[str, ...]:
+    """As paginas de um pedido de retraducao parcial, conferidas, ou `()` para todas.
+
+    Parcial so faz sentido sobre uma traducao que ja existe neste motor: o
+    resultado e ela com as paginas pedidas trocadas, e sem ela uma pagina sozinha
+    viraria um capitulo de uma pagina.
+    """
+    if asked is None:
+        return ()
+    if not isinstance(asked, list) or not asked or len(asked) > MAX_PAGES_PER_RETRANSLATION:
+        raise Invalid(f"pages e uma lista de 1 a {MAX_PAGES_PER_RETRANSLATION} nomes de pagina")
+
+    names: list[str] = []
+    for item in asked:
+        name = safe_page_name(item) if isinstance(item, str) else None
+        if name is None or not (directory / name).is_file():
+            raise Invalid(f"pagina {item!r} nao existe neste capitulo")
+        names.append(name)
+
+    if load_chapter(cfg, directory.parent.name, directory.name, engine) is None:
+        raise Invalid(f"traduza o capitulo inteiro com {engine!r} antes de retraduzir uma pagina")
+    return tuple(dict.fromkeys(names))
+
+
+MAX_EDITED_TEXT_CHARS = 2000
+"""Fala de balao passa raramente de duzentos caracteres; dois mil ja e colagem errada."""
+
+
+def _put_block(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Corrige uma fala a mao, na traducao de um motor, e marca que foi a mao.
+
+    E o conserto que faltava para erro de OCR ou de traducao: antes, uma fala
+    errada so saia retraduzindo o capitulo inteiro. A marca `edited` e o que faz
+    uma retraducao posterior devolver esta fala em vez de apaga-la.
+    """
+    series, chapter, engine = groups
+    payload = json_body(body)
+    if not isinstance(payload, dict):
+        raise Invalid("esperava um objeto com page, block e text")
+    page_index, block_id, text = payload.get("page"), payload.get("block"), payload.get("text")
+    if not isinstance(page_index, int) or not isinstance(block_id, str) or not isinstance(text, str):
+        raise Invalid("page e numero, block e text sao texto")
+    if not text.strip() or len(text) > MAX_EDITED_TEXT_CHARS:
+        raise Invalid(f"a fala precisa ter de 1 a {MAX_EDITED_TEXT_CHARS} caracteres")
+
+    stored = _translation_of(ctx.cfg, series, chapter, engine)
+    if stored is None:
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+    if has_active(ctx.connection, ctx.user.id, stored.series, stored.chapter):
+        return HTTPStatus.CONFLICT, {"error": "este capitulo esta na fila; espere terminar"}
+
+    updated = _with_edited_block(stored, page_index, block_id, text.strip())
+    if updated is None:
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+    save_chapter(ctx.cfg, updated)
+    return HTTPStatus.OK, {"page": page_index, "block": block_id, "text": text.strip(), "edited": True}
+
+
+def _translation_of(cfg: Config, series: str, chapter: str, engine: str) -> Chapter | None:
+    """A traducao deste motor na area de quem pede, ou None - que vira 404."""
+    if engine not in available_engines():
+        return None
+    path = _inside(cfg.output_dir, series, chapter, chapter_filename(engine))
+    if path is None or not path.is_file():
+        return None
+    return load_chapter(cfg, series, chapter, engine)
+
+
+def _with_edited_block(
+    stored: Chapter, page_index: int, block_id: str, text: str
+) -> Chapter | None:
+    """O capitulo com a fala trocada, ou None se a pagina ou o bloco nao existem."""
+    page = next((item for item in stored.pages if item.index == page_index), None)
+    if page is None or all(block.id != block_id for block in page.blocks):
+        return None
+    blocks = tuple(
+        block.model_copy(update={"text": text, "edited": True}) if block.id == block_id else block
+        for block in page.blocks
+    )
+    pages = tuple(
+        item.model_copy(update={"blocks": blocks}) if item.index == page_index else item
+        for item in stored.pages
+    )
+    return stored.model_copy(update={"pages": pages})
 
 
 def _job_payload(ctx: Context, job) -> dict:  # noqa: ANN001 - `Job` importado tardiamente
@@ -1304,7 +1401,7 @@ ROUTES: tuple[Route, ...] = (
         re.compile(rf"^/api/series/{_SLUG}/chapters$"),
         _create_chapter,
         writes=True,
-        quota_locked=True,
+        user_locked=True,
     ),
     Route(
         "PUT",
@@ -1313,7 +1410,7 @@ ROUTES: tuple[Route, ...] = (
         MAX_PAGE_BYTES,
         writes=True,
         body_required=True,
-        quota_locked=True,
+        user_locked=True,
     ),
     Route(
         "POST",
@@ -1323,7 +1420,7 @@ ROUTES: tuple[Route, ...] = (
         writes=True,
         body_required=True,
         stream=True,
-        quota_locked=True,
+        user_locked=True,
     ),
     Route(
         "POST",
@@ -1332,6 +1429,14 @@ ROUTES: tuple[Route, ...] = (
         writes=True,
     ),
     Route("GET", re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/incoming$"), _get_incoming),
+    Route(
+        "PUT",
+        re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/translations/{_SLUG}/blocks$"),
+        _put_block,
+        writes=True,
+        body_required=True,
+        user_locked=True,
+    ),
     Route("GET", re.compile(r"^/api/jobs$"), _list_jobs),
     Route("POST", re.compile(r"^/api/jobs$"), _create_job, writes=True, body_required=True),
     Route("GET", re.compile(rf"^/api/jobs/{_SLUG}$"), _get_job),
@@ -1700,7 +1805,7 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
             ocupa o mesmo disco que um que passa, e so o caminho de sucesso limpar
             transformaria cada erro em lixo permanente.
             """
-            locked = route.quota_locked and context.user is not None
+            locked = route.user_locked and context.user is not None
             try:
                 with user_locks.hold(context.user.id) if locked else nullcontext():
                     return route.handler(context, groups, body)

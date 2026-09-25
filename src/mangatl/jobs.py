@@ -137,6 +137,7 @@ def enqueue(
     priority: int,
     force: bool = False,
     dry_run: bool = False,
+    pages: tuple[str, ...] = (),
 ) -> Job:
     """Poe um job na fila, ou levanta `Busy`.
 
@@ -169,7 +170,7 @@ def enqueue(
                 json.dumps(Progress(phase="extract", detail="na fila").model_dump(mode="json")),
                 now(),
                 priority,
-                json.dumps({"force": force, "dry_run": dry_run}),
+                json.dumps({"force": force, "dry_run": dry_run, "pages": list(pages)}),
             ),
         )
     return get_any(connection, job_id)

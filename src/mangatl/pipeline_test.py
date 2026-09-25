@@ -2,9 +2,20 @@ from __future__ import annotations
 
 import pytest
 
-from .models import BBox, Detection
+from .config import Config
+from .models import (
+    BBox,
+    Chapter,
+    Detection,
+    ExtractedBlock,
+    ExtractedPage,
+    Extraction,
+    TranslatedBlock,
+    TranslatedPage,
+)
 from .ocr import BlockReading
-from .pipeline import _drop_repeated_readings
+from .pipeline import _drop_repeated_readings, keep_manual_edits, translate_chapter
+from .store import save_chapter
 
 
 def reading(x: int, y: int, w: int, h: int, text: str, confidence: float = 90.0):
@@ -98,3 +109,111 @@ def test_survives_degenerate_input(entrada):
 
     assert len(kept) == len(entrada)
     assert removed == []
+
+
+# ---------- correcao a mao e retraducao parcial ----------
+
+
+def _block(block_id: str, text: str, *, edited: bool = False) -> TranslatedBlock:
+    return TranslatedBlock(id=block_id, source_text="EN", text=text, edited=edited)
+
+
+def _page(index: int, image: str, *blocks: TranslatedBlock) -> TranslatedPage:
+    return TranslatedPage(index=index, image=image, width=10, height=10, blocks=blocks)
+
+
+def _chapter(*pages: TranslatedPage) -> Chapter:
+    return Chapter(
+        series="Obra", chapter="001", engine="free", pipeline_version=4,
+        created_at="2026-01-01T00:00:00+00:00", pages=pages,
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "previous", "fresh", "expected"),
+    [
+        ("sem traducao anterior fica a nova", None, [_block("b1", "novo")], ["novo"]),
+        (
+            "fala editada sobrevive a retraducao",
+            [_block("b1", "corrigido", edited=True)],
+            [_block("b1", "novo")],
+            ["corrigido"],
+        ),
+        (
+            "fala nao editada e trocada",
+            [_block("b1", "velho")],
+            [_block("b1", "novo")],
+            ["novo"],
+        ),
+        (
+            "fala editada que o OCR perdeu volta",
+            [_block("b1", "corrigido", edited=True)],
+            [_block("b2", "outro")],
+            ["outro", "corrigido"],
+        ),
+    ],
+)
+def test_keeps_manual_edits_across_a_retranslation(name, previous, fresh, expected):
+    before = None if previous is None else _chapter(_page(1, "p1.jpg", *previous))
+
+    merged = keep_manual_edits(before, [_page(1, "p1.jpg", *fresh)])
+
+    assert [block.text for block in merged[0].blocks] == expected, name
+
+
+class _Echo:
+    """Motor falso: traduz cada fala para `<pagina>:novo` e conta o que recebeu."""
+
+    name = "free"
+    model = None
+
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+
+    def translate_chapter(self, pages, glossary, chapter_dir, progress=None):  # noqa: ANN001
+        self.asked.extend(page.image for page in pages)
+        return [
+            _page(page.index, page.image, *(_block(b.id, f"{page.image}:novo") for b in page.blocks))
+            for page in pages
+        ]
+
+
+def _extraction(*images: str) -> Extraction:
+    return Extraction(
+        series="Obra",
+        chapter="001",
+        pipeline_version=4,
+        pages=tuple(
+            ExtractedPage(
+                index=index, image=image, width=10, height=10, image_sha256="x",
+                blocks=(ExtractedBlock(id="b1", bbox=BBox(x=0, y=0, w=5, h=5), raw_text="EN", confidence=90),),
+            )
+            for index, image in enumerate(images, start=1)
+        ),
+    )
+
+
+def test_retranslates_only_the_asked_page_and_keeps_the_rest(tmp_path):
+    cfg = Config(root=tmp_path)
+    (cfg.library_dir / "Obra" / "001").mkdir(parents=True)
+    save_chapter(
+        cfg,
+        _chapter(_page(1, "p1.jpg", _block("b1", "velho 1")), _page(2, "p2.jpg", _block("b1", "velho 2"))),
+    )
+    engine = _Echo()
+
+    chapter = translate_chapter(cfg, _extraction("p1.jpg", "p2.jpg"), engine, only_pages=frozenset({"p2.jpg"}))
+
+    assert engine.asked == ["p2.jpg"]
+    assert [page.blocks[0].text for page in chapter.pages] == ["velho 1", "p2.jpg:novo"]
+
+
+def test_translates_everything_when_there_is_nothing_to_splice_into(tmp_path):
+    cfg = Config(root=tmp_path)
+    (cfg.library_dir / "Obra" / "001").mkdir(parents=True)
+    engine = _Echo()
+
+    chapter = translate_chapter(cfg, _extraction("p1.jpg", "p2.jpg"), engine, only_pages=frozenset({"p2.jpg"}))
+
+    assert engine.asked == ["p1.jpg", "p2.jpg"]
+    assert len(chapter.pages) == 2

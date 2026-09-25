@@ -113,15 +113,25 @@ def _run_job(base: Config, job: Job) -> None:
     error: str | None = None
     try:
         with _collecting_into(lines):
+            # Retraduzir uma pagina e reler e retraduzir so ela; o resto do capitulo
+            # sai do cache de extracao e da traducao que ja existe.
+            pages = frozenset(job.options.get("pages") or ())
             report = extract_chapter(
                 cfg,
                 job.series,
                 job.chapter,
                 force=bool(job.options.get("force")),
                 progress=advance,
+                force_pages=pages,
             )
             if not job.options.get("dry_run"):
-                translate_chapter(cfg, report.extraction, create_engine(job.engine, cfg), advance)
+                translate_chapter(
+                    cfg,
+                    report.extraction,
+                    create_engine(job.engine, cfg),
+                    advance,
+                    only_pages=pages,
+                )
 
             # Sem isto o capitulo novo nao aparece para quem le: o indice sai do
             # `library.json` salvo, e nao do disco.

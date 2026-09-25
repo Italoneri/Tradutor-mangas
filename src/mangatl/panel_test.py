@@ -1030,3 +1030,110 @@ def test_trusts_the_real_ip_header_only_from_the_proxy(
     monkeypatch.setenv(panel.TRUSTED_PROXIES_ENV, trusted)
 
     assert panel.client_ip(peer, real_ip, panel.trusted_proxies()) == expected, name
+
+
+# ---------- 8.1 corrigir fala a mao, 8.2 retraduzir uma pagina ----------
+
+
+def translated_chapter(tmp_path: Path, slug: str = "Obra", chapter: str = "001") -> None:
+    """Um capitulo de duas paginas ja traduzido com `free`, na area do dono."""
+    pages_dir = owner_area(tmp_path, "library") / slug / chapter
+    pages_dir.mkdir(parents=True)
+    for image in ("p1.jpg", "p2.jpg"):
+        (pages_dir / image).write_bytes(JPEG)
+    output = owner_area(tmp_path, "output") / slug / chapter
+    output.mkdir(parents=True)
+    def page(index: int, image: str) -> dict:
+        return {
+            "index": index, "image": image, "width": 10, "height": 10,
+            "blocks": [{"id": "b1", "source_text": "HI", "text": "oi"}],
+        }
+
+    (output / "chapter.free.json").write_text(
+        json.dumps({
+            "series": slug, "chapter": chapter, "engine": "free", "pipeline_version": 4,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "pages": [page(1, "p1.jpg"), page(2, "p2.jpg")],
+        }),
+        encoding="utf-8",
+    )
+
+
+BLOCKS = "/api/series/Obra/chapters/001/translations/free/blocks"
+
+
+def test_saves_a_hand_corrected_line_and_marks_it(panel_server: Client, tmp_path: Path):
+    translated_chapter(tmp_path)
+
+    status, body = _put_json(panel_server, BLOCKS, {"page": 2, "block": "b1", "text": " ola "})
+
+    assert status == 200, body
+    stored = json.loads(
+        (owner_area(tmp_path, "output") / "Obra" / "001" / "chapter.free.json").read_text("utf-8")
+    )
+    assert stored["pages"][1]["blocks"][0] == {**stored["pages"][1]["blocks"][0], "text": "ola", "edited": True}
+    assert stored["pages"][0]["blocks"][0]["text"] == "oi"
+
+
+@pytest.mark.parametrize(
+    ("name", "path", "payload", "status"),
+    [
+        ("pagina que nao existe", BLOCKS, {"page": 9, "block": "b1", "text": "x"}, 404),
+        ("bloco que nao existe", BLOCKS, {"page": 1, "block": "zz", "text": "x"}, 404),
+        ("motor sem traducao", BLOCKS.replace("free", "claude"), {"page": 1, "block": "b1", "text": "x"}, 404),
+        ("capitulo de outra pasta", BLOCKS.replace("001", "002"), {"page": 1, "block": "b1", "text": "x"}, 404),
+        ("fala vazia", BLOCKS, {"page": 1, "block": "b1", "text": "  "}, 422),
+        ("pagina que nao e numero", BLOCKS, {"page": "1", "block": "b1", "text": "x"}, 422),
+    ],
+)
+def test_refuses_a_correction_that_points_nowhere(
+    panel_server: Client, tmp_path: Path, name: str, path: str, payload: dict, status: int
+):
+    translated_chapter(tmp_path)
+
+    assert _put_json(panel_server, path, payload)[0] == status, name
+
+
+def _retranslate(client: Client, pages: object) -> tuple[int, bytes]:
+    body = {"series": "Obra", "chapter": "001", "engine": "free", "pages": pages}
+    return client.send("POST", "/api/jobs", json.dumps(body).encode("utf-8"))
+
+
+def test_queues_a_retranslation_of_just_one_page(panel_server: Client, tmp_path: Path):
+    translated_chapter(tmp_path)
+
+    status, body = _retranslate(panel_server, ["p2.jpg"])
+
+    assert status == 202, body
+    with connect(Config(root=tmp_path)) as connection:
+        job = get_any(connection, json.loads(body)["job_id"])
+    assert job.options["pages"] == ["p2.jpg"]
+
+
+@pytest.mark.parametrize(
+    ("name", "pages"),
+    [
+        ("pagina que nao existe", ["p9.jpg"]),
+        ("caminho no lugar do nome", ["../p1.jpg"]),
+        ("lista vazia", []),
+        ("nao e lista", "p1.jpg"),
+    ],
+)
+def test_refuses_a_retranslation_of_pages_that_are_not_there(
+    panel_server: Client, tmp_path: Path, name: str, pages: object
+):
+    translated_chapter(tmp_path)
+
+    assert _retranslate(panel_server, pages)[0] == 422, name
+
+
+def test_refuses_to_retranslate_a_page_of_a_chapter_never_translated(
+    panel_server: Client, tmp_path: Path
+):
+    translated_chapter(tmp_path)
+    (owner_area(tmp_path, "output") / "Obra" / "001" / "chapter.free.json").unlink()
+
+    status, body = _retranslate(panel_server, ["p1.jpg"])
+
+    assert status == 422
+    assert b"inteiro" in body

@@ -194,6 +194,12 @@ class TranslatedBlock(Frozen):
     ela fica na pagina onde comeca e este campo diz quanto sobra para baixo. Zero
     na esmagadora maioria dos blocos, que cabem na propria pagina."""
 
+    edited: bool = False
+    """Se a fala foi corrigida a mao no leitor.
+
+    Retraduzir o capitulo preserva o texto destes blocos: sem a marca, uma
+    retraducao apagaria em silencio o que alguem corrigiu fala a fala."""
+
 
 class TranslatedPage(Frozen):
     index: int = Field(ge=1)

@@ -170,11 +170,16 @@ def test_keeps_the_options_across_a_restart(cfg, people):
             priority=TESTER_PRIORITY,
             force=True,
             dry_run=True,
+            pages=("p2.jpg",),
         )
         claim_next(connection)
         requeue_running(connection)
 
-        assert get_any(connection, job.id).options == {"force": True, "dry_run": True}
+        assert get_any(connection, job.id).options == {
+            "force": True,
+            "dry_run": True,
+            "pages": ["p2.jpg"],
+        }
 
 
 # ---------- progresso e fim ----------
