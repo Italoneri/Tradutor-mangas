@@ -183,6 +183,16 @@ Caddy (HTTPS, limites de corpo, timeouts)
   └── disco: data/users/<user_id>/{library,output}/...
 ```
 
+> **Decisão tomada na implementação (revisão de 24/09):** no lugar de `gunicorn` +
+> WSGI ficou o `ThreadingHTTPServer` da stdlib atrás do Caddy, e o worker é um
+> contêiner próprio, não um processo no mesmo contêiner. A troca não é etapa
+> faltando: o Caddy segura o que o `http.server` não segura sozinho (corpo máximo,
+> timeouts de leitura, slowloris), a entrega dos bytes já sai do Python pelo
+> `X-Accel-Redirect`, e o que sobra no app é autorizar e enfileirar — trabalho de
+> milissegundos, que uma thread por conexão atende. Se um dia o app precisar de
+> vários processos, a fila e a sessão já moram no banco e nada precisa mudar além
+> do servidor HTTP.
+
 Três pontos que decidem o resto:
 
 **O app autoriza, o proxy entrega.** Um capítulo são 155 JPEGs. Se cada imagem
@@ -620,6 +630,12 @@ Tarefa periódica: apaga usuário `tester` vencido, a área dele em disco, e as
 sessões. Loga quanto liberou. Um teto global de disco que, ao ser atingido,
 recusa upload novo com 507 em vez de encher o volume.
 
+A limpeza roda no laço do worker (`cleanup.sweep`, a cada 15 min), e desde a Fase
+7.6 também apaga `.upload` órfão com mais de uma hora e área de espera parada há
+mais de sete dias. Com o worker parado, ou no meio de um capítulo longo, ela
+também para; é aceito, porque os prazos são de horas e dias. A alternativa, se um
+dia pesar, é uma thread própria no `app`.
+
 **PARE.** Suba dois testadores, estoure a cota de um, confirme que o outro não é
 afetado. Reinicie o contêiner no meio de um job e confirme que ele volta. Relate.
 
@@ -936,7 +952,7 @@ todo dia, em ordem de valor.
 - [x] Chave da API fora da imagem, confirmado com `docker history` — 27 camadas, nenhuma ocorrência, e `.env` não está na imagem
 - [x] `scripts/serve.py` apagado e o motivo escrito no README
 - [x] README com: rodar local com chave própria, custo medido, por que a instância pública é limitada, requisitos reais, e o que o projeto não é — mais `PUBLIC_SHOWCASE` e a bateria do proxy
-- [ ] Termos publicados, com prazo de expiração e endereço para remoção — prazo ok; o endereço ainda é `contato@exemplo.com` (revisão de 24/09)
+- [x] Termos publicados, com prazo de expiração e endereço para remoção — o endereço vem de `CONTACT_EMAIL`; sem ele a página diz que ainda não foi configurado, em vez de mostrar um falso
 - [x] Os 7 primeiros testes da Fase 3.7 passando contra o app
 - [x] Os casos 8, 9 e 10 executados com o Caddy na frente, localmente — `caddy_test.py`, 14 testes
 - [ ] **Os casos 8, 9 e 10 repetidos contra o domínio público, de outra rede**
@@ -947,5 +963,5 @@ todo dia, em ordem de valor.
 - [x] 7.5 `attempts` na fila; job que derruba o worker 3 vezes vira `failed`
 - [x] 7.6 Limpeza de `.upload` órfão e de `.incoming` abandonado
 - [x] 7.7 Apagar capítulo pela sessão, e série pelo dono
-- [ ] 7.8 Menores: health enxuto, `src;C` apagada, README corrigido, seção 4 atualizada
+- [x] 7.8 Menores: health enxuto, `src;C` apagada, README corrigido, seção 4 atualizada
 - [ ] Backup de `data/` implementado (`mangatl backup`), e não só pedido na Fase 5

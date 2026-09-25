@@ -7,3 +7,4 @@ library/
 .pytest_cache/
 data/
 public/demo/
+.claude/

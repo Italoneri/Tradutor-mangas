@@ -27,7 +27,10 @@
 		Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
 		X-Content-Type-Options "nosniff"
 		Referrer-Policy "same-origin"
-		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		# Sem `includeSubDomains`: ele obriga HTTPS em todo subdominio do dominio
+		# escolhido, inclusive os que nao sao deste servidor, e o navegador guarda a
+		# regra por um ano. Ligue so depois de conferir que todos tem certificado.
+		Strict-Transport-Security "max-age=31536000"
 		X-Frame-Options "DENY"
 		-Server
 	}
