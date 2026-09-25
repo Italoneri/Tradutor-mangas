@@ -47,7 +47,7 @@ from contextlib import contextmanager, nullcontext
 from http import HTTPStatus
 from pathlib import Path, PurePosixPath
 from typing import IO, Literal, NamedTuple
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from .accounts import (
     User,
@@ -402,6 +402,14 @@ class Raw(NamedTuple):
 
     path: Path
     content_type: str
+    download_name: str | None = None
+    """Nome sugerido para salvar. Presente, a resposta vira download."""
+
+    temporary: bool = False
+    """Arquivo gerado para este pedido: sai pelo Python e e apagado depois.
+
+    Nao vai pelo proxy de proposito - o Caddy transmitiria depois de o Python ja
+    ter respondido, e nao haveria momento certo para apagar."""
 
 
 class Context(NamedTuple):
@@ -1277,6 +1285,40 @@ def _estimate(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, 
     return HTTPStatus.OK, {"engine": engine, "pages": pages, "usd": usd, "model": model}
 
 
+def _export(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """O capitulo traduzido como CBZ ou PDF, com a fala escrita nas paginas.
+
+    Gerado na hora e apagado depois de enviado: guardar a exportacao seria uma
+    segunda copia do capitulo ocupando a cota, e ela se refaz em segundos. Roda
+    na thread do pedido - o capitulo do testador tem 12 paginas, e o do dono e
+    pedido por uma pessoa so.
+    """
+    from .export import CONTENT_TYPES, WRITERS
+
+    series, chapter, engine, kind = groups
+    stored = _translation_of(ctx.cfg, series, chapter, engine)
+    pages_dir = _inside(ctx.cfg.library_dir, series, chapter)
+    if stored is None or pages_dir is None or not pages_dir.is_dir():
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+
+    spool = ctx.base.data_dir / "uploads"
+    spool.mkdir(parents=True, exist_ok=True)
+    handle, name = tempfile.mkstemp(dir=spool, suffix=".export")
+    os.close(handle)
+    target = Path(name)
+    try:
+        WRITERS[kind](stored, pages_dir, target)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    return HTTPStatus.OK, Raw(
+        target,
+        CONTENT_TYPES[kind],
+        download_name=f"{stored.series} {stored.chapter} ({engine}).{kind}",
+        temporary=True,
+    )
+
+
 def _job_payload(ctx: Context, job) -> dict:  # noqa: ANN001 - `Job` importado tardiamente
     """O job como a tela o ve, com o lugar na fila quando ainda espera.
 
@@ -1520,6 +1562,11 @@ ROUTES: tuple[Route, ...] = (
         "GET",
         re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/estimate/{_SLUG}$"),
         _estimate,
+    ),
+    Route(
+        "GET",
+        re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/export/([a-z]+)\.(cbz|pdf)$"),
+        _export,
     ),
     Route("GET", re.compile(r"^/api/jobs$"), _list_jobs),
     Route("POST", re.compile(r"^/api/jobs$"), _create_job, writes=True, body_required=True),
@@ -1855,7 +1902,19 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
             transmite, e o worker volta a atender na hora. Sem ele, transmite em
             pedacos daqui - funciona, e e divida anotada.
             """
-            internal = _internal_redirect(cfg, raw.path)
+            if raw.download_name:
+                # `filename*` porque nome de obra tem acento, e `filename` e ASCII.
+                headers["Content-Disposition"] = (
+                    f"attachment; filename*=UTF-8''{quote(raw.download_name)}"
+                )
+            try:
+                self._transmit(raw, headers)
+            finally:
+                if raw.temporary:
+                    raw.path.unlink(missing_ok=True)
+
+        def _transmit(self, raw: Raw, headers: dict[str, str]) -> None:
+            internal = None if raw.temporary else _internal_redirect(cfg, raw.path)
             if internal is not None:
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", raw.content_type)

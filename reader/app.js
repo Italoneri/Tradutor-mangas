@@ -330,7 +330,7 @@ function renderChapter(library, chapterData, entry, engine, { editable = false }
   el.main.innerHTML =
     `<div class="strip">${slices}</div>` +
     orphansHtml(chapterData.pages) +
-    chapterEndHtml(chapter, seriesHref(series), nextHref);
+    chapterEndHtml(chapter, seriesHref(series), nextHref, editable ? exportLinks(series, chapter, engine) : "");
 
   fitOnScroll();
   if (editable) {
@@ -388,7 +388,17 @@ function sliceHtml(library, series, chapter, page, editable) {
   </figure>`;
 }
 
-function chapterEndHtml(chapter, seriesUrl, nextHref) {
+/* Baixar o capitulo com a traducao escrita nas paginas, para ler fora daqui. So
+   no acervo da sessao: a rota gera o arquivo a partir da area de quem pede. */
+function exportLinks(series, chapter, engine) {
+  const base = `${ROOT}/api/series/${encodeURIComponent(series)}/chapters/${encodeURIComponent(chapter)}/export/${encodeURIComponent(engine)}`;
+  return `<div class="actions">
+      <a class="btn btn-ghost" href="${escapeHtml(base)}.cbz" download>Baixar CBZ</a>
+      <a class="btn btn-ghost" href="${escapeHtml(base)}.pdf" download>Baixar PDF</a>
+    </div>`;
+}
+
+function chapterEndHtml(chapter, seriesUrl, nextHref, exports = "") {
   const next = nextHref
     ? `<a class="btn btn-primary" href="${escapeHtml(nextHref)}">Ler o próximo capítulo</a>`
     : "";
@@ -400,6 +410,7 @@ function chapterEndHtml(chapter, seriesUrl, nextHref) {
       <a class="btn btn-secondary" href="${escapeHtml(seriesUrl)}">Voltar aos capítulos</a>
       ${next}
     </div>
+    ${exports}
   </div>`;
 }
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import threading
+import time
 from unittest import mock
 import zipfile
 from http.client import HTTPConnection
@@ -1220,3 +1221,47 @@ def test_signs_out_every_session_including_this_one(panel_server: Client):
     assert phone.get("/api/series")[0] == 401
     panel_server.cookie = phone.cookie
     assert panel_server.get("/api/series")[0] == 401
+
+
+# ---------- 8.7 exportar CBZ e PDF ----------
+
+
+def _real_pages(tmp_path: Path) -> None:
+    """Troca os JPEGs de mentira do capitulo por imagens que o Pillow abre."""
+    from PIL import Image
+
+    for image in ("p1.jpg", "p2.jpg"):
+        Image.new("RGB", (10, 10), (40, 40, 40)).save(owner_area(tmp_path, "library") / "Obra" / "001" / image)
+
+
+@pytest.mark.parametrize(("kind", "magic"), [("cbz", b"PK"), ("pdf", b"%PDF")])
+def test_downloads_the_chapter_as_a_file(panel_server: Client, tmp_path: Path, kind: str, magic: bytes):
+    translated_chapter(tmp_path)
+    _real_pages(tmp_path)
+
+    status, body, headers = panel_server.raw("GET", f"/api/series/Obra/chapters/001/export/free.{kind}")
+
+    assert status == 200
+    assert body.startswith(magic)
+    assert "attachment" in headers["content-disposition"]
+    # O servidor apaga depois de escrever o ultimo byte, e o cliente pode terminar
+    # de ler antes disso: espera um pouco em vez de correr com a thread dele.
+    spool = tmp_path / "data" / "uploads"
+    deadline = time.monotonic() + 5
+    while list(spool.glob("*.export")) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not list(spool.glob("*.export")), "o arquivo gerado ficou no disco depois de enviado"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/series/Obra/chapters/001/export/claude.cbz",
+        "/api/series/Obra/chapters/999/export/free.cbz",
+        "/api/series/Outra/chapters/001/export/free.pdf",
+    ],
+)
+def test_answers_404_for_exporting_what_is_not_there(panel_server: Client, tmp_path: Path, path: str):
+    translated_chapter(tmp_path)
+
+    assert panel_server.get(path)[0] == 404

@@ -50,7 +50,9 @@ INCOMING_MAX_AGE_DAYS = 7
 Area de espera e upload que nao virou capitulo. Uma semana sem ninguem mexer e
 desistencia, e o disco que ela ocupa conta contra o teto de todo mundo."""
 
-SPOOL_SUFFIXES = (".upload",)
+SPOOL_SUFFIXES = (".upload", ".export")
+"""O que o painel escreve em `data/uploads/` e apaga no fim do pedido: o corpo de
+um upload grande e o arquivo de uma exportacao."""
 
 
 def _older_than(path: Path, seconds: float, moment: float) -> bool:
