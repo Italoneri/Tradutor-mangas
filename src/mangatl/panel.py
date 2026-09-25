@@ -89,8 +89,10 @@ from .sessions import (
     issue,
     login_is_throttled,
     record_login_attempt,
+    record_tester_signup,
     resolve,
     revoke,
+    tester_signup_allowed,
     token_from_cookies,
     verify_password,
 )
@@ -856,7 +858,7 @@ def _create_chapter(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple
     # Antes de criar a pasta, e nao depois: area de espera aberta ja e disco
     # ocupado, e recusar depois deixaria o lixo para a limpeza varrer.
     check_new_chapter(ctx.cfg, ctx.user)
-    check_disk(ctx.base)
+    check_disk(ctx.base, ctx.user)
 
     chapter, incoming = _chapter_paths(ctx.cfg, directory.name, asked)
     if chapter.is_dir():
@@ -897,7 +899,7 @@ def _put_page(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, 
     adding = 0 if (incoming / name).exists() else 1
     check_incoming_pages(ctx.cfg, ctx.user, incoming, adding)
     check_upload_bytes(ctx.cfg, ctx.user, len(body))
-    check_disk(ctx.base, len(body))
+    check_disk(ctx.base, ctx.user, len(body))
 
     (incoming / name).write_bytes(body)
     record_usage(ctx.connection, ctx.user.id, pages=adding, bytes_=len(body))
@@ -921,7 +923,7 @@ def _put_archive(ctx: Context, groups: tuple[str, ...], body: Body) -> tuple[int
     size = body.stat().st_size if isinstance(body, Path) else len(body)
 
     check_upload_bytes(ctx.cfg, ctx.user, size)
-    check_disk(ctx.base, size)
+    check_disk(ctx.base, ctx.user, size)
 
     # O zip comprime, entao o corpo nao diz quanto vai ocupar: a folga da cota vira
     # teto do descompactado, e o teto de paginas conta o que ja esta na espera.
@@ -1447,6 +1449,11 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
             token = token_from_cookies(self.headers.get("Cookie"))
             session = resolve(connection, token)
             issued: str | None = None
+            requester_ip = client_ip(
+                self.client_address[0] if self.client_address else "",
+                self.headers.get(REAL_IP_HEADER),
+                trusted_proxies(),
+            )
 
             if (
                 session is None
@@ -1459,7 +1466,15 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
                 # So com a vitrine ligada: sem ela a instalacao e de uma pessoa, e
                 # esconder o testador na tela enquanto a API o cria seria a flag
                 # decidir so a aparencia.
+                if not tester_signup_allowed(connection, requester_ip):
+                    self._discard_small_body()
+                    self._send_json(
+                        HTTPStatus.TOO_MANY_REQUESTS,
+                        {"error": "sessoes de teste demais deste endereco; tente daqui a uma hora"},
+                    )
+                    return True
                 session, token = _open_tester_session(connection)
+                record_tester_signup(connection, requester_ip)
                 issued = token
 
             if session is None and route.access != "public":
@@ -1486,11 +1501,7 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
                 connection=connection,
                 session=session,
                 token=token,
-                client_ip=client_ip(
-                    self.client_address[0] if self.client_address else "",
-                    self.headers.get(REAL_IP_HEADER),
-                    trusted_proxies(),
-                ),
+                client_ip=requester_ip,
             )
 
             # A sessao recem-aberta viaja no cookie ate nas respostas de erro. Sem

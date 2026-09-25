@@ -29,6 +29,7 @@ from .quotas import (
     engines_for,
 )
 from .serving import _Server
+from .sessions import TESTER_SIGNUPS_PER_IP_PER_HOUR
 
 JPEG = bytes.fromhex("ffd8ffe0") + b"0" * 32
 
@@ -134,9 +135,34 @@ def test_refuses_a_new_upload_once_the_disk_is_full(tmp_path, monkeypatch):
     page.write_bytes(b"x" * 1000)
 
     monkeypatch.setenv(DISK_CEILING_ENV, "1500")
-    check_disk(base, 400)
+    check_disk(base, OWNER, 400)
     with pytest.raises(OutOfSpace):
-        check_disk(base, 600)
+        check_disk(base, OWNER, 600)
+
+
+@pytest.mark.parametrize(
+    ("name", "user", "incoming", "refused"),
+    [
+        ("testador cabe abaixo da fatia dele", TESTER, 100, False),
+        ("testador para em 80% do teto", TESTER, 300, True),
+        ("dono passa dos 80%", OWNER, 300, False),
+        ("dono para no teto inteiro", OWNER, 600, True),
+    ],
+)
+def test_reserves_the_last_slice_of_the_disk_for_the_owner(
+    tmp_path, monkeypatch, name: str, user: User, incoming: int, refused: bool
+):
+    base = Config(root=tmp_path)
+    page = base.data_dir / "users" / ("c" * 32) / "library" / "p.jpg"
+    page.parent.mkdir(parents=True)
+    page.write_bytes(b"x" * 1000)
+    monkeypatch.setenv(DISK_CEILING_ENV, "1500")
+
+    if refused:
+        with pytest.raises(OutOfSpace):
+            check_disk(base, user, incoming)
+    else:
+        check_disk(base, user, incoming)
 
 
 # ---------- pelo servidor de verdade ----------
@@ -315,3 +341,34 @@ def test_keeps_the_area_inside_the_quota_under_parallel_uploads(server: Client, 
         path.stat().st_size for path in _tester_area(tmp_path).rglob("*") if path.is_file()
     )
     assert used <= TESTER_MAX_UPLOAD_BYTES
+
+
+# ---------- 7.4 o teto global nao tranca o dono ----------
+
+
+def test_lets_the_owner_upload_after_testers_fill_their_share(
+    server: Client, tmp_path: Path, monkeypatch
+):
+    tester = _tester_with_series(server)
+    assert server.login() == 200
+    assert server.send("POST", "/api/series", json.dumps({"slug": "Minha"}).encode())[0] == 201
+
+    occupied = tmp_path / "data" / "users" / ("d" * 32) / "library" / "grande.jpg"
+    occupied.parent.mkdir(parents=True)
+    occupied.write_bytes(b"x" * 1300)
+    monkeypatch.setenv(DISK_CEILING_ENV, "1500")
+
+    chapter = json.dumps({"chapter": "001"}).encode()
+    assert tester.send("POST", "/api/series/Minha/chapters", chapter)[0] == 507
+    assert server.send("POST", "/api/series/Minha/chapters", chapter)[0] == 201
+
+
+def test_limits_how_many_tester_sessions_one_address_opens(server: Client):
+    """Apagar o cookie dava outra sessao, outra cota e outro lugar na fila."""
+    codes = [
+        Client(server.port).send("POST", "/api/series", json.dumps({"slug": "Minha"}).encode())[0]
+        for _ in range(TESTER_SIGNUPS_PER_IP_PER_HOUR + 1)
+    ]
+
+    assert codes[:TESTER_SIGNUPS_PER_IP_PER_HOUR] == [201] * TESTER_SIGNUPS_PER_IP_PER_HOUR
+    assert codes[-1] == 429

@@ -17,7 +17,11 @@ import logging
 from .accounts import delete_user, expired_testers
 from .config import Config
 from .db import connect
-from .sessions import purge_expired_sessions, purge_old_login_attempts
+from .sessions import (
+    purge_expired_sessions,
+    purge_old_login_attempts,
+    purge_old_tester_signups,
+)
 
 log = logging.getLogger("mangatl.cleanup")
 
@@ -45,6 +49,7 @@ def sweep(cfg: Config) -> tuple[int, int]:
 
         sessions = purge_expired_sessions(connection)
         purge_old_login_attempts(connection)
+        purge_old_tester_signups(connection)
 
     if removed or sessions:
         # Sem nome de arquivo e sem id de usuario: log de servidor nao guarda o

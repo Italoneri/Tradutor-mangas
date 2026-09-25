@@ -318,6 +318,39 @@ def clear_every_login_attempt(connection: sqlite3.Connection) -> int:
     return connection.execute("DELETE FROM login_attempts").rowcount
 
 
+TESTER_SIGNUPS_PER_IP_PER_HOUR = 5
+"""Sessoes de teste novas que um mesmo endereco abre por hora.
+
+Sem teto, a cota por sessao nao limita nada: quem apaga o cookie ganha outra
+sessao, outros 40MB e outro lugar na fila. Cinco cobrem uma casa com varios
+aparelhos atras do mesmo roteador."""
+
+
+def _ip_hash(ip: str) -> str:
+    """O IP como hash: o banco conta, mas nao guarda endereco de ninguem."""
+    return hashlib.sha256(ip.encode("utf-8")).hexdigest()
+
+
+def tester_signup_allowed(connection: sqlite3.Connection, ip: str) -> bool:
+    row = connection.execute(
+        "SELECT count(*) AS n FROM tester_signups WHERE ip_hash = ? AND at > ?",
+        (_ip_hash(ip), minutes_ago(60)),
+    ).fetchone()
+    return row["n"] < TESTER_SIGNUPS_PER_IP_PER_HOUR
+
+
+def record_tester_signup(connection: sqlite3.Connection, ip: str) -> None:
+    connection.execute(
+        "INSERT INTO tester_signups (ip_hash, at) VALUES (?, ?)", (_ip_hash(ip), now())
+    )
+
+
+def purge_old_tester_signups(connection: sqlite3.Connection) -> int:
+    return connection.execute(
+        "DELETE FROM tester_signups WHERE at <= ?", (minutes_ago(60),)
+    ).rowcount
+
+
 def purge_old_login_attempts(connection: sqlite3.Connection) -> int:
     since = minutes_ago(LOGIN_ATTEMPT_WINDOW_MINUTES)
     cursor = connection.execute("DELETE FROM login_attempts WHERE at <= ?", (since,))
