@@ -6,7 +6,9 @@ from .accounts import create_user
 from .config import Config
 from .db import connect, migrate
 from .jobs import (
+    CRASHED_ERROR,
     HISTORY,
+    MAX_ATTEMPTS,
     OWNER_PRIORITY,
     TESTER_PRIORITY,
     Busy,
@@ -238,3 +240,33 @@ def test_shows_only_the_most_recent_jobs(cfg, people):
             finish(connection, job.id, state="done")
 
         assert len(recent(connection, tester.id)) == HISTORY
+
+
+def test_gives_up_on_a_job_that_took_the_worker_down_three_times(cfg, people):
+    """Um capitulo que estoura a memoria mata o worker; o Docker o reinicia e o job
+    voltava para a fila para matar de novo, com a fila inteira parada atras dele."""
+    _, first, second = people
+    with connect(cfg) as connection:
+        crashing = _queue(connection, first)
+        waiting = _queue(connection, second)
+
+        for _ in range(MAX_ATTEMPTS):
+            assert claim_next(connection).id == crashing.id
+            requeue_running(connection)
+
+        dead = get_any(connection, crashing.id)
+        assert dead.state == "failed"
+        assert dead.error == CRASHED_ERROR
+        assert dead.finished_at is not None
+        assert claim_next(connection).id == waiting.id
+
+
+def test_counts_each_claim_as_an_attempt(cfg, people):
+    _, tester, _ = people
+    with connect(cfg) as connection:
+        job = _queue(connection, tester)
+        claim_next(connection)
+        requeue_running(connection)
+        claim_next(connection)
+
+        assert get_any(connection, job.id).attempts == 2

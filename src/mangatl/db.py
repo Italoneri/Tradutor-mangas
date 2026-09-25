@@ -135,6 +135,17 @@ MIGRATIONS: tuple[str, ...] = (
 
     CREATE INDEX jobs_queue ON jobs (state, priority, created_at);
     """,
+    # 4 - job que derruba o worker desiste, e testador novo tem limite por IP
+    """
+    ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+
+    CREATE TABLE tester_signups (
+        ip_hash TEXT NOT NULL,
+        at      TEXT NOT NULL
+    );
+
+    CREATE INDEX tester_signups_ip_hash ON tester_signups (ip_hash, at);
+    """,
 )
 """Scripts aplicados em ordem, uma vez cada.
 
