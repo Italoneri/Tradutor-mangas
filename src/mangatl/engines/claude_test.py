@@ -8,10 +8,10 @@ import cv2
 import numpy as np
 import pytest
 
-from ..config import Config
+from ..config import Config, ModelPricing
 from ..models import BBox, ExtractedBlock, ExtractedPage
 from .base import TranslationError
-from .claude import ChunkTranslation, ClaudeEngine
+from .claude import ChunkTranslation, ClaudeEngine, estimate_usd
 
 
 class FakeMessages:
@@ -254,3 +254,17 @@ def test_logs_token_usage_and_estimated_cost(cfg: Config, chapter_dir: Path, cap
 
     assert "input_tokens=20000" in caplog.text
     assert "output_tokens=4000" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("name", "pages", "expected"),
+    [
+        ("o capitulo medido do README", 40, 0.15),
+        ("capitulo vazio nao custa", 0, 0.0),
+        ("o de 155 fatias", 155, 0.58),
+    ],
+)
+def test_estimates_the_cost_from_the_measured_average(name: str, pages: int, expected: float):
+    sonnet = ModelPricing(input=2.0, output=10.0, cache_read=0.2)
+
+    assert estimate_usd(sonnet, pages) == pytest.approx(expected, abs=0.01), name

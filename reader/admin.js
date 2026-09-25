@@ -435,6 +435,7 @@ async function uploadStaged() {
 
 function openJob(chapter) {
   state.chapter = chapter;
+  disarmCost();
   el.jobCard.hidden = false;
   el.jobTarget.textContent = `${state.selected} · capítulo ${chapter}`;
   el.jobView.hidden = true;
@@ -509,7 +510,34 @@ async function restoreJob() {
   if (LIVE_STATES.includes(job.state)) pollJob(job.id);
 }
 
+/** O custo estimado de um job `claude`, pedido antes do clique que enfileira.
+ *
+ * O primeiro clique em "Traduzir" com `claude` so mostra o numero e troca o
+ * texto do botao; o segundo confirma. Trocar de motor ou de capitulo desarma.
+ */
+async function confirmCost() {
+  if (el.jobEngine.value !== "claude") return true;
+  const key = `${state.selected}/${state.chapter}`;
+  if (el.jobStart.dataset.confirmed === key) return true;
+
+  const path = `${seriesPath(state.selected)}/chapters/${encodeURIComponent(state.chapter)}/estimate/claude`;
+  const estimate = await api(path);
+  const cost = estimate.usd === null ? "custo desconhecido (modelo sem preço no config.toml)" : `~US$ ${estimate.usd.toFixed(2)}`;
+  el.engineNote.hidden = false;
+  el.engineNote.textContent = `Estimativa: ${estimate.pages} páginas com ${estimate.model}, ${cost}. É estimativa: captura alta vira mais páginas ao fatiar.`;
+  el.jobStart.dataset.confirmed = key;
+  el.jobStart.textContent = `Confirmar (${cost})`;
+  return false;
+}
+
+function disarmCost() {
+  delete el.jobStart.dataset.confirmed;
+  el.jobStart.textContent = "Traduzir";
+}
+
 async function startJob() {
+  if (!(await confirmCost())) return;
+  disarmCost();
   const job = await api("/jobs", {
     method: "POST",
     body: {
@@ -661,6 +689,7 @@ function wire() {
     event.preventDefault();
     guard(startJob);
   };
+  el.jobEngine.onchange = disarmCost;
 
   el.loginForm.onsubmit = signIn;
   el.signOut.onclick = () => guard(signOut);

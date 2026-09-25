@@ -1137,3 +1137,31 @@ def test_refuses_to_retranslate_a_page_of_a_chapter_never_translated(
 
     assert status == 422
     assert b"inteiro" in body
+
+
+@pytest.mark.parametrize(
+    ("name", "engine", "usd"),
+    [
+        # O `Config` do teste nao tem `[pricing]`: sem preco, a tela diz que nao
+        # sabe em vez de inventar. A conta com preco esta em `claude_test.py`.
+        ("claude sem preco no config responde que nao sabe", "claude", None),
+        ("free nunca custa", "free", 0.0),
+    ],
+)
+def test_estimates_a_job_before_it_is_queued(
+    panel_server: Client, tmp_path: Path, name: str, engine: str, usd: float | None
+):
+    translated_chapter(tmp_path)
+
+    status, body = panel_server.get(f"/api/series/Obra/chapters/001/estimate/{engine}")
+    payload = json.loads(body)
+
+    assert status == 200
+    assert payload["pages"] == 2
+    assert payload["usd"] == usd, name
+
+
+def test_answers_404_for_estimating_a_chapter_that_is_not_there(panel_server: Client):
+    series_with(panel_server)
+
+    assert panel_server.get("/api/series/Obra/chapters/404/estimate/claude")[0] == 404

@@ -1207,6 +1207,32 @@ def _with_edited_block(
     return stored.model_copy(update={"pages": pages})
 
 
+def _estimate(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Quanto um job deste motor neste capitulo deve custar, antes de enfileirar.
+
+    So `claude` custa; o `free` responde zero para a tela nao precisar de dois
+    caminhos. O motor vem no caminho, e nao na query, porque o roteador casa o
+    caminho sem ela.
+    """
+    series, chapter, engine = groups
+    if engine not in available_engines():
+        raise Invalid(f"motor {engine!r} nao existe; ha {', '.join(available_engines())}")
+    directory, _ = _chapter_paths(ctx.cfg, series, chapter)
+    if not directory.is_dir():
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+
+    pages = len(list_page_images(directory))
+    if engine != "claude":
+        return HTTPStatus.OK, {"engine": engine, "pages": pages, "usd": 0.0, "model": None}
+
+    from .engines.claude import estimate_usd
+
+    model = ctx.cfg.translation.model
+    pricing = ctx.cfg.pricing_for(model)
+    usd = None if pricing is None else estimate_usd(pricing, pages)
+    return HTTPStatus.OK, {"engine": engine, "pages": pages, "usd": usd, "model": model}
+
+
 def _job_payload(ctx: Context, job) -> dict:  # noqa: ANN001 - `Job` importado tardiamente
     """O job como a tela o ve, com o lugar na fila quando ainda espera.
 
@@ -1436,6 +1462,11 @@ ROUTES: tuple[Route, ...] = (
         writes=True,
         body_required=True,
         user_locked=True,
+    ),
+    Route(
+        "GET",
+        re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/estimate/{_SLUG}$"),
+        _estimate,
     ),
     Route("GET", re.compile(r"^/api/jobs$"), _list_jobs),
     Route("POST", re.compile(r"^/api/jobs$"), _create_job, writes=True, body_required=True),
