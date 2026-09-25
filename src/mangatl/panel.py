@@ -39,10 +39,11 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import traceback
 import zipfile
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from http import HTTPStatus
 from pathlib import Path, PurePosixPath
 from typing import IO, Literal, NamedTuple
@@ -463,6 +464,13 @@ class Route(NamedTuple):
     recebe b"" e recusa com 422 pela propria validacao, em vez de aceitar lixo.
     """
 
+    quota_locked: bool = False
+    """Se conferir a cota e gravar precisam ser indivisiveis para este usuario.
+
+    O servidor e uma thread por conexao, e "conferir e gravar" nao e atomico: dez
+    `PUT` simultaneos passavam todos pela conferencia antes de qualquer um gravar,
+    e a area terminava acima da cota. Marcada so nas rotas que ocupam disco."""
+
     stream: bool = False
     """Se o corpo desce para um arquivo em vez de virar `bytes`.
 
@@ -728,7 +736,10 @@ def _page_limit(user: User) -> int:
 
 
 def extract_archive(
-    data: bytes | Path, target: Path, limit: int = MAX_PAGES_PER_CHAPTER
+    data: bytes | Path,
+    target: Path,
+    limit: int = MAX_PAGES_PER_CHAPTER,
+    byte_ceiling: int | None = None,
 ) -> list[str]:
     """Grava as paginas do zip na area de espera, uma entrada por vez.
 
@@ -740,6 +751,11 @@ def extract_archive(
     O teto do descompactado e conferido duas vezes de proposito: o `file_size`
     declarado antes de abrir, porque um zip de 1MB pode dizer 100GB, e os bytes
     realmente escritos durante a copia, porque quem escreve o declarado e o zip.
+
+    `byte_ceiling` e a folga da cota de quem sobe. O zip de 40MB que cabia na cota
+    podia ocupar gigabytes depois de aberto, porque so o compactado era conferido.
+    Passar dela e `QuotaExceeded`, e nao `Invalid`: o arquivo e legitimo, quem nao
+    tem espaco e a sessao.
     """
     # `zipfile` so precisa de algo que leia e posicione, e um arquivo aberto serve
     # tao bem quanto um buffer - com a diferenca de que o zip de 160MB fica no disco
@@ -748,7 +764,7 @@ def extract_archive(
         if not zipfile.is_zipfile(buffer):
             raise Invalid("o corpo nao e um zip; .cbz tambem e zip, o nome nao decide")
         buffer.seek(0)
-        return _extract_from(buffer, target, limit)
+        return _extract_from(buffer, target, limit, byte_ceiling)
 
 
 @contextmanager
@@ -760,7 +776,26 @@ def _archive_source(data: bytes | Path) -> Iterator[IO[bytes]]:
     yield io.BytesIO(data)
 
 
-def _extract_from(buffer: IO[bytes], target: Path, limit: int) -> list[str]:
+MAGIC_PREFIX_BYTES = 16
+"""O suficiente para `image_suffix` reconhecer todos os formatos, webp incluso."""
+
+
+def _refuse_expansion(total: int, byte_ceiling: int | None) -> None:
+    """Levanta se `total` passou do teto que vale para esta extracao."""
+    if byte_ceiling is not None and byte_ceiling < MAX_ARCHIVE_EXPANDED_BYTES:
+        if total > byte_ceiling:
+            raise QuotaExceeded(
+                f"o arquivo descompactado passa de {byte_ceiling // (1024 * 1024)}MB,"
+                " que e o que esta sessao ainda aceita."
+            )
+        return
+    if total > MAX_ARCHIVE_EXPANDED_BYTES:
+        raise Invalid(f"o descompactado passa do teto de {MAX_ARCHIVE_EXPANDED_BYTES} bytes")
+
+
+def _extract_from(
+    buffer: IO[bytes], target: Path, limit: int, byte_ceiling: int | None = None
+) -> list[str]:
     with zipfile.ZipFile(buffer) as archive:
         infos = archive.infolist()
         entries = safe_archive_entries([info.filename for info in infos])
@@ -769,7 +804,11 @@ def _extract_from(buffer: IO[bytes], target: Path, limit: int) -> list[str]:
         if not entries:
             raise Invalid("o arquivo nao tem nenhuma imagem")
         if len(entries) > limit:
-            raise Invalid(f"{len(entries)} paginas; o teto e {limit}")
+            raise Invalid(f"{len(entries)} paginas; este capitulo aceita mais {max(limit, 0)}")
+
+        oversized = [name for index, name in entries if infos[index].file_size > MAX_PAGE_BYTES]
+        if oversized:
+            raise Invalid(f"{oversized[0]!r} passa de {MAX_PAGE_BYTES} bytes, o teto de uma pagina")
 
         names = [name for _, name in entries]
         if len(set(names)) != len(names):
@@ -777,20 +816,22 @@ def _extract_from(buffer: IO[bytes], target: Path, limit: int) -> list[str]:
             # faria uma apagar a outra, e o capitulo perderia pagina em silencio.
             raise Invalid("duas entradas do arquivo tem o mesmo nome de pagina")
 
-        declared = sum(infos[index].file_size for index, _ in entries)
-        if declared > MAX_ARCHIVE_EXPANDED_BYTES:
-            raise Invalid(
-                f"o arquivo declara {declared} bytes descompactados;"
-                f" o teto e {MAX_ARCHIVE_EXPANDED_BYTES}"
-            )
+        _refuse_expansion(sum(infos[index].file_size for index, _ in entries), byte_ceiling)
+
+        # Os bytes magicos de todas antes de gravar qualquer uma: uma entrada que
+        # nao e imagem com nome de `.jpg` condena o arquivo pelo mesmo raciocinio do
+        # caminho de fuga, e recusar no meio deixaria meio capitulo escrito.
+        for index, name in entries:
+            with archive.open(infos[index]) as source:
+                if image_suffix(source.read(MAGIC_PREFIX_BYTES)) is None:
+                    raise Invalid(f"{name!r} nao e jpeg, png, webp nem bmp; nada foi extraido")
 
         written = 0
         for index, name in entries:
             with archive.open(infos[index]) as source, (target / name).open("wb") as sink:
                 while chunk := source.read(64 * 1024):
                     written += len(chunk)
-                    if written > MAX_ARCHIVE_EXPANDED_BYTES:
-                        raise Invalid("o descompactado passou do teto no meio da extracao")
+                    _refuse_expansion(written, byte_ceiling)
                     sink.write(chunk)
 
     return sorted(names, key=_natural_key)
@@ -879,13 +920,19 @@ def _put_archive(ctx: Context, groups: tuple[str, ...], body: Body) -> tuple[int
 
     size = body.stat().st_size if isinstance(body, Path) else len(body)
 
-    # O zip comprime, entao o corpo nao diz quanto vai ocupar; o que o teto de
-    # paginas garante e que o descompactado tambem cabe.
     check_upload_bytes(ctx.cfg, ctx.user, size)
     check_disk(ctx.base, size)
 
+    # O zip comprime, entao o corpo nao diz quanto vai ocupar: a folga da cota vira
+    # teto do descompactado, e o teto de paginas conta o que ja esta na espera.
+    already = len(_incoming_files(incoming))
     try:
-        names = extract_archive(body, incoming, limit=_page_limit(ctx.user))
+        names = extract_archive(
+            body,
+            incoming,
+            limit=_page_limit(ctx.user) - already,
+            byte_ceiling=upload_headroom(ctx.cfg, ctx.user),
+        )
     except Exception:
         shutil.rmtree(incoming, ignore_errors=True)
         raise
@@ -1170,7 +1217,13 @@ ROUTES: tuple[Route, ...] = (
         writes=True,
         body_required=True,
     ),
-    Route("POST", re.compile(rf"^/api/series/{_SLUG}/chapters$"), _create_chapter, writes=True),
+    Route(
+        "POST",
+        re.compile(rf"^/api/series/{_SLUG}/chapters$"),
+        _create_chapter,
+        writes=True,
+        quota_locked=True,
+    ),
     Route(
         "PUT",
         re.compile(rf"^/api/series/{_SLUG}/chapters/{_SLUG}/files/{_SLUG}$"),
@@ -1178,6 +1231,7 @@ ROUTES: tuple[Route, ...] = (
         MAX_PAGE_BYTES,
         writes=True,
         body_required=True,
+        quota_locked=True,
     ),
     Route(
         "POST",
@@ -1187,6 +1241,7 @@ ROUTES: tuple[Route, ...] = (
         writes=True,
         body_required=True,
         stream=True,
+        quota_locked=True,
     ),
     Route(
         "POST",
@@ -1281,6 +1336,29 @@ def _internal_redirect(cfg: Config, path: Path) -> str | None:
     return f"{prefix.rstrip('/')}/{relative.as_posix()}"
 
 
+class UserLocks:
+    """Uma trava por usuario, para conferir a cota e gravar sem outra thread no meio.
+
+    Por usuario e nao global: o upload de um testador nao espera o do outro, que
+    nao disputa a mesma cota. Vive dentro de um handler, e nao no modulo: estado
+    vivo em variavel de modulo vaza entre dois servidores na mesma sessao de teste.
+
+    O dicionario ganha um item por usuario que subiu algo neste processo. Sao
+    dezenas de bytes por testador, e o processo reinicia a cada deploy.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._locks: dict[str, threading.Lock] = {}
+
+    @contextmanager
+    def hold(self, user_id: str) -> Iterator[None]:
+        with self._guard:
+            lock = self._locks.setdefault(user_id, threading.Lock())
+        with lock:
+            yield
+
+
 def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
     """Handler que serve o leitor e, para a propria maquina, tambem o painel.
 
@@ -1290,6 +1368,8 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
     Nao ha registro de jobs aqui: a fila mora no banco e quem a roda e o
     `mangatl worker`, noutro processo. Este handler so enfileira e le.
     """
+
+    user_locks = UserLocks()
 
     class PanelHandler(ReaderHandler):
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -1523,8 +1603,10 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
             ocupa o mesmo disco que um que passa, e so o caminho de sucesso limpar
             transformaria cada erro em lixo permanente.
             """
+            locked = route.quota_locked and context.user is not None
             try:
-                return route.handler(context, groups, body)
+                with user_locks.hold(context.user.id) if locked else nullcontext():
+                    return route.handler(context, groups, body)
             finally:
                 if isinstance(body, Path):
                     body.unlink(missing_ok=True)

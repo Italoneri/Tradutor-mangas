@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 import threading
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -222,3 +224,94 @@ def test_keeps_one_tester_out_of_another_testers_quota(server: Client):
     )
 
     assert status == 201
+
+
+# ---------- 7.3 a cota vale para o zip aberto e para uploads em paralelo ----------
+
+
+def _zip(entries: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data in entries.items():
+            archive.writestr(name, data)
+    return buffer.getvalue()
+
+
+def _tester_with_chapter(server: Client) -> Client:
+    tester = _tester_with_series(server)
+    status, _ = tester.send(
+        "POST", "/api/series/Minha/chapters", json.dumps({"chapter": "001"}).encode()
+    )
+    assert status == 201
+    return tester
+
+
+def _tester_area(tmp_path: Path) -> Path:
+    users = [
+        entry for entry in (tmp_path / "data" / "users").iterdir() if (entry / "library").is_dir()
+    ]
+    assert len(users) == 1
+    return users[0]
+
+
+def test_refuses_an_archive_that_grows_past_the_quota_when_opened(server: Client, tmp_path: Path):
+    """Zeros comprimem quase a nada: o zip cabe folgado nos 40MB, e aberto passa."""
+    tester = _tester_with_chapter(server)
+    page = bytes.fromhex("ffd8ffe0") + b"\0" * (5 * 1024 * 1024)
+    archive = _zip({f"p{n:02d}.jpg": page for n in range(10)})
+    assert len(archive) < TESTER_MAX_UPLOAD_BYTES // 10
+
+    status, body = tester.send("POST", "/api/series/Minha/chapters/001/archive", archive)
+
+    assert status == 429, body
+    assert not (_tester_area(tmp_path) / "library" / "Minha" / "001.incoming").exists()
+
+
+def test_refuses_an_archive_with_a_disguised_page(server: Client, tmp_path: Path):
+    tester = _tester_with_chapter(server)
+    archive = _zip({"1.jpg": JPEG, "2.jpg": b"MZ\x90\x00" + b"\0" * 64})
+
+    status, body = tester.send("POST", "/api/series/Minha/chapters/001/archive", archive)
+
+    assert status == 422
+    assert b"2.jpg" in body
+    assert not (_tester_area(tmp_path) / "library" / "Minha" / "001.incoming").exists()
+
+
+def test_counts_the_pages_already_waiting_against_the_archive(server: Client):
+    tester = _tester_with_chapter(server)
+    for number in range(TESTER_MAX_PAGES_PER_CHAPTER - 1):
+        tester.send("PUT", f"/api/series/Minha/chapters/001/files/p{number:04d}.jpg", JPEG)
+
+    archive = _zip({"z1.jpg": JPEG, "z2.jpg": JPEG})
+    status, _ = tester.send("POST", "/api/series/Minha/chapters/001/archive", archive)
+
+    assert status == 422
+
+
+def test_keeps_the_area_inside_the_quota_under_parallel_uploads(server: Client, tmp_path: Path):
+    """Dez `PUT` ao mesmo tempo passavam todos pela conferencia antes de gravar."""
+    tester = _tester_with_chapter(server)
+    page = bytes.fromhex("ffd8ffe0") + b"1" * (5 * 1024 * 1024)
+    barrier = threading.Barrier(10)
+    codes: list[int] = []
+
+    def upload(number: int) -> None:
+        client = Client(server.port)
+        client.cookie = tester.cookie
+        barrier.wait()
+        codes.append(
+            client.send("PUT", f"/api/series/Minha/chapters/001/files/p{number:02d}.jpg", page)[0]
+        )
+
+    threads = [threading.Thread(target=upload, args=(n,)) for n in range(10)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert sorted(set(codes)) == [200, 429]
+    used = sum(
+        path.stat().st_size for path in _tester_area(tmp_path).rglob("*") if path.is_file()
+    )
+    assert used <= TESTER_MAX_UPLOAD_BYTES

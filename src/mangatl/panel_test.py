@@ -731,9 +731,9 @@ def test_never_holds_the_whole_archive_in_memory(panel_server: Client, tmp_path:
     received: list[object] = []
     original = panel.extract_archive
 
-    def spy(data, target, limit=panel.MAX_PAGES_PER_CHAPTER):
+    def spy(data, target, limit=panel.MAX_PAGES_PER_CHAPTER, byte_ceiling=None):
         received.append(data)
-        return original(data, target, limit)
+        return original(data, target, limit, byte_ceiling)
 
     slug = series_with(panel_server)
     stage(panel_server, slug, "001")
