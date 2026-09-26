@@ -56,6 +56,15 @@ def is_servable(request_path: str) -> bool:
     return segments[0] in SERVABLE_ROOTS
 
 
+def is_showcase_path(request_path: str) -> bool:
+    """Se o caminho cai em `public/demo/`, a vitrine que so sai com a flag ligada.
+
+    `casefold` porque o NTFS acha `Demo` e `demo` iguais, e a flag nao pode
+    depender de o servidor rodar em Linux.
+    """
+    return [segment.casefold() for segment in _segments(request_path)[:2]] == ["public", "demo"]
+
+
 class ReaderHandler(http.server.SimpleHTTPRequestHandler):
     """SimpleHTTPRequestHandler com `is_servable` na frente.
 

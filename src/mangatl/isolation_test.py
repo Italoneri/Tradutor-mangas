@@ -309,6 +309,31 @@ def test_opens_a_tester_session_only_when_the_showcase_is_public(
     assert (anonymous.cookie is not None) == bool(users_created)
 
 
+@pytest.mark.parametrize(
+    ("showcase", "path", "status"),
+    [
+        ("0", "/public/demo/demo-library.json", 404),
+        ("0", "/public/%64emo/demo-library.json", 404),
+        ("0", "/public/Demo/demo-library.json", 404),
+        ("1", "/public/demo/demo-library.json", 200),
+    ],
+)
+def test_serves_the_showcase_files_only_when_the_showcase_is_public(
+    server: Client, tmp_path: Path, monkeypatch, showcase: str, path: str, status: int
+):
+    """A flag escondia a vitrine da tela e deixava os arquivos saindo por URL: um
+    `public/demo/` gerado na maquina do dono viaja dentro da imagem, e o indice dele
+    lista a obra para quem pedir o caminho direto."""
+    demo = tmp_path / "public" / "demo"
+    demo.mkdir(parents=True)
+    (demo / "demo-library.json").write_text('{"series": []}', encoding="utf-8")
+    monkeypatch.setenv("PUBLIC_SHOWCASE", showcase)
+
+    got, _ = Client(server.port).get(path)
+
+    assert got == status
+
+
 # ---------- 7.7 apagar alcanca so a propria area ----------
 
 

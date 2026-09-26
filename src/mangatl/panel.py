@@ -87,7 +87,7 @@ from .quotas import (
     record_usage,
     upload_headroom,
 )
-from .serving import ReaderHandler, serve_handler
+from .serving import ReaderHandler, is_showcase_path, serve_handler
 from .sessions import (
     REQUESTED_WITH,
     Session,
@@ -1717,6 +1717,14 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
         def do_GET(self) -> None:  # noqa: N802 - assinatura herdada da stdlib
             if not self._serve_api("GET"):
                 super().do_GET()
+
+        def send_head(self):  # noqa: ANN201 - assinatura herdada da stdlib
+            # A flag nao so esconde a vitrine da tela: um `public/demo/` gerado na
+            # maquina do dono viaja dentro da imagem, e sairia por URL direta.
+            if is_showcase_path(self.path) and not showcase_is_public():
+                self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+                return None
+            return super().send_head()
 
         def do_POST(self) -> None:  # noqa: N802 - assinatura herdada da stdlib
             self._serve_api("POST")
