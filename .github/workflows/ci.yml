@@ -51,5 +51,7 @@ jobs:
         with:
           node-version: "22"
 
-      - name: overlay
-        run: node --test reader/overlay.test.js
+      # Todo `*.test.js` do leitor: o overlay e a regra da CSP (`csp.test.js`),
+      # que pega estilo inline que so quebra atras do Caddy.
+      - name: leitor
+        run: node --test reader/*.test.js

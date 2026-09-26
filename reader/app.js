@@ -332,6 +332,7 @@ function renderChapter(library, chapterData, entry, engine, { editable = false }
     orphansHtml(chapterData.pages) +
     chapterEndHtml(chapter, seriesHref(series), nextHref, editable ? exportLinks(series, chapter, engine) : "");
 
+  applyBubbleGeometry(el.main);
   fitOnScroll();
   if (editable) {
     enableEditing(el.main.querySelector(".strip"), { series, chapter, engine }, fitSlice);
@@ -357,16 +358,35 @@ function bubbleHtml(block, page) {
     sourceFontPx: block.source_font_px,
   });
 
-  const box =
-    `left:${round(rect.left)}%;top:${round(rect.top)}%;width:${round(rect.width)}%` +
-    `;--h:${round(rect.height)}%;--limit:${round(rect.limit)}%;--min-w:${round(rect.minWidth)}%`;
+  // A geometria vai em `data-*`, e nao num `style="..."`: a CSP do Caddyfile
+  // (`style-src 'self'`) recusa atributo de estilo escrito no HTML, e com ele
+  // recusado todo balao caia no canto de baixo da fatia - so em producao, porque
+  // sem o proxy nao ha CSP. `applyBubbleGeometry` passa os valores pelo CSSOM,
+  // que a CSP nao bloqueia.
+  const geometry =
+    `data-left="${round(rect.left)}" data-top="${round(rect.top)}" data-width="${round(rect.width)}"` +
+    ` data-h="${round(rect.height)}" data-limit="${round(rect.limit)}" data-min-w="${round(rect.minWidth)}"`;
 
   // `data-size` guarda o tamanho pedido e `--size` o que foi aplicado. Sem separar
   // os dois, refazer o ajuste partiria do valor ja encolhido e so encolheria mais.
   // `data-page` e `data-block` sao o endereco da fala para a correcao a mao.
   const address = `data-page="${Number(page.index)}" data-block="${escapeHtml(block.id)}"${block.edited ? ' data-edited="true"' : ""}`;
-  return `<span class="bubble" style="${box};--size:${round(size)}" data-size="${round(size)}" ${address} title="${escapeHtml(block.source_text)}"
+  return `<span class="bubble" ${geometry} data-size="${round(size)}" ${address} title="${escapeHtml(block.source_text)}"
       ><span class="t">${escapeHtml(block.text)}</span></span>`;
+}
+
+/** Aplica pelo CSSOM a geometria que `bubbleHtml` deixou em `data-*`. */
+function applyBubbleGeometry(root) {
+  for (const bubble of root.querySelectorAll(".bubble")) {
+    const { left, top, width, h, limit, minW, size } = bubble.dataset;
+    bubble.style.left = `${left}%`;
+    bubble.style.top = `${top}%`;
+    bubble.style.width = `${width}%`;
+    bubble.style.setProperty("--h", `${h}%`);
+    bubble.style.setProperty("--limit", `${limit}%`);
+    bubble.style.setProperty("--min-w", `${minW}%`);
+    bubble.style.setProperty("--size", size);
+  }
 }
 
 /* Fatia sem margem nem moldura. A fronteira entre fatias e detalhe do

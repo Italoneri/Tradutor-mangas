@@ -338,7 +338,16 @@ function humanBytes(total) {
   return `${(total / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/* Uma URL por arquivo, criada na primeira vez. `renderStaged` roda a cada pagina
+   enviada, e criar uma URL nova em cada chamada deixava centenas delas vivas num
+   capitulo longo. A CSP do Caddyfile libera `blob:` em `img-src` por causa disto. */
+function previewUrl(item) {
+  item.preview ??= URL.createObjectURL(item.file);
+  return item.preview;
+}
+
 function stageFiles(files) {
+  for (const item of state.staged) if (item.preview) URL.revokeObjectURL(item.preview);
   // Ordenado aqui e nao na chegada: o navegador nao garante a ordem em que
   // entrega os arquivos arrastados, e a ordem que vale e a do nome.
   state.staged = [...files]
@@ -354,7 +363,7 @@ function renderStaged() {
   el.fileList.innerHTML = items
     .map((item) => {
       const thumb = item.file.type.startsWith("image/")
-        ? `<img src="${URL.createObjectURL(item.file)}" alt="" loading="lazy">`
+        ? `<img src="${previewUrl(item)}" alt="" loading="lazy">`
         : `<span class="cover-empty" aria-hidden="true">zip</span>`;
       const note = item.error ? `<span class="tag tag-warn">${escapeHtml(item.error)}</span>` : "";
 
