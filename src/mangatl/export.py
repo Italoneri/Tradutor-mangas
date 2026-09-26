@@ -16,6 +16,7 @@ decodificadas sao ~900MB, e o `app` tem 1GB.
 
 from __future__ import annotations
 
+import io
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -167,13 +168,76 @@ def write_cbz(chapter: Chapter, pages_dir: Path, target: Path) -> Path:
     return target
 
 
+PDF_DPI = 150
+"""Resolucao declarada da pagina: define o tamanho em pontos, e nao os pixels."""
+
+
 def write_pdf(chapter: Chapter, pages_dir: Path, target: Path) -> Path:
-    """Um PDF de uma pagina por fatia. O gerador segura uma imagem por vez."""
-    rendered = _rendered(chapter, pages_dir)
-    first = next(rendered, None)
-    if first is None:
-        raise ValueError("capitulo sem pagina nenhuma para exportar")
-    first.save(target, "PDF", save_all=True, append_images=rendered, resolution=150)
+    """Um PDF de uma pagina por fatia, gravado enquanto as paginas sao pintadas.
+
+    Nao usa o `save_all` do Pillow: ele junta todas as `append_images` numa lista
+    antes de escrever a primeira, e o gerador daqui virava o capitulo inteiro
+    decodificado na memoria - medido, 155 fatias de 800x2400 passavam de 1,1GB,
+    acima do `mem_limit` de 1GB do `app`, e o servidor inteiro caia por OOM.
+
+    Cada pagina entra como JPEG cru (`DCTDecode`), que o PDF aceita sem
+    reencodar. Os objetos saem na ordem em que ficam prontos; so a arvore de
+    paginas e o catalogo esperam o fim, porque precisam da lista inteira.
+    """
+    offsets: list[int] = []
+    page_ids: list[int] = []
+    # 1 e o catalogo e 2 a arvore de paginas, escritos no fim; o resto vem daqui.
+    next_id = 3
+
+    with target.open("wb") as sink:
+        sink.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+
+        def put(object_id: int, body: bytes) -> None:
+            while len(offsets) < object_id:
+                offsets.append(0)
+            offsets[object_id - 1] = sink.tell()
+            sink.write(b"%d 0 obj\n" % object_id + body + b"\nendobj\n")
+
+        for image in _rendered(chapter, pages_dir):
+            with image:
+                width, height = image.size
+                buffer = io.BytesIO()
+                image.save(buffer, "JPEG", quality=JPEG_QUALITY)
+            jpeg = buffer.getvalue()
+            points_w, points_h = width * 72 / PDF_DPI, height * 72 / PDF_DPI
+
+            image_id, content_id, page_id = next_id, next_id + 1, next_id + 2
+            next_id += 3
+            put(
+                image_id,
+                b"<< /Type /XObject /Subtype /Image /Width %d /Height %d"
+                b" /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode"
+                b" /Length %d >>\nstream\n" % (width, height, len(jpeg))
+                + jpeg
+                + b"\nendstream",
+            )
+            drawing = b"q %.2f 0 0 %.2f 0 0 cm /Im0 Do Q" % (points_w, points_h)
+            put(content_id, b"<< /Length %d >>\nstream\n" % len(drawing) + drawing + b"\nendstream")
+            put(
+                page_id,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %.2f %.2f]"
+                b" /Resources << /XObject << /Im0 %d 0 R >> >> /Contents %d 0 R >>"
+                % (points_w, points_h, image_id, content_id),
+            )
+            page_ids.append(page_id)
+
+        if not page_ids:
+            raise ValueError("capitulo sem pagina nenhuma para exportar")
+
+        kids = b" ".join(b"%d 0 R" % page_id for page_id in page_ids)
+        put(2, b"<< /Type /Pages /Kids [" + kids + b"] /Count %d >>" % len(page_ids))
+        put(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+
+        xref = sink.tell()
+        sink.write(b"xref\n0 %d\n0000000000 65535 f \n" % (len(offsets) + 1))
+        for offset in offsets:
+            sink.write(b"%010d 00000 n \n" % offset)
+        sink.write(b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(offsets) + 1, xref))
     return target
 
 

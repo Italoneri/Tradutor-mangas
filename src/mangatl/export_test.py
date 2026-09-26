@@ -79,3 +79,46 @@ def test_writes_one_pdf_page_per_page(pages_dir: Path, tmp_path: Path):
     assert data.startswith(b"%PDF")
     # `/Type /Page` sem o `s` de `/Pages`, que e o no raiz da arvore de paginas.
     assert len(re.findall(rb"/Type\s*/Page(?!s)", data)) == 2
+
+
+def test_pdf_pages_open_with_the_rendered_size(pages_dir: Path, tmp_path: Path):
+    """O PDF e escrito a mao; o parser do Pillow confere que a estrutura fecha."""
+    from PIL import PdfParser
+
+    target = write_pdf(_chapter(_page(1, "p1.jpg"), _page(2, "p2.jpg")), pages_dir, tmp_path / "c.pdf")
+
+    parsed = PdfParser.PdfParser(str(target))
+    try:
+        assert len(parsed.pages) == 2
+        box = parsed.read_indirect(parsed.pages[0])[b"MediaBox"]
+        assert [round(value) for value in box] == [0, 0, round(WIDTH * 72 / 150), round(HEIGHT * 72 / 150)]
+    finally:
+        parsed.close()
+
+
+def test_pdf_writes_each_page_before_painting_the_next(
+    pages_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Uma pagina decodificada por vez, e nao o capitulo inteiro.
+
+    O `save_all` do Pillow junta todas as paginas numa lista antes de escrever a
+    primeira: 155 fatias passavam de 1,1GB e derrubavam o `app`, que tem 1GB. Se a
+    pagina 1 ja esta no arquivo quando a 2 e pintada, a memoria nao cresce com o
+    tamanho do capitulo.
+    """
+    from . import export
+
+    target = tmp_path / "c.pdf"
+    painted = export._rendered
+    sizes_before_paint: list[int] = []
+
+    def watching(chapter: Chapter, directory: Path):
+        for image in painted(chapter, directory):
+            sizes_before_paint.append(target.stat().st_size if target.exists() else 0)
+            yield image
+
+    monkeypatch.setattr(export, "_rendered", watching)
+    write_pdf(_chapter(_page(1, "p1.jpg"), _page(2, "p2.jpg"), _page(3, "p1.jpg")), pages_dir, target)
+
+    assert sizes_before_paint[1] > sizes_before_paint[0] + 1000
+    assert sizes_before_paint[2] > sizes_before_paint[1] + 1000
