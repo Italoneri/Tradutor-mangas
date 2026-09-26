@@ -115,6 +115,23 @@ def check_new_chapter(cfg: Config, user: User) -> None:
         )
 
 
+TESTER_MAX_SERIES = TESTER_MAX_CHAPTERS
+"""Uma serie por capitulo possivel. Serie vazia nao ocupa quase nada em bytes, mas
+sem teto um laco de `POST /api/series` criava pastas sem fim dentro da cota de
+40MB - e o teto de disco conta bytes, nao pastas."""
+
+
+def check_new_series(cfg: Config, user: User) -> None:
+    if user.is_owner:
+        return
+    existing = [entry for entry in cfg.library_dir.iterdir() if entry.is_dir()] if cfg.library_dir.is_dir() else []
+    if len(existing) >= TESTER_MAX_SERIES:
+        raise QuotaExceeded(
+            f"esta sessao ja tem {len(existing)} obra(s); o teste vai ate {TESTER_MAX_SERIES}."
+            " Use uma das que ja existem."
+        )
+
+
 def check_incoming_pages(cfg: Config, user: User, incoming: Path, adding: int = 1) -> None:
     """Se cabem mais `adding` paginas na area de espera deste capitulo."""
     if user.is_owner:

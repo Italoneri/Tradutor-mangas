@@ -911,6 +911,67 @@ todo dia, em ordem de valor.
 
 ---
 
+## FASE 9 — Segunda revisão, 25/09/2026
+
+Mesmo padrão da Fase 7: nada disto aparecia no `pytest`. Os dois primeiros só
+existem com a instância montada de verdade — um depende da CSP que o Caddy põe, o
+outro do `mem_limit` do compose.
+
+### 9.1 A CSP do Caddyfile apagava a posição de todo balão
+
+`bubbleHtml` escrevia a geometria num `style="..."` dentro do HTML, e a CSP tem
+`style-src 'self'`, que recusa atributo de estilo inline. Atrás do Caddy todo
+balão caía no canto de baixo da fatia, e `fitSlice` lia `--limit` vazio, então a
+fonte também nunca encolhia. Sem o proxy não há CSP, e por isso tudo funcionava
+no desenvolvimento. Conferido no Chromium, com e sem o cabeçalho.
+
+**Feito:** a geometria vai em `data-*` e `applyBubbleGeometry` aplica pelo CSSOM,
+que a CSP não bloqueia. `img-src` ganhou `blob:` para a prévia das páginas no
+painel, que tinha o mesmo problema. `reader/csp.test.js` falha se voltar a
+aparecer `style=` no HTML do leitor, e o CI agora roda todo `reader/*.test.js`.
+SW em v8.
+
+### 9.2 Exportar PDF derrubava o `app`
+
+`Image.save(save_all=True, append_images=gerador)` junta o gerador inteiro numa
+lista antes de escrever a primeira página. Medido com fatias de 800x2400: 80
+páginas, 635MB; 155 páginas, 1,18GB — acima do `mem_limit: 1g`, e quem cai é o
+servidor HTTP inteiro, não só o pedido.
+
+**Feito:** `write_pdf` escreve o PDF à mão, uma página por vez, com o JPEG cru
+(`DCTDecode`). Pico medido: 61MB para 155 e para 400 páginas. Teste confere que a
+página anterior já está no arquivo quando a próxima é pintada.
+
+### 9.3 O tempo do login entregava o e-mail do dono
+
+A mensagem era a mesma para e-mail errado e senha errada, mas o scrypt só rodava
+quando o e-mail existia: ~98ms contra ~0ms. **Feito:** sem dono, a senha é
+conferida contra um hash de mesmo custo.
+
+### 9.4 Testador criava séries sem limite
+
+`POST /api/series` não passava por cota nenhuma. Pasta vazia quase não tem
+bytes, então nem a cota de 40MB nem o teto de disco a seguravam. **Feito:**
+`check_new_series`, com o mesmo teto dos capítulos (2).
+
+### 9.5 Anotados na revisão, feitos depois
+
+- O comentário do `Caddyfile` dizia que `read_timeout`/`write_timeout` fecham
+  conexão lenta. Esses dois valem para a conexão do Caddy com o `app`, e não
+  para a do cliente com o Caddy. **Feito:** `timeouts` de `servers` nas opções
+  globais — `read_header 10s` (é ele que fecha slowloris), `read_body 30m`
+  (500MB a 2 Mbps leva ~33min; mais curto cortaria upload de quem ia terminar)
+  e `idle 2m`. Comentário do `transport` corrigido. `caddy validate` passa.
+- `mangatl backup` grava em `data/backups/`, no mesmo disco que ele copia, e fora
+  da conta do teto de disco. Serve contra erro humano, não contra perder o disco.
+  **Feito:** o README diz isso e aponta `--out` para outro volume; a CLI já
+  avisava no fim da cópia.
+- `.impeccable/hook.cache.json` estava versionado, com caminhos da máquina
+  Windows, e gerava commits sem conteúdo real. **Feito:** no `.gitignore` e fora
+  do índice.
+
+---
+
 ## 5. Fora de escopo (anote, não implemente)
 
 - Qualquer tela que liste o acervo de outro usuário. A vitrine da Fase 1.5 é a
@@ -973,3 +1034,8 @@ todo dia, em ordem de valor.
 - [x] 8.7 Exportar CBZ e PDF com a fala escrita na página
 - [x] 8.8 CI no GitHub Actions. Os testes de `rtdetr` e `argos` não precisaram de marcador: cobrem funções puras e rodam sem torch nem Argos instalados
 - [ ] 8.9 Inpainting em balão colorido — fora desta execução; medir com `scripts/report_overlay.py` antes
+- [x] 9.1 Balões posicionados pelo CSSOM; CSP do Caddyfile conferida no navegador e por `csp.test.js`
+- [x] 9.2 PDF escrito página a página; pico de 61MB medido
+- [x] 9.3 Login com o mesmo custo para e-mail inexistente
+- [x] 9.4 Teto de séries para o testador
+- [x] 9.5 Timeout de cliente no Caddy, backup fora do disco, hook cache no `.gitignore`

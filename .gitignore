@@ -8,3 +8,4 @@ library/
 data/
 public/demo/
 .claude/
+.impeccable/hook.cache.json
