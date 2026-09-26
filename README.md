@@ -606,7 +606,10 @@ cliente dublê, mas ainda não foi exercitado contra a API real — falta a chav
   estimativa e o segundo confirma;
 - **baixar CBZ ou PDF** com a tradução escrita na página, no fim do capítulo;
 - **`mangatl backup`:** banco pela API de backup do sqlite (copiar o arquivo com o
-  WAL aberto não é backup) e `tar.gz` de `data/users/`, em `data/backups/<hora>/`;
+  WAL aberto não é backup) e `tar.gz` de `data/users/`, em `data/backups/<hora>/`.
+  Essa pasta fica no mesmo disco que ela copia e fora da conta do teto de disco:
+  protege contra erro humano, não contra perder o disco. Copie para outro lugar
+  ou use `--out` apontando para outro volume;
 - **trocar a senha** no painel ou com `mangatl set-password`, e "sair de todos os
   aparelhos". Depois da troca, o `OWNER_PASSWORD` do `.env` deixa de valer.
 

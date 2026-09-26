@@ -954,18 +954,21 @@ conferida contra um hash de mesmo custo.
 bytes, então nem a cota de 40MB nem o teto de disco a seguravam. **Feito:**
 `check_new_series`, com o mesmo teto dos capítulos (2).
 
-### 9.5 Anotado, não feito
+### 9.5 Anotados na revisão, feitos depois
 
-- O comentário do `Caddyfile` diz que `read_timeout`/`write_timeout` fecham
+- O comentário do `Caddyfile` dizia que `read_timeout`/`write_timeout` fecham
   conexão lenta. Esses dois valem para a conexão do Caddy com o `app`, e não
-  para a do cliente com o Caddy. O que protege de slowloris do lado do cliente
-  são os `timeouts` de `servers` nas opções globais. Um `read_body` curto
-  cortaria upload de 500MB em rede lenta, então escolha o número antes de ligar.
+  para a do cliente com o Caddy. **Feito:** `timeouts` de `servers` nas opções
+  globais — `read_header 10s` (é ele que fecha slowloris), `read_body 30m`
+  (500MB a 2 Mbps leva ~33min; mais curto cortaria upload de quem ia terminar)
+  e `idle 2m`. Comentário do `transport` corrigido. `caddy validate` passa.
 - `mangatl backup` grava em `data/backups/`, no mesmo disco que ele copia, e fora
-  da conta do teto de disco. Serve contra erro humano, não contra perder o disco:
-  copie a pasta para outro lugar.
-- `.impeccable/hook.cache.json` está versionado, com caminhos da máquina Windows,
-  e gera commits sem conteúdo real. Vale pôr no `.gitignore`.
+  da conta do teto de disco. Serve contra erro humano, não contra perder o disco.
+  **Feito:** o README diz isso e aponta `--out` para outro volume; a CLI já
+  avisava no fim da cópia.
+- `.impeccable/hook.cache.json` estava versionado, com caminhos da máquina
+  Windows, e gerava commits sem conteúdo real. **Feito:** no `.gitignore` e fora
+  do índice.
 
 ---
 
