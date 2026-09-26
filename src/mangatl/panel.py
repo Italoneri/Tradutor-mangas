@@ -28,6 +28,7 @@ headless e quebra a cada mudanca de layout, entao a origem das imagens e upload.
 
 from __future__ import annotations
 
+import functools
 import io
 import ipaddress
 import json
@@ -35,6 +36,7 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import sys
@@ -79,6 +81,7 @@ from .quotas import (
     check_engine,
     check_incoming_pages,
     check_new_chapter,
+    check_new_series,
     check_upload_bytes,
     engines_for,
     record_usage,
@@ -93,6 +96,7 @@ from .sessions import (
     clearing_cookie_header,
     cookie_header,
     csrf_is_valid,
+    hash_password,
     hours_for,
     issue,
     login_is_throttled,
@@ -109,11 +113,9 @@ from .store import (
     COVER_STEM,
     IMAGE_SUFFIXES,
     INCOMING_SUFFIX,
-    LIBRARY_FILENAME,
     _natural_key,
     build_library,
     chapter_filename,
-    chapter_output_dir,
     discover_series,
     list_page_images,
     load_glossary,
@@ -613,8 +615,12 @@ def _login(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, obj
         }
 
     owner = find_owner(ctx.connection, email)
-    stored = password_hash_of(ctx.connection, owner.id) if owner else None
-    if owner is None or not verify_password(password, stored):
+    # O scrypt roda tambem quando o e-mail nao e do dono. Sem isto a resposta era
+    # igual e o tempo nao: ~100ms para o e-mail certo e zero para o errado, e o
+    # cronometro entregava o e-mail do dono que a mensagem unica existe para esconder.
+    stored = password_hash_of(ctx.connection, owner.id) if owner else _decoy_hash()
+    matches = verify_password(password, stored)
+    if owner is None or not matches:
         record_login_attempt(ctx.connection, subjects[0])
         record_login_attempt(ctx.connection, subjects[1])
         return HTTPStatus.UNAUTHORIZED, {"error": "e-mail ou senha nao conferem"}
@@ -627,6 +633,12 @@ def _login(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, obj
         token=token,
         hours=hours,
     )
+
+
+@functools.cache
+def _decoy_hash() -> str:
+    """Um hash com o mesmo custo do verdadeiro, para o login sem dono gastar igual."""
+    return hash_password(secrets.token_urlsafe(16))
 
 
 def _logout(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
@@ -716,6 +728,7 @@ def _create_series(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[
     if not isinstance(title, str):
         raise Invalid("title precisa ser texto")
 
+    check_new_series(ctx.cfg, ctx.user)
     directory.mkdir(parents=True)
     save_series_meta(ctx.cfg, directory.name, SeriesMeta(title=title or directory.name))
     return HTTPStatus.CREATED, {"slug": directory.name, "title": title or directory.name}

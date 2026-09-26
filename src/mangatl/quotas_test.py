@@ -16,6 +16,7 @@ from .panel_test import OWNER_EMAIL, OWNER_PASSWORD, Client
 from .quotas import (
     DISK_CEILING_ENV,
     TESTER_MAX_CHAPTERS,
+    TESTER_MAX_SERIES,
     TESTER_MAX_PAGES_PER_CHAPTER,
     TESTER_MAX_UPLOAD_BYTES,
     OutOfSpace,
@@ -25,6 +26,7 @@ from .quotas import (
     check_engine,
     check_incoming_pages,
     check_new_chapter,
+    check_new_series,
     check_upload_bytes,
     engines_for,
 )
@@ -86,6 +88,29 @@ def test_never_stops_the_owner(area):
         (area.library_dir / "Obra" / f"{number:03d}").mkdir(parents=True)
 
     check_new_chapter(area, OWNER)
+
+
+
+def test_stops_the_tester_at_the_series_limit(area):
+    """Serie vazia quase nao tem bytes, entao a cota de disco nao a segurava."""
+    for number in range(TESTER_MAX_SERIES):
+        (area.library_dir / f"Obra {number}").mkdir(parents=True)
+
+    with pytest.raises(QuotaExceeded, match=str(TESTER_MAX_SERIES)):
+        check_new_series(area, TESTER)
+
+
+def test_never_stops_the_owner_creating_series(area):
+    for number in range(TESTER_MAX_SERIES + 5):
+        (area.library_dir / f"Obra {number}").mkdir(parents=True)
+
+    check_new_series(area, OWNER)
+
+
+def test_lets_the_tester_below_the_series_limit(area):
+    check_new_series(area, TESTER)
+    (area.library_dir / "Obra").mkdir(parents=True)
+    check_new_series(area, TESTER)
 
 
 # ---------- paginas ----------
