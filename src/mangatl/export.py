@@ -225,6 +225,9 @@ def write_pdf(chapter: Chapter, pages_dir: Path, target: Path) -> Path:
                 % (points_w, points_h, image_id, content_id),
             )
             page_ids.append(page_id)
+            # Sem isto a pagina fica no buffer do arquivo ate ele encher, e o
+            # teste que prova "uma pagina por vez" nao tem como ve-la no disco.
+            sink.flush()
 
         if not page_ids:
             raise ValueError("capitulo sem pagina nenhuma para exportar")
