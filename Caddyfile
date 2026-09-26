@@ -16,6 +16,19 @@
 	# Sem isto o Caddy tenta emitir certificado para um dominio que ainda nao
 	# aponta para ca, e o primeiro boot falha em silencio.
 	email {$ACME_EMAIL}
+
+	# Timeouts da conexao cliente -> Caddy. Os do `transport` la embaixo valem
+	# so para Caddy -> app e nao seguram cliente lento nenhum.
+	servers {
+		timeouts {
+			# O que fecha um slowloris: cabecalho pingado byte a byte.
+			read_header 10s
+			# Upload de 500MB leva ~33min a 2 Mbps e ~13min a 5 Mbps. Curto
+			# demais corta o upload de quem ia terminar.
+			read_body 30m
+			idle 2m
+		}
+	}
 }
 
 {$SITE_ADDRESS:tinta.example.com} {
@@ -62,7 +75,8 @@
 		# quando a conexao vem do endereco em `TRUSTED_PROXIES`.
 		header_up X-Real-IP {remote_host}
 
-		# `http.server` nao fecha conexao lenta sozinho. Estes fecham.
+		# Caddy -> app: um `app` travado nao prende o Caddy para sempre. Cliente
+		# lento e assunto dos `timeouts` de `servers`, no topo.
 		transport http {
 			read_timeout 120s
 			write_timeout 600s
