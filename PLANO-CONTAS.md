@@ -1038,4 +1038,4 @@ bytes, então nem a cota de 40MB nem o teto de disco a seguravam. **Feito:**
 - [x] 9.2 PDF escrito página a página; pico de 61MB medido
 - [x] 9.3 Login com o mesmo custo para e-mail inexistente
 - [x] 9.4 Teto de séries para o testador
-- [ ] 9.5 Timeout de cliente no Caddy, backup fora do disco, hook cache no `.gitignore`
+- [x] 9.5 Timeout de cliente no Caddy, backup fora do disco, hook cache no `.gitignore`
