@@ -488,11 +488,39 @@ A instância pública tem dois papéis, e eles não são simétricos:
 | Cota | nenhuma | 12 páginas, 2 capítulos, 40 MB |
 | Painel | completo | só subir e traduzir o próprio |
 
-```bash
-cp .env.example .env               # OWNER_EMAIL, OWNER_PASSWORD, ACME_EMAIL
-$EDITOR .env                       # SITE_ADDRESS=seu.dominio, PUBLIC_SHOWCASE=1
-docker compose --profile public up -d
-```
+### Subir num servidor
+
+1. **Máquina.** Um Linux com Docker e o plugin `compose`. O pico medido do worker
+   é 575 MB, mas o torch pede mais para carregar o modelo: 4 GB de RAM e 2 vCPU
+   dão folga. Disco: a imagem tem 4,6 GB e o teto padrão das contas é 20 GB,
+   então reserve uns 30 GB.
+2. **DNS e firewall.** Um registro `A` do domínio apontando para o IP da
+   máquina, e só as portas 80/tcp, 443/tcp e 443/udp abertas. A 8000 já está
+   publicada só no loopback: quem fala com a internet é o Caddy.
+3. **Código e configuração.**
+   ```bash
+   git clone https://github.com/Italoneri/Tradutor-mangas.git && cd Tradutor-mangas
+   cp .env.example .env
+   $EDITOR .env    # OWNER_EMAIL, OWNER_PASSWORD, ACME_EMAIL, SITE_ADDRESS, CONTACT_EMAIL
+   ```
+   Deixe `ANTHROPIC_API_KEY` vazia: ninguém além de você usa o `claude`, e você
+   pode usá-lo na sua máquina.
+4. **Vitrine, se for ligar.** `public/demo/` fica fora do git. Gere na sua
+   máquina com `mangatl build-demo` (seção abaixo) e copie para o servidor antes
+   de construir, porque ela entra na imagem:
+   `scp -r public/demo servidor:Tradutor-mangas/public/`. Sem vitrine, deixe
+   `PUBLIC_SHOWCASE=0`: nesse caso `/public/demo/` responde 404 mesmo que a pasta
+   exista.
+5. **Subir.** `docker compose --profile public up -d --build`. O primeiro build
+   baixa o modelo e o pacote de idioma e leva alguns minutos.
+6. **Conferir.** Rode a bateria do proxy (abaixo) e, depois, repita de outra
+   rede contra o domínio.
+7. **Backup agendado.** `mangatl backup` grava no mesmo disco. Agende a cópia e
+   leve a pasta para fora. No `crontab` do root, porque `data/` pertence ao
+   usuário 10001 do contêiner:
+   ```bash
+   0 4 * * * cd ~/Tradutor-mangas && docker compose exec -T app mangatl backup && rsync -a data/backups/ outro-lugar:tinta-backups/
+   ```
 
 `PUBLIC_SHOWCASE` vem desligada. Desligada, quem chega sem sessão recebe a tela
 de entrar; é o que a instalação de uma pessoa só quer, e é o padrão porque abrir
@@ -502,7 +530,9 @@ visitante vê as amostras e pode subir 12 páginas sem cadastro.
 
 **Antes de apontar o domínio, rode a bateria do proxy.** Ela não roda com o
 `pytest` normal, porque o perfil `public` não sobe por padrão e o buraco que ela
-vigia mora no `Caddyfile`, fora do alcance do app:
+vigia mora no `Caddyfile`, fora do alcance do app. A rede se chama
+`<pasta>_edge` com o nome da pasta do projeto sem acento: `traduo_edge` aqui,
+`tradutor-mangas_edge` num clone (`docker network ls` confirma):
 
 ```bash
 SITE_ADDRESS=":80" CADDY_HTTP_PORT=18080 ACME_EMAIL=a@b.com     docker compose --profile public up -d
@@ -552,9 +582,9 @@ publicados na internet aberta, sem login. Domínio público, licença livre ou a
 sua — e a escolha fica registrada aqui. Se o material for licenciado, mantenha a
 vitrine fora do ar e mostre a ferramenta por vídeo; a engenharia aparece igual.
 
-> **Pendente:** os dois capítulos da vitrine ainda não foram escolhidos, e o
-> endereço de contato para pedidos de remoção em `reader/termos.html` ainda é um
-> `contato@exemplo.com` de exemplo.
+> **Pendente:** os dois capítulos da vitrine ainda não foram escolhidos. O
+> endereço para pedidos de remoção vem de `CONTACT_EMAIL`; sem ele a página de
+> termos diz que ainda não foi configurado.
 
 ---
 
