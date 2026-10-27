@@ -56,7 +56,7 @@ from .accounts import (
     area_config,
     change_owner_password,
     create_user,
-    find_owner,
+    find_account,
     password_hash_of,
 )
 from .config import Config
@@ -445,10 +445,6 @@ class Context(NamedTuple):
     def user(self) -> User | None:
         return self.session.user if self.session else None
 
-    @property
-    def is_owner(self) -> bool:
-        return self.session is not None and self.session.is_owner
-
 
 Body = bytes | Path
 """O corpo como o handler o recebe.
@@ -460,7 +456,15 @@ o processo inteiro segurando o upload na RAM enquanto atende o resto.
 
 Handler = Callable[[Context, tuple[str, ...], Body], tuple[int, object]]
 
-Access = Literal["public", "session", "owner"]
+Access = Literal["public", "session", "account", "admin"]
+
+_ACCESS_ALLOWS: dict[Access, Callable[[User], bool]] = {
+    "public": lambda user: True,
+    "session": lambda user: True,
+    "account": lambda user: user.has_account,
+    "admin": lambda user: user.is_admin,
+}
+"""O que cada nivel exige de quem ja tem sessao. Sem sessao, so `public` passa."""
 
 
 class Route(NamedTuple):
@@ -474,8 +478,9 @@ class Route(NamedTuple):
     """Quem pode chamar. O default e o lado seguro de errar: uma rota nova que
     esqueca a marca exige sessao, em vez de responder para qualquer um.
 
-    `owner` esta nas que destroem ou custam dinheiro. `public` esta em login e em
-    health, que precisam responder antes de existir sessao."""
+    `account` esta nas que mexem na serie inteira, e `admin` nas que mexem na
+    instancia. `public` esta em login e em health, que precisam responder antes de
+    existir sessao."""
 
     writes: bool = False
     """Se a rota muda o disco.
@@ -534,7 +539,7 @@ def _health(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, ob
     versao do Python e presenca da chave da API sao inventario do servidor, e uma
     rota publica nao tem por que entrega-lo a quem so quer saber se ele responde.
     """
-    if not ctx.is_owner:
+    if ctx.user is None or not ctx.user.is_admin:
         return HTTPStatus.OK, {"ok": True}
     return HTTPStatus.OK, {
         "ok": True,
@@ -572,6 +577,8 @@ def _session_payload(session: Session | None) -> dict:
         return {
             "authenticated": False,
             "kind": None,
+            "can_admin": False,
+            "has_account": False,
             "engines": [],
             "showcase": showcase_is_public(),
             "contact": contact_email(),
@@ -581,6 +588,10 @@ def _session_payload(session: Session | None) -> dict:
         "showcase": showcase_is_public(),
         "contact": contact_email(),
         "kind": session.user.kind,
+        # A tela pergunta por estes dois, e nao pelo `kind`: deduzir capacidade
+        # de string no front e o mesmo atalho que o back acabou de desfazer.
+        "can_admin": session.user.is_admin,
+        "has_account": session.user.has_account,
         "expires_at": session.expires_at,
         # O testador nunca ve `claude` na lista: a chave da API e do dono, e a
         # conta chega para ele. A interface esconde e a API recusa - as duas.
@@ -594,7 +605,7 @@ def _session(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, o
 
 
 def _login(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
-    """Entra como dono. Unica rota que aceita senha, e a unica que pode ser varrida.
+    """Entra numa conta, de dono ou de membro. Unica rota que aceita senha, e a unica que pode ser varrida.
 
     A resposta e a mesma para e-mail que nao existe e para senha errada. Distinguir
     as duas entrega uma lista de quem tem conta aqui, de graca.
@@ -614,22 +625,22 @@ def _login(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, obj
             "error": "tentativas demais; espere alguns minutos"
         }
 
-    owner = find_owner(ctx.connection, email)
-    # O scrypt roda tambem quando o e-mail nao e do dono. Sem isto a resposta era
+    account = find_account(ctx.connection, email)
+    # O scrypt roda tambem quando o e-mail nao tem conta. Sem isto a resposta era
     # igual e o tempo nao: ~100ms para o e-mail certo e zero para o errado, e o
-    # cronometro entregava o e-mail do dono que a mensagem unica existe para esconder.
-    stored = password_hash_of(ctx.connection, owner.id) if owner else _decoy_hash()
+    # cronometro entregava quem tem conta, que a mensagem unica existe para esconder.
+    stored = password_hash_of(ctx.connection, account.id) if account else _decoy_hash()
     matches = verify_password(password, stored)
-    if owner is None or not matches:
+    if account is None or not matches:
         record_login_attempt(ctx.connection, subjects[0])
         record_login_attempt(ctx.connection, subjects[1])
         return HTTPStatus.UNAUTHORIZED, {"error": "e-mail ou senha nao conferem"}
 
     clear_login_attempts(ctx.connection, subjects)
-    hours = hours_for(owner.kind)
-    token, expires_at = issue(ctx.connection, owner.id, hours=hours)
+    hours = hours_for(account.kind)
+    token, expires_at = issue(ctx.connection, account.id, hours=hours)
     return HTTPStatus.OK, _Issued(
-        payload=_session_payload(Session(user=owner, expires_at=expires_at)),
+        payload=_session_payload(Session(user=account, expires_at=expires_at)),
         token=token,
         hours=hours,
     )
@@ -824,7 +835,7 @@ def _incoming_files(incoming: Path) -> list[Path]:
 
 def _page_limit(user: User) -> int:
     """Quantas paginas este usuario pode ter num capitulo."""
-    return MAX_PAGES_PER_CHAPTER if user.is_owner else TESTER_MAX_PAGES_PER_CHAPTER
+    return MAX_PAGES_PER_CHAPTER if user.is_unmetered else TESTER_MAX_PAGES_PER_CHAPTER
 
 
 def extract_archive(
@@ -1169,7 +1180,7 @@ def _create_job(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int
             series=directory.parent.name,
             chapter=directory.name,
             engine=engine,
-            priority=OWNER_PRIORITY if ctx.is_owner else TESTER_PRIORITY,
+            priority=OWNER_PRIORITY if ctx.user.is_admin else TESTER_PRIORITY,
             force=bool(payload.get("force")),
             dry_run=bool(payload.get("dry_run")),
             pages=pages,
@@ -1397,6 +1408,8 @@ def _inside(base: Path, *parts: str) -> Path | None:
     return resolved if root in resolved.parents else None
 
 
+ACCESS_DENIED_BODY = {"error": "esta conta nao pode fazer isso"}
+
 NOT_FOUND_BODY = {"error": "nao existe"}
 """Uma resposta so para "nao existe" e "nao e seu".
 
@@ -1487,7 +1500,7 @@ ROUTES: tuple[Route, ...] = (
         "POST",
         re.compile(r"^/api/account/password$"),
         _change_password,
-        access="owner",
+        access="admin",
         writes=True,
         body_required=True,
     ),
@@ -1508,7 +1521,7 @@ ROUTES: tuple[Route, ...] = (
         "PUT",
         re.compile(rf"^/api/series/{_SLUG}/series\.json$"),
         _put_series_meta,
-        access="owner",
+        access="account",
         writes=True,
         body_required=True,
     ),
@@ -1517,7 +1530,7 @@ ROUTES: tuple[Route, ...] = (
         re.compile(rf"^/api/series/{_SLUG}/cover$"),
         _put_cover,
         MAX_PAGE_BYTES,
-        access="owner",
+        access="account",
         writes=True,
         body_required=True,
     ),
@@ -1526,7 +1539,7 @@ ROUTES: tuple[Route, ...] = (
         "PUT",
         re.compile(rf"^/api/series/{_SLUG}/glossary$"),
         _put_glossary,
-        access="owner",
+        access="account",
         writes=True,
         body_required=True,
     ),
@@ -1596,12 +1609,14 @@ ROUTES: tuple[Route, ...] = (
         _delete_chapter,
         writes=True,
     ),
-    Route("DELETE", re.compile(rf"^/api/series/{_SLUG}$"), _delete_series, access="owner", writes=True),
+    Route("DELETE", re.compile(rf"^/api/series/{_SLUG}$"), _delete_series, access="account", writes=True),
 )
 """Toda rota diz quem pode chama-la e se ela escreve.
 
-As `owner` sao as que mudam o acervo inteiro: apagar uma serie, reescrever
-`series.json`, trocar a capa e editar o glossario. Apagar capitulo e area de
+As `account` sao as que mudam o acervo inteiro: apagar uma serie, reescrever
+`series.json`, trocar a capa e editar o glossario. A area continua vindo do
+cookie, entao um membro so alcanca a propria. A troca de senha e `admin` ate a
+conta do membro poder trocar a dele (fase E do `PLANO-CADASTRO.md`). Apagar capitulo e area de
 espera e da sessao: a area vem do cookie, entao o testador so alcanca a propria,
 e sem essas duas ele nao tinha como sair da cota nem de um upload quebrado."""
 
@@ -1824,9 +1839,9 @@ def make_panel_handler(cfg: Config) -> type[ReaderHandler]:
                 self._discard_small_body()
                 self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "entre para continuar"})
                 return True
-            if route.access == "owner" and (session is None or not session.is_owner):
+            if session is not None and not _ACCESS_ALLOWS[route.access](session.user):
                 self._discard_small_body()
-                self._send_json(HTTPStatus.FORBIDDEN, {"error": "so o dono faz isso"})
+                self._send_json(HTTPStatus.FORBIDDEN, ACCESS_DENIED_BODY)
                 return True
 
             # A area sai antes do corpo porque o teto da cota depende dela, e o teto

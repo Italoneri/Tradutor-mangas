@@ -6,6 +6,7 @@ import pytest
 
 from .accounts import (
     MigrationRefused,
+    User,
     change_owner_password,
     ensure_owner,
     password_hash_of,
@@ -13,6 +14,7 @@ from .accounts import (
     config_for_user,
     create_user,
     delete_user,
+    find_account,
     get_user,
     migrate_to_accounts,
     new_user_id,
@@ -137,7 +139,45 @@ def test_stores_and_reads_back_a_user(cfg):
 
     assert found == created
     assert found.email == "dono@example.com"
-    assert found.is_owner
+    assert found.is_admin
+
+
+@pytest.mark.parametrize(
+    ("kind", "is_admin", "has_account", "is_unmetered"),
+    [
+        ("owner", True, True, True),
+        ("member", False, True, False),
+        ("tester", False, False, False),
+    ],
+)
+def test_answers_each_capability_by_role(kind, is_admin, has_account, is_unmetered):
+    user = User(id="a" * 32, kind=kind, email=None, created_at="", expires_at=None)
+
+    assert (user.is_admin, user.has_account, user.is_unmetered) == (is_admin, has_account, is_unmetered)
+
+
+def create_member(connection, email: str) -> User:
+    """Membro direto no banco, antes de a migracao 6 abrir o CHECK para ele.
+
+    Existe para a fase A provar as rotas com tres papeis sem esperar a fase B.
+    """
+    connection.execute("PRAGMA ignore_check_constraints = ON")
+    try:
+        return create_user(connection, kind="member", email=email)
+    finally:
+        connection.execute("PRAGMA ignore_check_constraints = OFF")
+
+
+def test_finds_owner_and_member_accounts_by_email_and_never_a_tester(cfg):
+    migrate(cfg)
+    with connect(cfg) as connection:
+        owner = create_user(connection, kind="owner", email="dono@example.com")
+        member = create_member(connection, "membro@example.com")
+        create_user(connection, kind="tester")
+
+        assert find_account(connection, " Dono@Example.com ") == owner
+        assert find_account(connection, "membro@example.com") == member
+        assert find_account(connection, "ninguem@example.com") is None
 
 
 def test_removes_the_area_from_disk_when_the_user_goes(cfg):

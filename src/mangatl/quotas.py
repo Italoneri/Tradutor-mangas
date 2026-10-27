@@ -63,7 +63,7 @@ class OutOfSpace(RuntimeError):
 def engines_for(user: User) -> tuple[str, ...]:
     from .engines.base import available_engines
 
-    return tuple(available_engines()) if user.is_owner else TESTER_ENGINES
+    return tuple(available_engines()) if user.is_admin else TESTER_ENGINES
 
 
 def check_engine(user: User, engine: str) -> None:
@@ -105,7 +105,7 @@ def chapter_names(cfg: Config) -> list[str]:
 
 
 def check_new_chapter(cfg: Config, user: User) -> None:
-    if user.is_owner:
+    if user.is_unmetered:
         return
     existing = chapter_names(cfg)
     if len(existing) >= TESTER_MAX_CHAPTERS:
@@ -122,7 +122,7 @@ sem teto um laco de `POST /api/series` criava pastas sem fim dentro da cota de
 
 
 def check_new_series(cfg: Config, user: User) -> None:
-    if user.is_owner:
+    if user.is_unmetered:
         return
     existing = [entry for entry in cfg.library_dir.iterdir() if entry.is_dir()] if cfg.library_dir.is_dir() else []
     if len(existing) >= TESTER_MAX_SERIES:
@@ -134,7 +134,7 @@ def check_new_series(cfg: Config, user: User) -> None:
 
 def check_incoming_pages(cfg: Config, user: User, incoming: Path, adding: int = 1) -> None:
     """Se cabem mais `adding` paginas na area de espera deste capitulo."""
-    if user.is_owner:
+    if user.is_unmetered:
         return
     present = len(list_page_images(incoming)) if incoming.is_dir() else 0
     if present + adding > TESTER_MAX_PAGES_PER_CHAPTER:
@@ -151,14 +151,14 @@ def upload_headroom(cfg: Config, user: User) -> int | None:
     o zip nao cabe seria receber o zip inteiro primeiro, e ai os 500MB ja estao no
     disco que a cota existia para proteger.
     """
-    if user.is_owner:
+    if user.is_unmetered:
         return None
     return max(0, TESTER_MAX_UPLOAD_BYTES - area_bytes(cfg))
 
 
 def check_upload_bytes(cfg: Config, user: User, incoming_bytes: int) -> None:
     """Se o upload cabe no que esta sessao ainda pode gravar."""
-    if user.is_owner:
+    if user.is_unmetered:
         return
     used = area_bytes(cfg)
     if used + incoming_bytes > TESTER_MAX_UPLOAD_BYTES:
@@ -187,7 +187,7 @@ def check_disk(base: Config, user: User, incoming_bytes: int = 0) -> None:
     """Se o servidor inteiro ainda tem espaco para este upload, deste usuario."""
     from .accounts import users_root
 
-    ceiling = disk_ceiling() if user.is_owner else int(disk_ceiling() * TESTER_DISK_SHARE)
+    ceiling = disk_ceiling() if user.is_unmetered else int(disk_ceiling() * TESTER_DISK_SHARE)
     used = directory_bytes(users_root(base))
     if used + incoming_bytes > ceiling:
         raise OutOfSpace("o servidor esta sem espaco para uploads novos; tente mais tarde")

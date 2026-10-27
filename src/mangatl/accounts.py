@@ -29,7 +29,10 @@ from .db import now
 
 log = logging.getLogger("mangatl.accounts")
 
-UserKind = Literal["owner", "tester"]
+UserKind = Literal["owner", "member", "tester"]
+
+ACCOUNT_KINDS: frozenset[UserKind] = frozenset({"owner", "member"})
+"""Quem tem conta de verdade: e-mail, senha e acervo que nao expira."""
 
 USERS_DIRNAME = "users"
 
@@ -112,8 +115,23 @@ class User:
     created_at: str
     expires_at: str | None
 
+    # O codigo pergunta pela capacidade, e nunca pelo papel. `kind == "owner"`
+    # respondia quatro perguntas de uma vez, e o membro precisa de respostas
+    # diferentes para cada uma.
+
     @property
-    def is_owner(self) -> bool:
+    def is_admin(self) -> bool:
+        """Administra a instancia: convites, contas, limites."""
+        return self.kind == "owner"
+
+    @property
+    def has_account(self) -> bool:
+        """Acervo permanente, e as rotas que mexem na serie inteira."""
+        return self.kind in ACCOUNT_KINDS
+
+    @property
+    def is_unmetered(self) -> bool:
+        """Fora de toda cota."""
         return self.kind == "owner"
 
 
@@ -151,9 +169,11 @@ def sole_owner(connection: sqlite3.Connection) -> User | None:
     return None if row is None else user_from_row(row)
 
 
-def find_owner(connection: sqlite3.Connection, email: str) -> User | None:
+def find_account(connection: sqlite3.Connection, email: str) -> User | None:
+    """A conta com este e-mail, de dono ou de membro. Testador nao tem e-mail."""
     row = connection.execute(
-        "SELECT * FROM users WHERE kind = 'owner' AND email = ?", (email.strip().lower(),)
+        "SELECT * FROM users WHERE kind IN ('owner', 'member') AND email = ?",
+        (email.strip().lower(),),
     ).fetchone()
     return None if row is None else user_from_row(row)
 
@@ -319,7 +339,7 @@ def area_config(cfg: Config, user: User) -> Config:
     derived = config_for_user(cfg, user.id)
     if derived is None:
         return cfg
-    if user.is_owner and not derived.library_dir.is_dir() and has_legacy_library(cfg):
+    if user.is_admin and not derived.library_dir.is_dir() and has_legacy_library(cfg):
         return cfg
     return derived
 

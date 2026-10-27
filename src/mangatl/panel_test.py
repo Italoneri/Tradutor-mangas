@@ -12,12 +12,14 @@ from pathlib import Path
 import pytest
 
 from . import panel
-from .accounts import ensure_owner, sole_owner, user_path
+from .accounts import create_user, ensure_owner, sole_owner, user_path
+from .accounts_test import create_member
 from .config import Config
 from .db import connect, migrate
 from .jobs import finish, get_any, set_progress
 from .models import Progress
 from .panel import (
+    ACCESS_DENIED_BODY,
     MAX_JSON_BYTES,
     ROUTES,
     Invalid,
@@ -35,6 +37,7 @@ from .panel import (
     validate_glossary,
 )
 from .serving import _Server
+from .sessions import COOKIE_NAME, issue
 
 
 @pytest.mark.parametrize(
@@ -1265,3 +1268,127 @@ def test_answers_404_for_exporting_what_is_not_there(panel_server: Client, tmp_p
     translated_chapter(tmp_path)
 
     assert panel_server.get(path)[0] == 404
+
+
+# ---------- quem alcanca cada rota ----------
+
+
+ROUTE_ACCESS = {
+    ("GET", "/api/health"): "public",
+    ("GET", "/api/session"): "public",
+    ("POST", "/api/login"): "public",
+    ("POST", "/api/logout"): "public",
+    ("POST", "/api/account/password"): "admin",
+    ("POST", "/api/account/sessions/revoke"): "session",
+    ("GET", "/u/library"): "session",
+    ("GET", "/u/pages/x/x/x"): "session",
+    ("GET", "/u/chapters/x/x/chapter.x.json"): "session",
+    ("GET", "/api/series"): "session",
+    ("POST", "/api/series"): "session",
+    ("GET", "/api/series/x/series.json"): "session",
+    ("PUT", "/api/series/x/series.json"): "account",
+    ("PUT", "/api/series/x/cover"): "account",
+    ("GET", "/api/series/x/glossary"): "session",
+    ("PUT", "/api/series/x/glossary"): "account",
+    ("POST", "/api/series/x/chapters"): "session",
+    ("PUT", "/api/series/x/chapters/x/files/x"): "session",
+    ("POST", "/api/series/x/chapters/x/archive"): "session",
+    ("POST", "/api/series/x/chapters/x/commit"): "session",
+    ("GET", "/api/series/x/chapters/x/incoming"): "session",
+    ("PUT", "/api/series/x/chapters/x/translations/x/blocks"): "session",
+    ("GET", "/api/series/x/chapters/x/estimate/x"): "session",
+    ("GET", "/api/series/x/chapters/x/export/free.cbz"): "session",
+    ("GET", "/api/jobs"): "session",
+    ("POST", "/api/jobs"): "session",
+    ("GET", "/api/jobs/x"): "session",
+    ("DELETE", "/api/series/x/chapters/x/incoming"): "session",
+    ("DELETE", "/api/series/x/chapters/x"): "session",
+    ("DELETE", "/api/series/x"): "account",
+}
+"""O nivel que cada rota deve ter, escrito a mao e de proposito.
+
+Derivar o esperado de `route.access` faria o teste concordar com qualquer erro na
+tabela de rotas. Aqui os dois lados sao independentes: mudar o nivel de uma rota
+exige mudar as duas, e uma rota nova sem linha aqui falha no teste de baixo."""
+
+ALLOWED_ROLES = {
+    "public": {"tester", "member", "owner"},
+    "session": {"tester", "member", "owner"},
+    "account": {"member", "owner"},
+    "admin": {"owner"},
+}
+
+
+def _sample_path(route: panel.Route) -> str:
+    """Um caminho que casa com a rota, com `x` em cada nome."""
+    path = route.pattern.pattern.removeprefix("^").removesuffix("$")
+    path = path.replace(panel._SLUG, "x").replace("([a-z]+)", "free").replace("(cbz|pdf)", "cbz")
+    return path.replace(r"\.", ".")
+
+
+def _role_cookie(tmp_path: Path, role: str) -> str:
+    """Uma sessao nova por pedido: logout e "sair de tudo" derrubariam a seguinte."""
+    with connect(Config(root=tmp_path)) as connection:
+        if role == "owner":
+            user = sole_owner(connection)
+        elif role == "member":
+            user = create_member(connection, f"membro-{time.monotonic_ns()}@example.com")
+        else:
+            user = create_user(connection, kind="tester")
+        assert user is not None
+        token, _ = issue(connection, user.id, hours=1)
+    return f"{COOKIE_NAME}={token}"
+
+
+def test_declares_an_access_level_for_every_route():
+    declared = {(route.method, _sample_path(route)) for route in ROUTES}
+
+    assert declared == set(ROUTE_ACCESS), "rota nova ou removida: atualize ROUTE_ACCESS"
+
+
+@pytest.mark.parametrize(
+    "route", ROUTES, ids=[f"{route.method} {route.pattern.pattern}" for route in ROUTES]
+)
+def test_lets_each_role_reach_only_the_routes_of_its_level(
+    panel_server: Client, tmp_path: Path, route: panel.Route
+):
+    """Cada papel contra cada rota, pelo handler real.
+
+    So confere a porta, e nao o que a rota faz depois dela. Por isso o corpo e
+    `{}` e os nomes sao `x`: passar da porta e qualquer resposta que nao seja 401
+    nem a recusa de nivel - 404 e 422 incluidos.
+    """
+    path = _sample_path(route)
+    found = match_route(route.method, path)
+    assert found is not None and found.route is route, path
+    level = ROUTE_ACCESS[(route.method, path)]
+
+    for role in ("tester", "member", "owner"):
+        status, body, _ = panel_server.raw(
+            route.method, path, b"{}", cookie=_role_cookie(tmp_path, role)
+        )
+        denied = status == 403 and json.loads(body) == ACCESS_DENIED_BODY
+        if role in ALLOWED_ROLES[level]:
+            assert status != 401 and not denied, (role, status, body)
+        else:
+            assert denied, (role, status, body)
+
+
+def test_logs_a_member_in_through_the_same_door_as_the_owner(panel_server: Client, tmp_path: Path):
+    from .sessions import hash_password
+
+    with connect(Config(root=tmp_path)) as connection:
+        member = create_member(connection, "membro@example.com")
+        connection.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password("senha-do-membro-comprida"), member.id),
+        )
+
+    panel_server.forget()
+    assert panel_server.login("membro@example.com", "senha-do-membro-comprida") == 200
+    status, body = panel_server.get("/api/session")
+    payload = json.loads(body)
+
+    assert status == 200
+    assert (payload["kind"], payload["can_admin"], payload["has_account"]) == ("member", False, True)
+    assert payload["engines"] == ["free"]

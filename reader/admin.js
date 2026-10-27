@@ -98,8 +98,8 @@ const el = {
 
 const state = {
   health: null,
-  /** Quem esta usando o painel. `{authenticated, kind, engines}`, como o back manda. */
-  session: { authenticated: false, kind: null, engines: [] },
+  /** Quem esta usando o painel. `{authenticated, can_admin, has_account, engines}`, como o back manda. */
+  session: { authenticated: false, can_admin: false, has_account: false, engines: [] },
   series: [],
   selected: null,
   /** Arquivos escolhidos e ainda nao enviados, com o resultado de cada um. */
@@ -295,7 +295,7 @@ async function selectSeries(slug) {
   el.seriesName.textContent = entry.title || entry.series;
   el.seriesSlug.textContent = `pasta: ${entry.series}`;
   el.seriesCard.hidden = false;
-  el.seriesDanger.hidden = state.session.kind !== "owner";
+  el.seriesDanger.hidden = !state.session.has_account;
   el.uploadCard.hidden = false;
   el.jobCard.hidden = true;
   renderStaged();
@@ -733,12 +733,11 @@ function renderEngines() {
     })
     .join("");
 
-  const owner = state.session.kind === "owner";
-  if (owner && !state.health.has_api_key) {
+  if (state.session.can_admin && !state.health.has_api_key) {
     el.engineNote.hidden = false;
     el.engineNote.textContent =
       "O motor claude está desligado porque não há ANTHROPIC_API_KEY no ambiente do servidor. Copie .env.example para .env, preencha a chave e reinicie.";
-  } else if (!owner) {
+  } else if (!state.session.has_account) {
     el.engineNote.hidden = false;
     el.engineNote.textContent =
       "Esta é uma sessão de teste: só o motor free, até 12 páginas por capítulo, e o que você subir expira em 48 horas.";
@@ -796,7 +795,7 @@ async function enterPanel() {
   el.health.textContent = state.health.detector ? `detector ${state.health.detector}` : "";
   el.login.hidden = true;
   el.panel.hidden = false;
-  el.accountCard.hidden = state.session.kind !== "owner";
+  el.accountCard.hidden = !state.session.can_admin;
   el.signOut.hidden = false;
   renderEngines();
   await guard(() => loadSeries(false));
