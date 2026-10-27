@@ -241,6 +241,12 @@ nível cai na matriz sem ninguém escrever teste para ela.
 
 **PARE.** Bateria inteira, e o `grep` da seção 3.1.
 
+> **Feito em 27/10/2026.** 631 testes passando. Um desvio: `POST /api/account/password`
+> era `owner` e virou `admin`, e não `account`. Ela chama `change_owner_password` e o
+> card de conta só aparece para o dono; abrir para o membro é a Fase E. O membro de
+> teste nasce com `PRAGMA ignore_check_constraints`, porque o `CHECK` de `users` só
+> aceita `member` depois da migração 6.
+
 ---
 
 ## FASE B — Convites e criação de conta
@@ -434,9 +440,9 @@ contra a API real e anotado no README.
 
 ## Checklist
 
-- [ ] A: `is_admin`, `has_account`, `is_unmetered`; `grep is_owner` limpo
-- [ ] A: quatro níveis de acesso; matriz rota × papel gerada de `ROUTES`
-- [ ] A: login aceita dono e membro, com o hash de fachada para e-mail inexistente
+- [x] A: `is_admin`, `has_account`, `is_unmetered`; `grep is_owner` limpo
+- [x] A: quatro níveis de acesso; matriz rota × papel gerada de `ROUTES` — o esperado vem de uma tabela escrita à mão (`ROUTE_ACCESS`), não de `route.access`: derivado, o teste concordava com qualquer erro (conferido rebaixando o glossário para `session`)
+- [x] A: login aceita dono e membro, com o hash de fachada para e-mail inexistente
 - [ ] B: migração 6 reconstrói `users` sem perder sessão, job nem uso — testado
 - [ ] B: convite de uso único, 7 dias, token só como hash, link com `#`
 - [ ] B: testador que aceita convite vira membro com o mesmo id e o mesmo acervo
