@@ -157,15 +157,8 @@ def test_answers_each_capability_by_role(kind, is_admin, has_account, is_unmeter
 
 
 def create_member(connection, email: str) -> User:
-    """Membro direto no banco, antes de a migracao 6 abrir o CHECK para ele.
-
-    Existe para a fase A provar as rotas com tres papeis sem esperar a fase B.
-    """
-    connection.execute("PRAGMA ignore_check_constraints = ON")
-    try:
-        return create_user(connection, kind="member", email=email)
-    finally:
-        connection.execute("PRAGMA ignore_check_constraints = OFF")
+    """Membro direto no banco, sem passar por convite."""
+    return create_user(connection, kind="member", email=email)
 
 
 def test_finds_owner_and_member_accounts_by_email_and_never_a_tester(cfg):

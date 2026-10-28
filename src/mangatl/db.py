@@ -1,7 +1,7 @@
 """O banco: identidade, sessao, fila e cota.
 
 `sqlite3` da stdlib e um arquivo em `data/mangatl.db`. Nao ha ORM de proposito -
-o esquema inteiro cabe em quatro tabelas, e migracao aqui e uma lista de scripts
+o esquema inteiro cabe em poucas tabelas, e migracao aqui e uma lista de scripts
 numerados aplicados em ordem.
 
 Tres decisoes que o resto do sistema depende:
@@ -26,6 +26,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 from .config import Config
 
@@ -67,7 +68,21 @@ def minutes_ago(minutes: int) -> str:
     return (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat(timespec="milliseconds")
 
 
-MIGRATIONS: tuple[str, ...] = (
+class TableRebuild(NamedTuple):
+    """Migracao que reconstroi uma tabela, e por isso roda com as chaves desligadas.
+
+    O sqlite nao altera `CHECK`, entao mudar um exige criar a tabela de novo. Com
+    `foreign_keys = ON`, o `DROP TABLE` da tabela velha e um `DELETE` implicito, e
+    o `ON DELETE CASCADE` das filhas apaga todas as linhas delas sem erro nenhum.
+    E o procedimento de 12 passos da documentacao do sqlite ("Making Other Kinds
+    Of Table Schema Changes"), e o pragma so muda fora de transacao - por isso a
+    marca, e nao o script decidindo sozinho.
+    """
+
+    script: str
+
+
+MIGRATIONS: tuple[str | TableRebuild, ...] = (
     # 1 - identidade, sessao, fila e cota
     """
     CREATE TABLE users (
@@ -151,6 +166,69 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE users ADD COLUMN password_origin TEXT
         CHECK (password_origin IS NULL OR password_origin IN ('env', 'panel'));
     """,
+    # 6 - o papel `member`, e o que o dono ajusta por conta
+    TableRebuild(
+        """
+        CREATE TABLE users_new (
+            id               TEXT PRIMARY KEY,
+            kind             TEXT NOT NULL CHECK (kind IN ('owner', 'member', 'tester')),
+            email            TEXT UNIQUE,
+            password_hash    TEXT,
+            created_at       TEXT NOT NULL,
+            expires_at       TEXT,
+            password_origin  TEXT
+                CHECK (password_origin IS NULL OR password_origin IN ('env', 'panel')),
+            status           TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active', 'disabled')),
+            last_login_at    TEXT,
+            disk_limit_bytes INTEGER,
+            pages_per_day    INTEGER,
+            max_pending_jobs INTEGER
+        );
+
+        INSERT INTO users_new (id, kind, email, password_hash, created_at, expires_at, password_origin)
+            SELECT id, kind, email, password_hash, created_at, expires_at, password_origin FROM users;
+
+        DROP TABLE users;
+        ALTER TABLE users_new RENAME TO users;
+
+        CREATE INDEX users_expires_at ON users (expires_at) WHERE expires_at IS NOT NULL;
+        """
+    ),
+    # 7 - convite, redefinicao de senha e o registro do que o dono fez
+    """
+    CREATE TABLE invites (
+        token_hash TEXT PRIMARY KEY,
+        created_by TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        note       TEXT,
+        used_by    TEXT REFERENCES users (id) ON DELETE SET NULL,
+        used_at    TEXT
+    );
+
+    CREATE INDEX invites_created_at ON invites (created_at);
+
+    CREATE TABLE password_resets (
+        token_hash TEXT PRIMARY KEY,
+        user_id    TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at    TEXT
+    );
+
+    CREATE INDEX password_resets_user_id ON password_resets (user_id);
+
+    CREATE TABLE audit_log (
+        at        TEXT NOT NULL,
+        actor_id  TEXT,
+        action    TEXT NOT NULL,
+        target_id TEXT,
+        detail    TEXT
+    );
+
+    CREATE INDEX audit_log_at ON audit_log (at);
+    """,
 )
 """Scripts aplicados em ordem, uma vez cada.
 
@@ -227,22 +305,68 @@ def migrate(cfg: Config) -> int:
     quatro linhas nao custa nada, e a alternativa e alguem subir o servidor com o
     esquema velho e descobrir na primeira escrita.
 
-    O script e o registro da versao vao no mesmo `executescript`, com BEGIN e
-    COMMIT escritos a mao: o sqlite faz DDL dentro de transacao, entao ou a
-    migracao inteira entrou e ficou registrada, ou nao aconteceu. Sem isso, uma
-    queda entre as duas coisas deixaria a tabela criada e a versao ausente - e a
-    proxima subida morreria em `table already exists`.
+    `app` e `worker` sobem juntos e os dois chamam isto. Por isso cada migracao
+    pega a trava de escrita e so entao confere se ja foi aplicada: medido na
+    migracao 6, o `app` lia a lista de versoes antes de o `worker` gravar a dele,
+    tentava de novo e morria na subida.
     """
     with connect(cfg) as connection:
-        applied = _applied_versions(connection)
-        for version, script in enumerate(MIGRATIONS, start=1):
-            if version in applied:
-                continue
-            connection.executescript(
-                "BEGIN;\n"
-                f"{script}\n"
-                "INSERT INTO schema_migrations (version, applied_at)"
-                f" VALUES ({version}, '{now()}');\n"
-                "COMMIT;"
-            )
+        _applied_versions(connection)
+        for version, migration in enumerate(MIGRATIONS, start=1):
+            _apply(connection, version, migration)
         return len(MIGRATIONS)
+
+
+def _apply(connection: sqlite3.Connection, version: int, migration: str | TableRebuild) -> None:
+    """Aplica uma migracao e registra a versao na mesma transacao. Tudo ou nada.
+
+    O sqlite faz DDL dentro de transacao, entao ou a migracao inteira entrou e
+    ficou registrada, ou nao aconteceu. Instrucao por instrucao, e nao
+    `executescript`: ele faria COMMIT da transacao aberta antes de rodar o script,
+    e a trava pega para conferir a versao se soltaria antes da hora.
+
+    Um `TableRebuild` roda com as chaves desligadas, e o `foreign_key_check` e o
+    passo que a documentacao pede antes do COMMIT: com as chaves desligadas o
+    banco aceita qualquer coisa, e e ali que uma copia que esqueceu linha aparece
+    como filha orfa em vez de virar dado perdido.
+    """
+    rebuild = isinstance(migration, TableRebuild)
+    script = migration.script if rebuild else migration
+    if rebuild:
+        connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        if version in _applied_versions(connection):
+            connection.execute("ROLLBACK")
+            return
+        for statement in _statements(script):
+            connection.execute(statement)
+        orphans = connection.execute("PRAGMA foreign_key_check").fetchall() if rebuild else []
+        if orphans:
+            raise RuntimeError(
+                f"migracao {version}: {len(orphans)} linha(s) sem dono depois da reconstrucao"
+            )
+        connection.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", (version, now())
+        )
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        if rebuild:
+            connection.execute("PRAGMA foreign_keys = ON")
+
+
+def _statements(script: str) -> list[str]:
+    """As instrucoes de um script de migracao.
+
+    Separar por `;` basta aqui porque nenhum script tem gatilho nem texto com
+    ponto e virgula; `complete_statement` recusa o script se um dia tiver.
+    """
+    statements = [part.strip() for part in script.split(";") if part.strip()]
+    for statement in statements:
+        if not sqlite3.complete_statement(f"{statement};"):
+            raise ValueError(f"instrucao incompleta na migracao: {statement[:60]!r}")
+    return statements
