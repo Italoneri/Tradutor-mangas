@@ -336,6 +336,31 @@ alternados, e não 3 de um e depois 3 do outro.
 
 **PARE.**
 
+> **Feito em 27/10/2026.** 670 testes passando, e um membro convidado rodado contra
+> o worker real atrás do Caddy: a 4ª página do dia (teto baixado para 3) levou 429
+> com a mensagem do teto, o capítulo traduziu com prioridade 1, e o card de upload
+> mostra "usado 54 B de 2.0 GB · páginas hoje: 0 de 600".
+>
+> O que saiu diferente do texto acima:
+>
+> - **O quarto job leva 409, e não 429.** É a mesma recusa de sempre do testador
+>   (`Busy`), agora com o teto da conta na mensagem. Duas respostas para "fila
+>   cheia" seriam uma a mais para o painel tratar.
+> - **O teto conta fila e execução juntas** (`pending` + `running`), como a regra do
+>   testador já contava. Na config, a chave é `active_jobs`; a coluna da conta
+>   continua `max_pending_jobs`.
+> - **O dono perdeu o teto de um job por vez**, porque o dono não tem cota. O que
+>   ficou para todo papel, dono incluso, é recusar o *mesmo capítulo* duas vezes na
+>   fila: o segundo job refaria o primeiro.
+> - Membro sem teto de capítulos e de obras: quem segura é o disco. Páginas por
+>   capítulo, as 400 do dono.
+> - A posição na fila (`queue_position`) agora segue a mesma regra do
+>   `claim_next`. Contar só quem é mais antigo mentiria com a vez alternando.
+> - O uso sai em `GET /api/account/usage`, e não em `/api/session`: somar o disco
+>   varre a área, e a sessão é lida a cada página do leitor.
+> - Antes de subir, nenhum job pendente na base real com a prioridade antiga: os 5
+>   que existem são do dono e estão `done`.
+
 ---
 
 ## FASE D — O dono administra as contas
@@ -469,9 +494,9 @@ contra a API real e anotado no README.
 - [x] B: convite de uso único, 7 dias, token só como hash, link com `#`
 - [x] B: testador que aceita convite vira membro com o mesmo id e o mesmo acervo
 - [x] B: `mangatl invite`
-- [ ] C: limites por conta com padrão em `[members]`
-- [ ] C: disco pelo disco, páginas por dia pela `usage`, pendentes pela fila
-- [ ] C: fila alterna entre contas; prioridade dono 0, membro 1, testador 2
+- [x] C: limites por conta com padrão em `[members]`
+- [x] C: disco pelo disco, páginas por dia pela `usage`, pendentes pela fila
+- [x] C: fila alterna entre contas; prioridade dono 0, membro 1, testador 2 — conferido: sem o desempate novo, o teste de alternância cai
 - [ ] D: lista de contas sem nenhum nome de série; desativar; redefinir por link
 - [ ] D: auditoria de toda ação de administração
 - [ ] D: `mangatl users list | disable | reset-link | delete`
