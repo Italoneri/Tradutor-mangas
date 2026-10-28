@@ -284,6 +284,28 @@ pelo login normal; membro não alcança `POST /api/invites`.
 
 **PARE.**
 
+> **Feito em 27/10/2026.** 654 testes passando, e o fluxo rodado de ponta a ponta
+> atrás do Caddy: `mangatl invite` → `convite.html` no Chromium → painel do membro
+> vazio, só com `free` → o mesmo link de novo leva a resposta única.
+>
+> A subida real achou um furo que já existia: `app` e `worker` rodam `migrate()`
+> juntos, e o segundo tentava a mesma migração e morria (`UNIQUE constraint
+> failed: schema_migrations.version`; com as migrações antigas seria `duplicate
+> column`). O rollback protegeu o banco, e o Docker reiniciou o app. Agora cada
+> migração pega `BEGIN IMMEDIATE` e confere a versão de novo antes de aplicar.
+>
+> Decisões que o plano não fixava:
+>
+> - o link usa `SITE_ADDRESS`, o mesmo endereço que o Caddy atende. Sem domínio,
+>   aponta para `http://localhost:8000`;
+> - conta logada que abre um convite leva 409, porque aceitar trocaria a pessoa
+>   sem ela pedir. Só a sessão de teste vira a conta nova;
+> - aceitar derruba a sessão de teste de 48 h e abre uma com o prazo de conta;
+> - só convite não usado é revogável. O usado fica como registro de quem entrou;
+> - a auditoria de criar e revogar convite ficou para a Fase D, junto com o card.
+> - Antes de migrar a base real, uma cópia foi para
+>   `data/backups/mangatl-antes-da-migracao-6.db`.
+
 ---
 
 ## FASE C — Cota por conta e fila justa
@@ -443,10 +465,10 @@ contra a API real e anotado no README.
 - [x] A: `is_admin`, `has_account`, `is_unmetered`; `grep is_owner` limpo
 - [x] A: quatro níveis de acesso; matriz rota × papel gerada de `ROUTES` — o esperado vem de uma tabela escrita à mão (`ROUTE_ACCESS`), não de `route.access`: derivado, o teste concordava com qualquer erro (conferido rebaixando o glossário para `session`)
 - [x] A: login aceita dono e membro, com o hash de fachada para e-mail inexistente
-- [ ] B: migração 6 reconstrói `users` sem perder sessão, job nem uso — testado
-- [ ] B: convite de uso único, 7 dias, token só como hash, link com `#`
-- [ ] B: testador que aceita convite vira membro com o mesmo id e o mesmo acervo
-- [ ] B: `mangatl invite`
+- [x] B: migração 6 reconstrói `users` sem perder sessão, job nem uso — testado, e o teste falha se o `foreign_keys = OFF` sair (conferido)
+- [x] B: convite de uso único, 7 dias, token só como hash, link com `#`
+- [x] B: testador que aceita convite vira membro com o mesmo id e o mesmo acervo
+- [x] B: `mangatl invite`
 - [ ] C: limites por conta com padrão em `[members]`
 - [ ] C: disco pelo disco, páginas por dia pela `usage`, pendentes pela fila
 - [ ] C: fila alterna entre contas; prioridade dono 0, membro 1, testador 2
