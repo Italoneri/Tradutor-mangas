@@ -74,3 +74,10 @@ tall_ratio = 3.0          # altura/largura acima disso e captura de rolagem
 seam_window = 0.25        # busca a costura em +-25% da altura alvo
 format = "jpeg"           # "png" preserva sem perda, mas pesa ~5x no celular
 quality = 92
+
+# O que uma conta de membro pode gastar. O dono ajusta conta a conta; isto e o
+# padrao de quem nao foi ajustado. O dono nao tem teto, e o testador tem o seu.
+[members]
+disk_bytes = 2147483648   # 2GB: ~40 capitulos longos
+pages_per_day = 600       # ~4 capitulos de 155 fatias
+active_jobs = 3           # na fila ou rodando ao mesmo tempo

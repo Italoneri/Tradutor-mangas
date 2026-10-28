@@ -17,8 +17,9 @@ reinicio ser um detalhe - `requeue_running` devolve para `pending` o que estava
 rodando quando o processo caiu.
 
 Prioridade e uma coluna e nao uma consulta esperta: job de dono passa na frente de
-job de testador, e um numero na linha diz isso sem ninguem precisar reconstruir a
-regra a partir de um `ORDER BY` com `JOIN`.
+job de membro, que passa na frente de job de testador, e um numero na linha diz
+isso sem ninguem precisar reconstruir a regra a partir de um `ORDER BY` com `JOIN`.
+Entre iguais, a vez e de quem esta ha mais tempo sem rodar nada.
 
 Cancelamento continua fora de escopo. Nao ha ponto de interrupcao seguro no meio
 de um OCR, e matar o processo deixaria o `extract.json` escrito pela metade - que
@@ -31,8 +32,9 @@ import json
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, NamedTuple
 
+from .accounts import User
 from .db import now, transaction
 from .models import Progress
 
@@ -49,9 +51,16 @@ JobState = Literal["pending", "running", "done", "failed", "cancelled"]
 valor existe para o dia em que entrar sem que o contrato mude."""
 
 OWNER_PRIORITY = 0
-TESTER_PRIORITY = 1
-"""Menor vai primeiro. O dono nao espera a curiosidade de um visitante terminar
-para poder usar a propria ferramenta."""
+MEMBER_PRIORITY = 1
+TESTER_PRIORITY = 2
+"""Menor vai primeiro. O dono nao espera ninguem para usar a propria ferramenta, e
+quem tem conta nao espera a curiosidade de um visitante terminar."""
+
+
+def priority_for(user: User) -> int:
+    if user.is_admin:
+        return OWNER_PRIORITY
+    return MEMBER_PRIORITY if user.has_account else TESTER_PRIORITY
 
 
 MAX_ATTEMPTS = 3
@@ -65,7 +74,7 @@ CRASHED_ERROR = f"o worker caiu {MAX_ATTEMPTS} vezes neste capitulo; ele foi tir
 
 
 class Busy(RuntimeError):
-    """Esta pessoa ja tem um processamento na fila."""
+    """Esta pessoa ja tem na fila todos os processamentos que pode ter."""
 
 
 @dataclass(frozen=True)
@@ -138,21 +147,34 @@ def enqueue(
     force: bool = False,
     dry_run: bool = False,
     pages: tuple[str, ...] = (),
+    max_active: int | None = 1,
 ) -> Job:
     """Poe um job na fila, ou levanta `Busy`.
 
+    `max_active` conta o que esta na fila e o que esta rodando, e None e sem teto.
+    O default e um, que e a regra de antes das contas: quem chama sem pensar nisso
+    nao abre a fila sem querer.
+
     A checagem e a insercao acontecem na mesma transacao `IMMEDIATE`: separadas,
     dois pedidos simultaneos passariam os dois pela checagem antes de qualquer um
-    inserir, e a pessoa acabaria com dois capitulos concorrendo pelo mesmo CPU.
+    inserir, e a pessoa passaria do teto.
     """
     job_id = uuid.uuid4().hex[:12]
     with transaction(connection):
         waiting = connection.execute(
             "SELECT count(*) AS n FROM jobs WHERE user_id = ? AND state IN ('pending', 'running')",
             (user_id,),
-        ).fetchone()
-        if waiting["n"]:
-            raise Busy("voce ja tem um processamento na fila; deixe terminar")
+        ).fetchone()["n"]
+        # O mesmo capitulo duas vezes e recusado para todo papel, dono incluso: o
+        # segundo job refaria o primeiro e sobrescreveria o resultado dele.
+        if has_active(connection, user_id, series, chapter):
+            raise Busy("voce ja tem um processamento deste capitulo na fila; deixe terminar")
+        if max_active is not None and waiting >= max_active:
+            raise Busy(
+                "voce ja tem um processamento na fila; deixe terminar"
+                if max_active == 1
+                else f"voce ja tem {waiting} processamentos na fila; o teto e {max_active}"
+            )
 
         connection.execute(
             """
@@ -179,9 +201,12 @@ def enqueue(
 def claim_next(connection: sqlite3.Connection) -> Job | None:
     """Marca como `running` o proximo job que pode rodar, e devolve.
 
-    Duas regras numa consulta so: prioridade do dono na frente, e no maximo um job
-    por usuario ao mesmo tempo. A segunda e o que impede uma pessoa de ocupar a
-    fila inteira enfileirando dez capitulos.
+    Tres regras numa consulta so: prioridade por papel, no maximo um job por
+    usuario ao mesmo tempo, e entre iguais a vez de quem esta ha mais tempo sem
+    rodar nada. Sem a terceira, quem enfileirou dez capitulos as 9h passava na
+    frente de quem enfileirou um as 9h05 dez vezes seguidas; com ela, as contas
+    se alternam. Conta que nunca rodou nada vem primeiro: no sqlite, NULL ordena
+    antes de qualquer data.
 
     Tudo dentro de uma transacao `IMMEDIATE`, para dois workers nao pegarem o
     mesmo job - a escolha e a marcacao tem que ser indivisiveis.
@@ -195,7 +220,10 @@ def claim_next(connection: sqlite3.Connection) -> Job | None:
                   SELECT 1 FROM jobs AS mine
                   WHERE mine.user_id = candidate.user_id AND mine.state = 'running'
               )
-            ORDER BY candidate.priority, candidate.created_at
+            ORDER BY
+                candidate.priority,
+                (SELECT max(past.started_at) FROM jobs AS past WHERE past.user_id = candidate.user_id),
+                candidate.created_at
             LIMIT 1
             """
         ).fetchone()
@@ -307,13 +335,45 @@ def queue_position(connection: sqlite3.Connection, job: Job) -> int:
     """Quantos jobs passam na frente deste. Zero quando ele e o proximo.
 
     A tela mostra isto porque "na fila" sem numero e indistinguivel de travado.
+    A conta repete a regra do `claim_next` em vez de contar quem e mais antigo:
+    com a vez alternando entre contas, a idade do job sozinha mente.
     """
-    row = connection.execute(
-        """
-        SELECT count(*) AS n FROM jobs
-        WHERE state = 'pending'
-          AND (priority < ? OR (priority = ? AND created_at < ?))
-        """,
-        (job.priority, job.priority, job.created_at),
-    ).fetchone()
-    return row["n"]
+    # Sem LIMIT de proposito: o que esta na fila ja e limitado pelo teto de jobs
+    # ativos de cada conta, e cortar a lista erraria a posicao.
+    waiting = [
+        _Turn(row["id"], row["user_id"], row["priority"], row["created_at"])
+        for row in connection.execute(
+            "SELECT id, user_id, priority, created_at FROM jobs WHERE state = 'pending'"
+        )
+    ]
+    last_start = {
+        row["user_id"]: row["last_start"]
+        for row in connection.execute(
+            "SELECT user_id, max(started_at) AS last_start FROM jobs GROUP BY user_id"
+        )
+    }
+    return claim_order(waiting, last_start).index(job.id) if job.state == "pending" else 0
+
+
+class _Turn(NamedTuple):
+    id: str
+    user_id: str
+    priority: int
+    created_at: str
+
+
+def claim_order(waiting: list[_Turn], last_start: dict[str, str | None]) -> list[str]:
+    """A ordem em que o `claim_next` pegaria estes jobs, com um worker so.
+
+    Cada job pego passa a contar como o inicio mais recente da conta dele, e por
+    isso a conta vai para o fim da vez. `~` ordena depois de qualquer data ISO.
+    """
+    started = dict(last_start)
+    left = list(waiting)
+    order: list[str] = []
+    while left:
+        chosen = min(left, key=lambda turn: (turn.priority, started.get(turn.user_id) or "", turn.created_at))
+        left.remove(chosen)
+        order.append(chosen.id)
+        started[chosen.user_id] = f"~{len(order):06d}"
+    return order

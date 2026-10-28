@@ -1280,6 +1280,7 @@ ROUTE_ACCESS = {
     ("POST", "/api/logout"): "public",
     ("POST", "/api/account/password"): "admin",
     ("POST", "/api/account/sessions/revoke"): "session",
+    ("GET", "/api/account/usage"): "session",
     ("POST", "/api/invites/accept"): "public",
     ("GET", "/api/invites"): "admin",
     ("POST", "/api/invites"): "admin",
@@ -1483,3 +1484,38 @@ def test_revokes_an_open_invite_from_the_panel(panel_server: Client):
 
     assert panel_server.send("DELETE", f"/api/invites/{listed['id']}")[0] == 200
     assert _accept_as(Client(panel_server.port), token, "tarde@example.com")[0] == 404
+
+
+# ---------- cota do membro ----------
+
+
+def test_stops_a_member_at_the_daily_page_ceiling_and_shows_the_count(panel_server: Client, tmp_path: Path):
+    from .sessions import hash_password
+
+    with connect(Config(root=tmp_path)) as connection:
+        member = create_member(connection, "cota@example.com")
+        connection.execute(
+            "UPDATE users SET password_hash = ?, pages_per_day = 2 WHERE id = ?",
+            (hash_password("senha-do-membro-comprida"), member.id),
+        )
+    panel_server.forget()
+    assert panel_server.login("cota@example.com", "senha-do-membro-comprida") == 200
+    panel_server.send("POST", "/api/series", json.dumps({"slug": "Obra"}).encode())
+    stage(panel_server, "Obra", "001")
+
+    codes = [
+        panel_server.send("PUT", f"/api/series/Obra/chapters/001/files/{n}.jpg", JPEG)[0]
+        for n in (1, 2, 3)
+    ]
+    usage = json.loads(panel_server.get("/api/account/usage")[1])
+
+    assert codes == [200, 200, 429]
+    assert (usage["pages_today"], usage["pages_per_day"], usage["pages_left_today"]) == (2, 2, 0)
+    assert usage["disk_used"] >= 2 * len(JPEG), "as duas paginas contam no disco da conta"
+    assert usage["disk_limit"] == Config(root=tmp_path).members.disk_bytes
+
+
+def test_shows_no_ceiling_to_the_owner(panel_server: Client):
+    usage = json.loads(panel_server.get("/api/account/usage")[1])
+
+    assert (usage["disk_limit"], usage["pages_per_day"], usage["active_jobs"]) == (None, None, None)

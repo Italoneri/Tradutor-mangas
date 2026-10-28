@@ -69,6 +69,7 @@ const el = {
   seriesDelete: document.getElementById("series-delete"),
 
   uploadCard: document.getElementById("upload-card"),
+  usageLine: document.getElementById("usage-line"),
   chapterNumber: document.getElementById("chapter-number"),
   drop: document.getElementById("drop"),
   fileInput: document.getElementById("file-input"),
@@ -299,6 +300,7 @@ async function selectSeries(slug) {
   el.uploadCard.hidden = false;
   el.jobCard.hidden = true;
   renderStaged();
+  refreshUsage();
 
   const [meta, glossary] = await Promise.all([
     api(seriesPath(slug, "/series.json")),
@@ -335,7 +337,23 @@ function isArchive(file) {
 function humanBytes(total) {
   if (total < 1024) return `${total} B`;
   if (total < 1024 * 1024) return `${Math.round(total / 1024)} KB`;
-  return `${(total / (1024 * 1024)).toFixed(1)} MB`;
+  if (total < 1024 ** 3) return `${(total / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(total / 1024 ** 3).toFixed(1)} GB`;
+}
+
+/* O teto antes de ele chegar, e nao so a mensagem de erro depois. Sem teto - o
+   dono - a linha nem aparece. */
+async function renderUsage() {
+  const usage = await api("/account/usage");
+  const parts = [];
+  if (usage.disk_limit !== null) parts.push(`usado ${humanBytes(usage.disk_used)} de ${humanBytes(usage.disk_limit)}`);
+  if (usage.pages_per_day !== null) parts.push(`páginas hoje: ${usage.pages_today} de ${usage.pages_per_day}`);
+  el.usageLine.textContent = parts.join(" · ");
+  el.usageLine.hidden = parts.length === 0;
+}
+
+function refreshUsage() {
+  renderUsage().catch((error) => console.warn("painel: uso da conta indisponivel", error));
 }
 
 /* Uma URL por arquivo, criada na primeira vez. `renderStaged` roda a cada pagina
@@ -426,6 +444,7 @@ async function uploadStaged() {
       item.state = "falhou";
       item.error = error.message;
       renderStaged();
+      refreshUsage();
       throw new Error(`${item.file.name}: ${error.message} — corrija e clique em enviar de novo`);
     }
     done += 1;
@@ -440,6 +459,7 @@ async function uploadStaged() {
   renderStaged();
   setBar(el.uploadFill, el.uploadTrack, 0, 0);
   flash(`Capítulo ${committed.chapter} pronto com ${committed.files.length} páginas.`, "ok");
+  refreshUsage();
 
   await loadSeries();
   openJob(committed.chapter);

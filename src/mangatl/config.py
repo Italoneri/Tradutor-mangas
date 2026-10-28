@@ -113,6 +113,20 @@ class ReadingOrderConfig(Frozen):
     band_overlap: float = Field(default=0.40, gt=0, le=1)
 
 
+class MembersConfig(Frozen):
+    """O que uma conta de membro pode gastar, quando o dono nao ajustou a conta.
+
+    Ha um worker, e ele traduz ~1,4s por fatia: os numeros existem para a fila de
+    todo mundo nao depender de uma pessoa so."""
+
+    disk_bytes: int = Field(default=2 * 1024**3, ge=0)
+    """~40 capitulos longos; dez membros cabem num disco de 60GB."""
+    pages_per_day: int = Field(default=600, ge=0)
+    """~4 capitulos de 155 fatias."""
+    active_jobs: int = Field(default=3, ge=1)
+    """Na fila ou rodando ao mesmo tempo. Ninguem enche a fila de uma vez."""
+
+
 class Config(Frozen):
     root: Path
     paths: PathsConfig = PathsConfig()
@@ -122,6 +136,7 @@ class Config(Frozen):
     detect: DetectConfig = DetectConfig()
     slicing: SlicingConfig = SlicingConfig()
     reading_order: ReadingOrderConfig = ReadingOrderConfig()
+    members: MembersConfig = MembersConfig()
 
     content_root: Path | None = None
     """Onde `library/` e `output/` moram, quando nao e na raiz do projeto.

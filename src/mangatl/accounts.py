@@ -114,6 +114,10 @@ class User:
     email: str | None
     created_at: str
     expires_at: str | None
+    disk_limit_bytes: int | None = None
+    pages_per_day: int | None = None
+    max_pending_jobs: int | None = None
+    """Os tres ajustes do dono por conta. None e o padrao de `[members]`."""
 
     # O codigo pergunta pela capacidade, e nunca pelo papel. `kind == "owner"`
     # respondia quatro perguntas de uma vez, e o membro precisa de respostas
@@ -147,6 +151,9 @@ def user_from_row(row: sqlite3.Row) -> User:
         email=row["email"],
         created_at=row["created_at"],
         expires_at=row["expires_at"],
+        disk_limit_bytes=row["disk_limit_bytes"],
+        pages_per_day=row["pages_per_day"],
+        max_pending_jobs=row["max_pending_jobs"],
     )
 
 

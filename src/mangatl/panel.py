@@ -74,27 +74,31 @@ from .invites import (
     revoke_invite,
 )
 from .jobs import (
-    OWNER_PRIORITY,
-    TESTER_PRIORITY,
     Busy,
     enqueue,
     get as get_job,
     has_active,
+    priority_for,
     queue_position,
     recent as recent_jobs,
 )
 from .models import Chapter, SeriesMeta
 from .quotas import (
-    TESTER_MAX_PAGES_PER_CHAPTER,
+    MAX_PAGES_PER_CHAPTER,
     OutOfSpace,
     QuotaExceeded,
+    area_bytes,
+    check_daily_pages,
     check_disk,
     check_engine,
     check_incoming_pages,
     check_new_chapter,
     check_new_series,
     check_upload_bytes,
+    daily_pages_left,
     engines_for,
+    limits_for,
+    pages_today,
     record_usage,
     upload_headroom,
 )
@@ -246,9 +250,6 @@ de uma captura de rolagem inteira."""
 
 MAX_ARCHIVE_BYTES = 500 * 1024 * 1024
 """Um .cbz de capitulo longo passa raspando de 100MB."""
-
-MAX_PAGES_PER_CHAPTER = 400
-"""O capitulo medido aqui tem 155 fatias. Acima de 400 e pasta errada, nao capitulo."""
 
 MAX_JSON_BYTES = 1024 * 1024
 """Corpo JSON do painel. Um glossario cheio nao passa de dezenas de KB; 1MB ja e
@@ -710,6 +711,23 @@ def _sign_out_everywhere(ctx: Context, groups: tuple[str, ...], body: bytes) -> 
     return HTTPStatus.OK, _Cleared({"authenticated": False, "kind": None, "engines": []})
 
 
+def _account_usage(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Quanto desta conta ja foi gasto, para o painel mostrar antes de o teto chegar.
+
+    Rota propria, e nao campo de `/api/session`: somar o disco da area varre os
+    arquivos dela, e a sessao e lida a cada pagina que o leitor abre.
+    """
+    limits = limits_for(ctx.cfg, ctx.user)
+    return HTTPStatus.OK, {
+        "disk_used": area_bytes(ctx.cfg),
+        "disk_limit": limits.disk_bytes,
+        "pages_today": pages_today(ctx.connection, ctx.user.id),
+        "pages_per_day": limits.pages_per_day,
+        "pages_left_today": daily_pages_left(ctx.connection, ctx.cfg, ctx.user),
+        "active_jobs": limits.active_jobs,
+    }
+
+
 # ---------- convites ----------
 
 
@@ -948,9 +966,9 @@ def _incoming_files(incoming: Path) -> list[Path]:
     return list_page_images(incoming) if incoming.is_dir() else []
 
 
-def _page_limit(user: User) -> int:
+def _page_limit(cfg: Config, user: User) -> int:
     """Quantas paginas este usuario pode ter num capitulo."""
-    return MAX_PAGES_PER_CHAPTER if user.is_unmetered else TESTER_MAX_PAGES_PER_CHAPTER
+    return limits_for(cfg, user).pages_per_chapter
 
 
 def extract_archive(
@@ -1114,6 +1132,7 @@ def _put_page(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, 
     # Sobrescrever uma pagina que ja subiu nao acrescenta pagina nenhuma.
     adding = 0 if (incoming / name).exists() else 1
     check_incoming_pages(ctx.cfg, ctx.user, incoming, adding)
+    check_daily_pages(ctx.connection, ctx.cfg, ctx.user, adding)
     check_upload_bytes(ctx.cfg, ctx.user, len(body))
     check_disk(ctx.base, ctx.user, len(body))
 
@@ -1148,9 +1167,12 @@ def _put_archive(ctx: Context, groups: tuple[str, ...], body: Body) -> tuple[int
         names = extract_archive(
             body,
             incoming,
-            limit=_page_limit(ctx.user) - already,
+            limit=_page_limit(ctx.cfg, ctx.user) - already,
             byte_ceiling=upload_headroom(ctx.cfg, ctx.user),
         )
+        # Depois de extrair, porque so o zip aberto diz quantas paginas tem. Se
+        # passar do dia, a area some como em qualquer outra falha do zip.
+        check_daily_pages(ctx.connection, ctx.cfg, ctx.user, len(names))
     except Exception:
         shutil.rmtree(incoming, ignore_errors=True)
         raise
@@ -1295,7 +1317,8 @@ def _create_job(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int
             series=directory.parent.name,
             chapter=directory.name,
             engine=engine,
-            priority=OWNER_PRIORITY if ctx.user.is_admin else TESTER_PRIORITY,
+            priority=priority_for(ctx.user),
+            max_active=limits_for(ctx.cfg, ctx.user).active_jobs,
             force=bool(payload.get("force")),
             dry_run=bool(payload.get("dry_run")),
             pages=pages,
@@ -1620,6 +1643,7 @@ ROUTES: tuple[Route, ...] = (
         body_required=True,
     ),
     Route("POST", re.compile(r"^/api/account/sessions/revoke$"), _sign_out_everywhere, writes=True),
+    Route("GET", re.compile(r"^/api/account/usage$"), _account_usage),
     Route(
         "POST",
         re.compile(r"^/api/invites/accept$"),
