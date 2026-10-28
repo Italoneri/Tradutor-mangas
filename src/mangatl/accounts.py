@@ -285,6 +285,12 @@ MIN_PASSWORD_CHARS = 12
 """Senha que protege o acervo e a chave da API. Doze e o piso, nao a meta."""
 
 
+def check_new_password(password: str) -> None:
+    """A regra de toda senha de conta. Conferida antes de gastar o scrypt nela."""
+    if len(password) < MIN_PASSWORD_CHARS:
+        raise ValueError(f"a senha precisa de pelo menos {MIN_PASSWORD_CHARS} caracteres")
+
+
 def change_owner_password(connection: sqlite3.Connection, user_id: str, password: str) -> None:
     """Troca a senha do dono e tira do `.env` a autoridade sobre ela.
 
@@ -293,8 +299,7 @@ def change_owner_password(connection: sqlite3.Connection, user_id: str, password
     """
     from .sessions import hash_password
 
-    if len(password) < MIN_PASSWORD_CHARS:
-        raise ValueError(f"a senha precisa de pelo menos {MIN_PASSWORD_CHARS} caracteres")
+    check_new_password(password)
     connection.execute(
         "UPDATE users SET password_hash = ?, password_origin = 'panel' WHERE id = ?",
         (hash_password(password), user_id),

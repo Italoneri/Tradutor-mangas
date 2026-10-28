@@ -55,6 +55,7 @@ from .accounts import (
     User,
     area_config,
     change_owner_password,
+    check_new_password,
     create_user,
     find_account,
     password_hash_of,
@@ -62,6 +63,16 @@ from .accounts import (
 from .config import Config
 from .db import connect, in_hours
 from .engines.base import available_engines
+from .invites import (
+    EmailTaken,
+    Invite,
+    InviteRefused,
+    accept_invite,
+    create_invite,
+    invite_link,
+    list_invites,
+    revoke_invite,
+)
 from .jobs import (
     OWNER_PRIORITY,
     TESTER_PRIORITY,
@@ -100,6 +111,7 @@ from .sessions import (
     hours_for,
     issue,
     login_is_throttled,
+    looks_like_email,
     record_login_attempt,
     record_tester_signup,
     resolve,
@@ -696,6 +708,109 @@ def _sign_out_everywhere(ctx: Context, groups: tuple[str, ...], body: bytes) -> 
     """Encerra todas as sessoes desta pessoa, inclusive a deste navegador."""
     revoke_all(ctx.connection, ctx.user.id)
     return HTTPStatus.OK, _Cleared({"authenticated": False, "kind": None, "engines": []})
+
+
+# ---------- convites ----------
+
+
+def _invite_payload(invite: Invite) -> dict:
+    return {
+        "id": invite.id,
+        "note": invite.note,
+        "state": invite.state,
+        "created_at": invite.created_at,
+        "expires_at": invite.expires_at,
+        "used_at": invite.used_at,
+        "used_by": invite.used_by_email,
+    }
+
+
+def _list_invites(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    return HTTPStatus.OK, {"invites": [_invite_payload(item) for item in list_invites(ctx.connection)]}
+
+
+def _create_invite(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Gera um convite e devolve o link. E a unica vez que o link existe.
+
+    O banco guarda o hash do token, entao link perdido nao se recupera: gera-se
+    outro e revoga-se o primeiro.
+    """
+    payload = json_body(body)
+    if payload is not None and not isinstance(payload, dict):
+        raise Invalid("esperava um objeto com note, ou corpo vazio")
+    note = (payload or {}).get("note")
+    if note is not None and not isinstance(note, str):
+        raise Invalid("note precisa ser texto")
+
+    token, invite = create_invite(ctx.connection, ctx.user, note)
+    return HTTPStatus.CREATED, {"link": invite_link(token), "invite": _invite_payload(invite)}
+
+
+def _revoke_invite(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    if not revoke_invite(ctx.connection, groups[0]):
+        return HTTPStatus.NOT_FOUND, NOT_FOUND_BODY
+    return HTTPStatus.OK, {"revoked": groups[0]}
+
+
+INVITE_REFUSED_BODY = {"error": "este convite nao vale mais; peca outro a quem mandou"}
+"""Uma resposta so para token inventado, vencido e usado, pelo motivo do login."""
+
+
+def _accept_invite(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
+    """Cria a conta do convidado e ja entra nela.
+
+    Publica porque quem tem o convite ainda nao tem conta. Uma sessao de teste
+    aberta vira a conta nova, com o mesmo id e o que ela ja tinha subido; uma
+    sessao de conta recusa, porque o convite criaria uma segunda pessoa no lugar
+    da primeira sem ela ter pedido.
+
+    Token errado conta como tentativa de login do mesmo IP: o token tem 256 bits
+    e nao se adivinha, mas a rota publica nao precisa aceitar varredura.
+    """
+    if ctx.user is not None and ctx.user.has_account:
+        return HTTPStatus.CONFLICT, {"error": "voce ja esta numa conta; saia dela para aceitar o convite"}
+
+    payload = json_body(body)
+    if not isinstance(payload, dict):
+        raise Invalid("esperava um objeto com token, email e password")
+    token, email, password = payload.get("token"), payload.get("email"), payload.get("password")
+    if not isinstance(token, str) or not isinstance(email, str) or not isinstance(password, str):
+        raise Invalid("token, email e password sao texto")
+    if not looks_like_email(email):
+        raise Invalid("isto nao parece um endereco de e-mail")
+    try:
+        check_new_password(password)
+    except ValueError as error:
+        raise Invalid(str(error)) from error
+
+    subject = f"invite-ip:{ctx.client_ip}"
+    if login_is_throttled(ctx.connection, (subject,)):
+        return HTTPStatus.TOO_MANY_REQUESTS, {"error": "tentativas demais; espere alguns minutos"}
+
+    try:
+        member = accept_invite(
+            ctx.connection,
+            token=token,
+            email=email,
+            password_hash=hash_password(password),
+            tester=ctx.user,
+        )
+    except InviteRefused:
+        record_login_attempt(ctx.connection, subject)
+        return HTTPStatus.NOT_FOUND, INVITE_REFUSED_BODY
+    except EmailTaken as error:
+        return HTTPStatus.CONFLICT, {"error": str(error)}
+
+    # A sessao de teste tinha prazo de 48h; a conta nao. Sai a velha, entra uma
+    # com o prazo de conta.
+    revoke_all(ctx.connection, member.id)
+    hours = hours_for(member.kind)
+    session_token, expires_at = issue(ctx.connection, member.id, hours=hours)
+    return HTTPStatus.CREATED, _Issued(
+        payload=_session_payload(Session(user=member, expires_at=expires_at)),
+        token=session_token,
+        hours=hours,
+    )
 
 
 def _series(ctx: Context, groups: tuple[str, ...], body: bytes) -> tuple[int, object]:
@@ -1505,6 +1620,18 @@ ROUTES: tuple[Route, ...] = (
         body_required=True,
     ),
     Route("POST", re.compile(r"^/api/account/sessions/revoke$"), _sign_out_everywhere, writes=True),
+    Route(
+        "POST",
+        re.compile(r"^/api/invites/accept$"),
+        _accept_invite,
+        access="public",
+        writes=True,
+        body_required=True,
+    ),
+    # A instancia: so o dono.
+    Route("GET", re.compile(r"^/api/invites$"), _list_invites, access="admin"),
+    Route("POST", re.compile(r"^/api/invites$"), _create_invite, access="admin", writes=True),
+    Route("DELETE", re.compile(rf"^/api/invites/{_SLUG}$"), _revoke_invite, access="admin", writes=True),
     # O conteudo do usuario. Nenhuma recebe id: ele vem da sessao.
     Route("GET", re.compile(r"^/u/library$"), _user_library),
     Route("GET", re.compile(rf"^/u/pages/{_SLUG}/{_SLUG}/{_SLUG}$"), _user_page),

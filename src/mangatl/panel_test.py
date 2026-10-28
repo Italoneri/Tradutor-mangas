@@ -15,7 +15,7 @@ from . import panel
 from .accounts import create_user, ensure_owner, sole_owner, user_path
 from .accounts_test import create_member
 from .config import Config
-from .db import connect, migrate
+from .db import connect, in_hours, migrate
 from .jobs import finish, get_any, set_progress
 from .models import Progress
 from .panel import (
@@ -37,7 +37,7 @@ from .panel import (
     validate_glossary,
 )
 from .serving import _Server
-from .sessions import COOKIE_NAME, issue
+from .sessions import COOKIE_NAME, issue, token_hash
 
 
 @pytest.mark.parametrize(
@@ -1280,6 +1280,10 @@ ROUTE_ACCESS = {
     ("POST", "/api/logout"): "public",
     ("POST", "/api/account/password"): "admin",
     ("POST", "/api/account/sessions/revoke"): "session",
+    ("POST", "/api/invites/accept"): "public",
+    ("GET", "/api/invites"): "admin",
+    ("POST", "/api/invites"): "admin",
+    ("DELETE", "/api/invites/x"): "admin",
     ("GET", "/u/library"): "session",
     ("GET", "/u/pages/x/x/x"): "session",
     ("GET", "/u/chapters/x/x/chapter.x.json"): "session",
@@ -1392,3 +1396,90 @@ def test_logs_a_member_in_through_the_same_door_as_the_owner(panel_server: Clien
     assert status == 200
     assert (payload["kind"], payload["can_admin"], payload["has_account"]) == ("member", False, True)
     assert payload["engines"] == ["free"]
+
+
+# ---------- convites ----------
+
+
+def _new_invite(client: Client) -> str:
+    status, body = client.send("POST", "/api/invites", json.dumps({"note": "para o teste"}).encode())
+    assert status == 201, body
+    link = json.loads(body)["link"]
+    assert "/reader/convite.html#" in link
+    return link.split("#", 1)[1]
+
+
+def _accept_as(client: Client, token: str, email: str, **kwargs) -> tuple[int, bytes]:
+    payload = {"token": token, "email": email, "password": "senha-do-convidado"}
+    return client.send("POST", "/api/invites/accept", json.dumps(payload).encode(), **kwargs)
+
+
+def test_gives_a_guest_an_account_that_logs_in_like_the_owner(panel_server: Client):
+    token = _new_invite(panel_server)
+    guest = Client(panel_server.port)
+
+    status, body = _accept_as(guest, token, "convidado@example.com")
+    session = json.loads(guest.get("/api/session")[1])
+    second = _accept_as(Client(panel_server.port), token, "outro@example.com")
+
+    assert status == 201, body
+    assert (session["kind"], session["has_account"], session["can_admin"]) == ("member", True, False)
+    assert second == (404, json.dumps(panel.INVITE_REFUSED_BODY).encode())
+
+    guest.forget()
+    assert guest.login("convidado@example.com", "senha-do-convidado") == 200
+    assert guest.send("POST", "/api/invites", b"{}")[0] == 403
+
+
+def test_keeps_what_a_tester_uploaded_when_they_accept(panel_server: Client, tmp_path: Path):
+    cfg = Config(root=tmp_path)
+    with connect(cfg) as connection:
+        tester = create_user(connection, kind="tester", expires_at=in_hours(48))
+        connection.execute(
+            "INSERT INTO jobs (id, user_id, series, chapter, engine, state, created_at)"
+            " VALUES ('j', ?, 'Obra', '001', 'free', 'done', '2026-10-27')",
+            (tester.id,),
+        )
+        token, _ = issue(connection, tester.id, hours=48)
+    page = user_path(cfg, tester.id, "library", "Obra", "001", "p0001.jpg")
+    page.parent.mkdir(parents=True)
+    page.write_bytes(b"pagina do testador")
+
+    status, body = _accept_as(
+        panel_server, _new_invite(panel_server), "testador@example.com", cookie=f"{COOKIE_NAME}={token}"
+    )
+
+    with connect(cfg) as connection:
+        promoted = connection.execute("SELECT kind, expires_at FROM users WHERE id = ?", (tester.id,)).fetchone()
+        jobs = connection.execute("SELECT count(*) FROM jobs WHERE user_id = ?", (tester.id,)).fetchone()[0]
+        old_session = connection.execute(
+            "SELECT count(*) FROM sessions WHERE token_hash = ?", (token_hash(token),)
+        ).fetchone()[0]
+
+    assert status == 201, body
+    assert (promoted["kind"], promoted["expires_at"]) == ("member", None)
+    assert jobs == 1
+    assert page.read_bytes() == b"pagina do testador"
+    assert old_session == 0, "a sessao de teste, com prazo de 48h, tinha que sair"
+
+
+def test_refuses_an_invite_while_signed_in_to_an_account(panel_server: Client):
+    status, _ = _accept_as(panel_server, _new_invite(panel_server), "segunda@example.com")
+
+    assert status == 409
+
+
+def test_slows_down_whoever_guesses_invite_tokens(panel_server: Client):
+    guest = Client(panel_server.port)
+
+    codes = [_accept_as(guest, f"chute-{n}", "chute@example.com")[0] for n in range(6)]
+
+    assert codes == [404] * 5 + [429]
+
+
+def test_revokes_an_open_invite_from_the_panel(panel_server: Client):
+    token = _new_invite(panel_server)
+    [listed] = json.loads(panel_server.get("/api/invites")[1])["invites"]
+
+    assert panel_server.send("DELETE", f"/api/invites/{listed['id']}")[0] == 200
+    assert _accept_as(Client(panel_server.port), token, "tarde@example.com")[0] == 404
