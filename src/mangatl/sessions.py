@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from http.cookies import SimpleCookie
 from urllib.parse import urlsplit
 
-from .accounts import User, UserKind, user_from_row
+from .accounts import ACCOUNT_KINDS, User, UserKind, user_from_row
 from .db import in_hours, minutes_ago, now
 
 COOKIE_NAME = "sid"
@@ -157,13 +157,10 @@ class Session:
     user: User
     expires_at: str
 
-    @property
-    def is_owner(self) -> bool:
-        return self.user.is_owner
-
 
 def hours_for(kind: UserKind) -> int:
-    return OWNER_SESSION_HOURS if kind == "owner" else TESTER_SESSION_HOURS
+    """Conta de verdade fica logada; sessao de teste dura o que o teste dura."""
+    return OWNER_SESSION_HOURS if kind in ACCOUNT_KINDS else TESTER_SESSION_HOURS
 
 
 def issue(connection: sqlite3.Connection, user_id: str, *, hours: int) -> tuple[str, str]:

@@ -29,7 +29,10 @@ from .db import now
 
 log = logging.getLogger("mangatl.accounts")
 
-UserKind = Literal["owner", "tester"]
+UserKind = Literal["owner", "member", "tester"]
+
+ACCOUNT_KINDS: frozenset[UserKind] = frozenset({"owner", "member"})
+"""Quem tem conta de verdade: e-mail, senha e acervo que nao expira."""
 
 USERS_DIRNAME = "users"
 
@@ -111,9 +114,28 @@ class User:
     email: str | None
     created_at: str
     expires_at: str | None
+    disk_limit_bytes: int | None = None
+    pages_per_day: int | None = None
+    max_pending_jobs: int | None = None
+    """Os tres ajustes do dono por conta. None e o padrao de `[members]`."""
+
+    # O codigo pergunta pela capacidade, e nunca pelo papel. `kind == "owner"`
+    # respondia quatro perguntas de uma vez, e o membro precisa de respostas
+    # diferentes para cada uma.
 
     @property
-    def is_owner(self) -> bool:
+    def is_admin(self) -> bool:
+        """Administra a instancia: convites, contas, limites."""
+        return self.kind == "owner"
+
+    @property
+    def has_account(self) -> bool:
+        """Acervo permanente, e as rotas que mexem na serie inteira."""
+        return self.kind in ACCOUNT_KINDS
+
+    @property
+    def is_unmetered(self) -> bool:
+        """Fora de toda cota."""
         return self.kind == "owner"
 
 
@@ -129,6 +151,9 @@ def user_from_row(row: sqlite3.Row) -> User:
         email=row["email"],
         created_at=row["created_at"],
         expires_at=row["expires_at"],
+        disk_limit_bytes=row["disk_limit_bytes"],
+        pages_per_day=row["pages_per_day"],
+        max_pending_jobs=row["max_pending_jobs"],
     )
 
 
@@ -151,9 +176,11 @@ def sole_owner(connection: sqlite3.Connection) -> User | None:
     return None if row is None else user_from_row(row)
 
 
-def find_owner(connection: sqlite3.Connection, email: str) -> User | None:
+def find_account(connection: sqlite3.Connection, email: str) -> User | None:
+    """A conta com este e-mail, de dono ou de membro. Testador nao tem e-mail."""
     row = connection.execute(
-        "SELECT * FROM users WHERE kind = 'owner' AND email = ?", (email.strip().lower(),)
+        "SELECT * FROM users WHERE kind IN ('owner', 'member') AND email = ?",
+        (email.strip().lower(),),
     ).fetchone()
     return None if row is None else user_from_row(row)
 
@@ -265,6 +292,12 @@ MIN_PASSWORD_CHARS = 12
 """Senha que protege o acervo e a chave da API. Doze e o piso, nao a meta."""
 
 
+def check_new_password(password: str) -> None:
+    """A regra de toda senha de conta. Conferida antes de gastar o scrypt nela."""
+    if len(password) < MIN_PASSWORD_CHARS:
+        raise ValueError(f"a senha precisa de pelo menos {MIN_PASSWORD_CHARS} caracteres")
+
+
 def change_owner_password(connection: sqlite3.Connection, user_id: str, password: str) -> None:
     """Troca a senha do dono e tira do `.env` a autoridade sobre ela.
 
@@ -273,8 +306,7 @@ def change_owner_password(connection: sqlite3.Connection, user_id: str, password
     """
     from .sessions import hash_password
 
-    if len(password) < MIN_PASSWORD_CHARS:
-        raise ValueError(f"a senha precisa de pelo menos {MIN_PASSWORD_CHARS} caracteres")
+    check_new_password(password)
     connection.execute(
         "UPDATE users SET password_hash = ?, password_origin = 'panel' WHERE id = ?",
         (hash_password(password), user_id),
@@ -319,7 +351,7 @@ def area_config(cfg: Config, user: User) -> Config:
     derived = config_for_user(cfg, user.id)
     if derived is None:
         return cfg
-    if user.is_owner and not derived.library_dir.is_dir() and has_legacy_library(cfg):
+    if user.is_admin and not derived.library_dir.is_dir() and has_legacy_library(cfg):
         return cfg
     return derived
 

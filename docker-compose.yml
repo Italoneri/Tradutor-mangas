@@ -55,6 +55,8 @@ services:
       # gateway da rede, e nao e confiado.
       TRUSTED_PROXIES: 172.28.0.10
       CONTACT_EMAIL: ${CONTACT_EMAIL:-}
+      # O endereco que entra no link de convite. O mesmo que o Caddy atende.
+      SITE_ADDRESS: ${SITE_ADDRESS:-}
     expose:
       - "8000"
     # Publicada so no loopback: quem fala com a internet e o Caddy.

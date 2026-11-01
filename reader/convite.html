@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#161826">
+<!-- O token mora no fragmento da URL. Sem isto, o link para os termos levaria a
+     URL inteira, token incluso, no cabecalho Referer. -->
+<meta name="referrer" content="no-referrer">
+<title>Convite · Tinta</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="convite.js"></script>
+</head>
+<body>
+
+<header class="bar">
+  <div class="bar-row">
+    <a class="back" href="index.html">
+      <svg width="16" height="16" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M224 128a8 8 0 0 1-8 8H59.31l58.35 58.34a8 8 0 0 1-11.32 11.32l-72-72a8 8 0 0 1 0-11.32l72-72a8 8 0 0 1 11.32 11.32L59.31 120H216a8 8 0 0 1 8 8Z"></path></svg>
+      <span>Voltar</span>
+    </a>
+    <div class="title"><strong>Convite</strong></div>
+  </div>
+</header>
+
+<main class="admin">
+
+  <div class="flash" id="flash" role="status" hidden></div>
+
+  <section class="card" id="invite-card">
+    <div class="card-head"><h2>Criar sua conta</h2></div>
+    <p class="hint">
+      Você recebeu um convite. Escolha o e-mail e a senha com que vai entrar. O que
+      você subir fica guardado na sua conta e ninguém mais alcança. Leia os
+      <a href="termos.html">termos</a> antes.
+    </p>
+
+    <form class="row" id="invite-form">
+      <label class="field">
+        <span>e-mail</span>
+        <input id="invite-email" type="email" autocomplete="username" required>
+      </label>
+      <label class="field">
+        <span>senha (12 ou mais)</span>
+        <input id="invite-password" type="password" autocomplete="new-password" minlength="12" required>
+      </label>
+      <label class="field">
+        <span>repita a senha</span>
+        <input id="invite-confirm" type="password" autocomplete="new-password" minlength="12" required>
+      </label>
+      <button class="btn btn-primary" type="submit">Criar conta</button>
+    </form>
+  </section>
+
+  <section class="card" id="no-token" hidden>
+    <div class="card-head"><h2>Link incompleto</h2></div>
+    <p class="hint">
+      Este endereço precisa do código do convite depois do <code>#</code>. Copie o
+      link inteiro da mensagem que você recebeu.
+    </p>
+  </section>
+
+</main>
+
+</body>
+</html>

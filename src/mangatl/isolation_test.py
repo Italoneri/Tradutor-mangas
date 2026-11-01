@@ -20,7 +20,7 @@ import pytest
 from .accounts import ensure_owner, sole_owner
 from .config import Config
 from .db import connect, migrate
-from .panel import make_panel_handler
+from .panel import ACCESS_DENIED_BODY, make_panel_handler
 from .panel_test import OWNER_EMAIL, OWNER_PASSWORD, Client
 from .serving import _Server
 
@@ -242,7 +242,7 @@ def test_answers_403_for_an_owner_route_asked_by_a_tester(server: Client, method
     status, body = tester.send(method, path, b'{"title": "x"}')
 
     assert status == 403, path
-    assert b"dono" in body
+    assert json.loads(body) == ACCESS_DENIED_BODY
 
 
 # ---------- CSRF ----------

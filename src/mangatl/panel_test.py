@@ -12,12 +12,14 @@ from pathlib import Path
 import pytest
 
 from . import panel
-from .accounts import ensure_owner, sole_owner, user_path
+from .accounts import create_user, ensure_owner, sole_owner, user_path
+from .accounts_test import create_member
 from .config import Config
-from .db import connect, migrate
+from .db import connect, in_hours, migrate
 from .jobs import finish, get_any, set_progress
 from .models import Progress
 from .panel import (
+    ACCESS_DENIED_BODY,
     MAX_JSON_BYTES,
     ROUTES,
     Invalid,
@@ -35,6 +37,7 @@ from .panel import (
     validate_glossary,
 )
 from .serving import _Server
+from .sessions import COOKIE_NAME, issue, token_hash
 
 
 @pytest.mark.parametrize(
@@ -1265,3 +1268,254 @@ def test_answers_404_for_exporting_what_is_not_there(panel_server: Client, tmp_p
     translated_chapter(tmp_path)
 
     assert panel_server.get(path)[0] == 404
+
+
+# ---------- quem alcanca cada rota ----------
+
+
+ROUTE_ACCESS = {
+    ("GET", "/api/health"): "public",
+    ("GET", "/api/session"): "public",
+    ("POST", "/api/login"): "public",
+    ("POST", "/api/logout"): "public",
+    ("POST", "/api/account/password"): "admin",
+    ("POST", "/api/account/sessions/revoke"): "session",
+    ("GET", "/api/account/usage"): "session",
+    ("POST", "/api/invites/accept"): "public",
+    ("GET", "/api/invites"): "admin",
+    ("POST", "/api/invites"): "admin",
+    ("DELETE", "/api/invites/x"): "admin",
+    ("GET", "/u/library"): "session",
+    ("GET", "/u/pages/x/x/x"): "session",
+    ("GET", "/u/chapters/x/x/chapter.x.json"): "session",
+    ("GET", "/api/series"): "session",
+    ("POST", "/api/series"): "session",
+    ("GET", "/api/series/x/series.json"): "session",
+    ("PUT", "/api/series/x/series.json"): "account",
+    ("PUT", "/api/series/x/cover"): "account",
+    ("GET", "/api/series/x/glossary"): "session",
+    ("PUT", "/api/series/x/glossary"): "account",
+    ("POST", "/api/series/x/chapters"): "session",
+    ("PUT", "/api/series/x/chapters/x/files/x"): "session",
+    ("POST", "/api/series/x/chapters/x/archive"): "session",
+    ("POST", "/api/series/x/chapters/x/commit"): "session",
+    ("GET", "/api/series/x/chapters/x/incoming"): "session",
+    ("PUT", "/api/series/x/chapters/x/translations/x/blocks"): "session",
+    ("GET", "/api/series/x/chapters/x/estimate/x"): "session",
+    ("GET", "/api/series/x/chapters/x/export/free.cbz"): "session",
+    ("GET", "/api/jobs"): "session",
+    ("POST", "/api/jobs"): "session",
+    ("GET", "/api/jobs/x"): "session",
+    ("DELETE", "/api/series/x/chapters/x/incoming"): "session",
+    ("DELETE", "/api/series/x/chapters/x"): "session",
+    ("DELETE", "/api/series/x"): "account",
+}
+"""O nivel que cada rota deve ter, escrito a mao e de proposito.
+
+Derivar o esperado de `route.access` faria o teste concordar com qualquer erro na
+tabela de rotas. Aqui os dois lados sao independentes: mudar o nivel de uma rota
+exige mudar as duas, e uma rota nova sem linha aqui falha no teste de baixo."""
+
+ALLOWED_ROLES = {
+    "public": {"tester", "member", "owner"},
+    "session": {"tester", "member", "owner"},
+    "account": {"member", "owner"},
+    "admin": {"owner"},
+}
+
+
+def _sample_path(route: panel.Route) -> str:
+    """Um caminho que casa com a rota, com `x` em cada nome."""
+    path = route.pattern.pattern.removeprefix("^").removesuffix("$")
+    path = path.replace(panel._SLUG, "x").replace("([a-z]+)", "free").replace("(cbz|pdf)", "cbz")
+    return path.replace(r"\.", ".")
+
+
+def _role_cookie(tmp_path: Path, role: str) -> str:
+    """Uma sessao nova por pedido: logout e "sair de tudo" derrubariam a seguinte."""
+    with connect(Config(root=tmp_path)) as connection:
+        if role == "owner":
+            user = sole_owner(connection)
+        elif role == "member":
+            user = create_member(connection, f"membro-{time.monotonic_ns()}@example.com")
+        else:
+            user = create_user(connection, kind="tester")
+        assert user is not None
+        token, _ = issue(connection, user.id, hours=1)
+    return f"{COOKIE_NAME}={token}"
+
+
+def test_declares_an_access_level_for_every_route():
+    declared = {(route.method, _sample_path(route)) for route in ROUTES}
+
+    assert declared == set(ROUTE_ACCESS), "rota nova ou removida: atualize ROUTE_ACCESS"
+
+
+@pytest.mark.parametrize(
+    "route", ROUTES, ids=[f"{route.method} {route.pattern.pattern}" for route in ROUTES]
+)
+def test_lets_each_role_reach_only_the_routes_of_its_level(
+    panel_server: Client, tmp_path: Path, route: panel.Route
+):
+    """Cada papel contra cada rota, pelo handler real.
+
+    So confere a porta, e nao o que a rota faz depois dela. Por isso o corpo e
+    `{}` e os nomes sao `x`: passar da porta e qualquer resposta que nao seja 401
+    nem a recusa de nivel - 404 e 422 incluidos.
+    """
+    path = _sample_path(route)
+    found = match_route(route.method, path)
+    assert found is not None and found.route is route, path
+    level = ROUTE_ACCESS[(route.method, path)]
+
+    for role in ("tester", "member", "owner"):
+        status, body, _ = panel_server.raw(
+            route.method, path, b"{}", cookie=_role_cookie(tmp_path, role)
+        )
+        denied = status == 403 and json.loads(body) == ACCESS_DENIED_BODY
+        if role in ALLOWED_ROLES[level]:
+            assert status != 401 and not denied, (role, status, body)
+        else:
+            assert denied, (role, status, body)
+
+
+def test_logs_a_member_in_through_the_same_door_as_the_owner(panel_server: Client, tmp_path: Path):
+    from .sessions import hash_password
+
+    with connect(Config(root=tmp_path)) as connection:
+        member = create_member(connection, "membro@example.com")
+        connection.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password("senha-do-membro-comprida"), member.id),
+        )
+
+    panel_server.forget()
+    assert panel_server.login("membro@example.com", "senha-do-membro-comprida") == 200
+    status, body = panel_server.get("/api/session")
+    payload = json.loads(body)
+
+    assert status == 200
+    assert (payload["kind"], payload["can_admin"], payload["has_account"]) == ("member", False, True)
+    assert payload["engines"] == ["free"]
+
+
+# ---------- convites ----------
+
+
+def _new_invite(client: Client) -> str:
+    status, body = client.send("POST", "/api/invites", json.dumps({"note": "para o teste"}).encode())
+    assert status == 201, body
+    link = json.loads(body)["link"]
+    assert "/reader/convite.html#" in link
+    return link.split("#", 1)[1]
+
+
+def _accept_as(client: Client, token: str, email: str, **kwargs) -> tuple[int, bytes]:
+    payload = {"token": token, "email": email, "password": "senha-do-convidado"}
+    return client.send("POST", "/api/invites/accept", json.dumps(payload).encode(), **kwargs)
+
+
+def test_gives_a_guest_an_account_that_logs_in_like_the_owner(panel_server: Client):
+    token = _new_invite(panel_server)
+    guest = Client(panel_server.port)
+
+    status, body = _accept_as(guest, token, "convidado@example.com")
+    session = json.loads(guest.get("/api/session")[1])
+    second = _accept_as(Client(panel_server.port), token, "outro@example.com")
+
+    assert status == 201, body
+    assert (session["kind"], session["has_account"], session["can_admin"]) == ("member", True, False)
+    assert second == (404, json.dumps(panel.INVITE_REFUSED_BODY).encode())
+
+    guest.forget()
+    assert guest.login("convidado@example.com", "senha-do-convidado") == 200
+    assert guest.send("POST", "/api/invites", b"{}")[0] == 403
+
+
+def test_keeps_what_a_tester_uploaded_when_they_accept(panel_server: Client, tmp_path: Path):
+    cfg = Config(root=tmp_path)
+    with connect(cfg) as connection:
+        tester = create_user(connection, kind="tester", expires_at=in_hours(48))
+        connection.execute(
+            "INSERT INTO jobs (id, user_id, series, chapter, engine, state, created_at)"
+            " VALUES ('j', ?, 'Obra', '001', 'free', 'done', '2026-10-27')",
+            (tester.id,),
+        )
+        token, _ = issue(connection, tester.id, hours=48)
+    page = user_path(cfg, tester.id, "library", "Obra", "001", "p0001.jpg")
+    page.parent.mkdir(parents=True)
+    page.write_bytes(b"pagina do testador")
+
+    status, body = _accept_as(
+        panel_server, _new_invite(panel_server), "testador@example.com", cookie=f"{COOKIE_NAME}={token}"
+    )
+
+    with connect(cfg) as connection:
+        promoted = connection.execute("SELECT kind, expires_at FROM users WHERE id = ?", (tester.id,)).fetchone()
+        jobs = connection.execute("SELECT count(*) FROM jobs WHERE user_id = ?", (tester.id,)).fetchone()[0]
+        old_session = connection.execute(
+            "SELECT count(*) FROM sessions WHERE token_hash = ?", (token_hash(token),)
+        ).fetchone()[0]
+
+    assert status == 201, body
+    assert (promoted["kind"], promoted["expires_at"]) == ("member", None)
+    assert jobs == 1
+    assert page.read_bytes() == b"pagina do testador"
+    assert old_session == 0, "a sessao de teste, com prazo de 48h, tinha que sair"
+
+
+def test_refuses_an_invite_while_signed_in_to_an_account(panel_server: Client):
+    status, _ = _accept_as(panel_server, _new_invite(panel_server), "segunda@example.com")
+
+    assert status == 409
+
+
+def test_slows_down_whoever_guesses_invite_tokens(panel_server: Client):
+    guest = Client(panel_server.port)
+
+    codes = [_accept_as(guest, f"chute-{n}", "chute@example.com")[0] for n in range(6)]
+
+    assert codes == [404] * 5 + [429]
+
+
+def test_revokes_an_open_invite_from_the_panel(panel_server: Client):
+    token = _new_invite(panel_server)
+    [listed] = json.loads(panel_server.get("/api/invites")[1])["invites"]
+
+    assert panel_server.send("DELETE", f"/api/invites/{listed['id']}")[0] == 200
+    assert _accept_as(Client(panel_server.port), token, "tarde@example.com")[0] == 404
+
+
+# ---------- cota do membro ----------
+
+
+def test_stops_a_member_at_the_daily_page_ceiling_and_shows_the_count(panel_server: Client, tmp_path: Path):
+    from .sessions import hash_password
+
+    with connect(Config(root=tmp_path)) as connection:
+        member = create_member(connection, "cota@example.com")
+        connection.execute(
+            "UPDATE users SET password_hash = ?, pages_per_day = 2 WHERE id = ?",
+            (hash_password("senha-do-membro-comprida"), member.id),
+        )
+    panel_server.forget()
+    assert panel_server.login("cota@example.com", "senha-do-membro-comprida") == 200
+    panel_server.send("POST", "/api/series", json.dumps({"slug": "Obra"}).encode())
+    stage(panel_server, "Obra", "001")
+
+    codes = [
+        panel_server.send("PUT", f"/api/series/Obra/chapters/001/files/{n}.jpg", JPEG)[0]
+        for n in (1, 2, 3)
+    ]
+    usage = json.loads(panel_server.get("/api/account/usage")[1])
+
+    assert codes == [200, 200, 429]
+    assert (usage["pages_today"], usage["pages_per_day"], usage["pages_left_today"]) == (2, 2, 0)
+    assert usage["disk_used"] >= 2 * len(JPEG), "as duas paginas contam no disco da conta"
+    assert usage["disk_limit"] == Config(root=tmp_path).members.disk_bytes
+
+
+def test_shows_no_ceiling_to_the_owner(panel_server: Client):
+    usage = json.loads(panel_server.get("/api/account/usage")[1])
+
+    assert (usage["disk_limit"], usage["pages_per_day"], usage["active_jobs"]) == (None, None, None)

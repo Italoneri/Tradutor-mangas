@@ -4,17 +4,22 @@ import io
 import json
 import threading
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from .accounts import User, config_for_user, ensure_owner
 from .config import Config
+from .config import MembersConfig
 from .db import connect, migrate
 from .panel import make_panel_handler
 from .panel_test import OWNER_EMAIL, OWNER_PASSWORD, Client
 from .quotas import (
     DISK_CEILING_ENV,
+    MAX_PAGES_PER_CHAPTER,
+    OWNER_LIMITS,
+    TESTER_LIMITS,
     TESTER_MAX_CHAPTERS,
     TESTER_MAX_SERIES,
     TESTER_MAX_PAGES_PER_CHAPTER,
@@ -22,13 +27,18 @@ from .quotas import (
     OutOfSpace,
     QuotaExceeded,
     area_bytes,
+    check_daily_pages,
     check_disk,
     check_engine,
     check_incoming_pages,
     check_new_chapter,
     check_new_series,
     check_upload_bytes,
+    daily_pages_left,
     engines_for,
+    limits_for,
+    record_usage,
+    upload_headroom,
 )
 from .serving import _Server
 from .sessions import TESTER_SIGNUPS_PER_IP_PER_HOUR
@@ -37,6 +47,7 @@ JPEG = bytes.fromhex("ffd8ffe0") + b"0" * 32
 
 OWNER = User(id="a" * 32, kind="owner", email="dono@example.com", created_at="", expires_at=None)
 TESTER = User(id="b" * 32, kind="tester", email=None, created_at="", expires_at="2030-01-01")
+MEMBER = User(id="d" * 32, kind="member", email="membro@example.com", created_at="", expires_at=None)
 
 
 @pytest.fixture
@@ -170,6 +181,8 @@ def test_refuses_a_new_upload_once_the_disk_is_full(tmp_path, monkeypatch):
     [
         ("testador cabe abaixo da fatia dele", TESTER, 100, False),
         ("testador para em 80% do teto", TESTER, 300, True),
+        ("membro passa dos 80%", MEMBER, 400, False),
+        ("membro para em 95% do teto", MEMBER, 450, True),
         ("dono passa dos 80%", OWNER, 300, False),
         ("dono para no teto inteiro", OWNER, 600, True),
     ],
@@ -397,3 +410,73 @@ def test_limits_how_many_tester_sessions_one_address_opens(server: Client):
 
     assert codes[:TESTER_SIGNUPS_PER_IP_PER_HOUR] == [201] * TESTER_SIGNUPS_PER_IP_PER_HOUR
     assert codes[-1] == 429
+
+
+# ---------- membro ----------
+
+
+SMALL_MEMBERS = MembersConfig(disk_bytes=1000, pages_per_day=3, active_jobs=2)
+
+
+@pytest.mark.parametrize(
+    ("name", "user", "expected"),
+    [
+        ("dono sem teto nenhum", OWNER, OWNER_LIMITS),
+        ("testador com as constantes de sempre", TESTER, TESTER_LIMITS),
+        ("membro com o padrao de [members]", MEMBER, (1000, 3, 2)),
+        (
+            "membro com o ajuste do dono",
+            replace(MEMBER, disk_limit_bytes=50, pages_per_day=0, max_pending_jobs=9),
+            (50, 0, 9),
+        ),
+    ],
+)
+def test_picks_the_limits_of_each_account(tmp_path, name: str, user: User, expected):
+    cfg = Config(root=tmp_path, members=SMALL_MEMBERS)
+
+    limits = limits_for(cfg, user)
+
+    if isinstance(expected, tuple):
+        assert (limits.disk_bytes, limits.pages_per_day, limits.active_jobs) == expected, name
+        assert limits.pages_per_chapter == MAX_PAGES_PER_CHAPTER
+        assert (limits.chapters, limits.series) == (None, None)
+    else:
+        assert limits == expected, name
+
+
+def test_refuses_a_member_at_the_disk_limit_and_never_the_owner(tmp_path):
+    cfg = Config(root=tmp_path, members=SMALL_MEMBERS)
+    member_area = config_for_user(cfg, MEMBER.id)
+    owner_area = config_for_user(cfg, OWNER.id)
+    for area in (member_area, owner_area):
+        area.library_dir.mkdir(parents=True)
+        (area.library_dir / "p.jpg").write_bytes(b"x" * 900)
+
+    check_upload_bytes(member_area, MEMBER, 100)
+    with pytest.raises(QuotaExceeded, match="esta conta pode gravar"):
+        check_upload_bytes(member_area, MEMBER, 101)
+    assert upload_headroom(member_area, MEMBER) == 100
+
+    check_upload_bytes(owner_area, OWNER, 10**9)
+    assert upload_headroom(owner_area, OWNER) is None
+
+
+def test_counts_the_pages_of_the_day_from_the_usage_table(tmp_path):
+    cfg = Config(root=tmp_path, members=SMALL_MEMBERS)
+    migrate(cfg)
+    with connect(cfg) as connection:
+        connection.execute(
+            "INSERT INTO users (id, kind, email, created_at) VALUES (?, 'member', ?, '')",
+            (MEMBER.id, MEMBER.email),
+        )
+        record_usage(connection, MEMBER.id, pages=2)
+        record_usage(connection, MEMBER.id, pages=0)
+
+        check_daily_pages(connection, cfg, MEMBER, 1)
+        record_usage(connection, MEMBER.id, pages=1)
+
+        assert daily_pages_left(connection, cfg, MEMBER) == 0
+        with pytest.raises(QuotaExceeded, match="3 paginas por dia"):
+            check_daily_pages(connection, cfg, MEMBER, 1)
+        check_daily_pages(connection, cfg, OWNER, 10**6)
+        assert daily_pages_left(connection, cfg, OWNER) is None

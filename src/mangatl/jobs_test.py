@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from .accounts import create_user
+from .accounts import User, create_user
 from .config import Config
 from .db import connect, migrate
 from .jobs import (
     CRASHED_ERROR,
     HISTORY,
     MAX_ATTEMPTS,
+    MEMBER_PRIORITY,
     OWNER_PRIORITY,
     TESTER_PRIORITY,
     Busy,
@@ -17,6 +18,7 @@ from .jobs import (
     finish,
     get,
     get_any,
+    priority_for,
     queue_position,
     recent,
     requeue_running,
@@ -275,3 +277,110 @@ def test_counts_each_claim_as_an_attempt(cfg, people):
         claim_next(connection)
 
         assert get_any(connection, job.id).attempts == 2
+
+
+# ---------- contas de membro ----------
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """Um relogio que sempre anda.
+
+    No teste, dois `claim_next` seguidos caem no mesmo milissegundo, e o empate do
+    inicio mais recente cairia no `created_at`. Num worker de verdade cada job leva
+    minutos, e esse empate nao existe.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from . import jobs
+
+    ticks = iter(range(1, 10_000))
+    start = datetime(2026, 10, 27, tzinfo=UTC)
+    monkeypatch.setattr(
+        jobs, "now", lambda: (start + timedelta(seconds=next(ticks))).isoformat(timespec="milliseconds")
+    )
+
+
+def _member(connection, name: str):  # noqa: ANN001
+    return create_user(connection, kind="member", email=f"{name}@example.com")
+
+
+def _queue_member(connection, user, chapter: str, max_active: int | None = 3):  # noqa: ANN001
+    return enqueue(
+        connection,
+        user_id=user.id,
+        series="Obra",
+        chapter=chapter,
+        engine="free",
+        priority=MEMBER_PRIORITY,
+        max_active=max_active,
+    )
+
+
+def test_puts_owner_then_member_then_tester():
+    def user(kind: str) -> User:
+        return User(id="a" * 32, kind=kind, email=None, created_at="", expires_at=None)
+
+    assert [priority_for(user(kind)) for kind in ("owner", "member", "tester")] == [
+        OWNER_PRIORITY,
+        MEMBER_PRIORITY,
+        TESTER_PRIORITY,
+    ]
+    assert OWNER_PRIORITY < MEMBER_PRIORITY < TESTER_PRIORITY
+
+
+def test_refuses_the_job_past_the_account_ceiling(cfg):
+    with connect(cfg) as connection:
+        member = _member(connection, "m")
+        for chapter in ("001", "002", "003"):
+            _queue_member(connection, member, chapter)
+
+        with pytest.raises(Busy, match="o teto e 3"):
+            _queue_member(connection, member, "004")
+
+
+def test_refuses_the_same_chapter_twice_even_without_a_ceiling(cfg, people):
+    owner, _, _ = people
+    with connect(cfg) as connection:
+        _queue_member(connection, owner, "001", max_active=None)
+        _queue_member(connection, owner, "002", max_active=None)
+
+        with pytest.raises(Busy, match="deste capitulo"):
+            _queue_member(connection, owner, "001", max_active=None)
+
+
+def _drain(connection) -> list[str]:  # noqa: ANN001
+    """O que um worker so faria: pega, termina, pega o proximo."""
+    order: list[str] = []
+    while (job := claim_next(connection)) is not None:
+        order.append(job.id)
+        finish(connection, job.id, state="done")
+    return order
+
+
+def test_takes_turns_between_members_instead_of_draining_the_first(cfg, clock):
+    """Quem enfileirou tres antes nao passa tres vezes na frente de quem veio depois."""
+    with connect(cfg) as connection:
+        first, second = _member(connection, "a"), _member(connection, "b")
+        early = [_queue_member(connection, first, f"00{n}").id for n in (1, 2, 3)]
+        late = [_queue_member(connection, second, f"00{n}").id for n in (1, 2, 3)]
+
+        order = _drain(connection)
+
+    assert order == [early[0], late[0], early[1], late[1], early[2], late[2]]
+
+
+def test_predicts_the_same_order_the_worker_follows(cfg, people, clock):
+    owner, tester, _ = people
+    with connect(cfg) as connection:
+        first, second = _member(connection, "a"), _member(connection, "b")
+        queued = [
+            _queue_member(connection, first, "001"),
+            _queue_member(connection, first, "002"),
+            _queue_member(connection, second, "001"),
+            _queue(connection, tester),
+            _queue_member(connection, owner, "001", max_active=None),
+        ]
+        predicted = sorted(queued, key=lambda job: queue_position(connection, job))
+
+        assert [job.id for job in predicted] == _drain(connection)

@@ -31,6 +31,7 @@ from .detectors.base import (
     available_detectors,
 )
 from .engines.base import TranslationError, UnknownEngineError, available_engines, create_engine
+from .invites import INVITE_DAYS, create_invite, invite_link
 from .models import Progress, ProgressFn
 from .panel import serve_panel
 from .pipeline import ChapterNotFoundError, extract_chapter, translate_chapter
@@ -530,6 +531,27 @@ def set_password() -> None:
             raise typer.Exit(code=1) from error
         closed = revoke_all(connection, owner.id)
     typer.secho(f"senha trocada; {closed} sessao(oes) encerrada(s)", fg=typer.colors.GREEN)
+
+
+@app.command(name="invite")
+def invite(
+    note: str = typer.Option(None, "--note", help="Lembrete de para quem e o convite; so o dono ve"),
+) -> None:
+    """Gera um convite e imprime o link. Vale uma vez, por sete dias.
+
+    E o caminho do dono antes de o painel existir no servidor. O link nao e
+    guardado: o banco fica com o hash, entao copie agora.
+    """
+    cfg = _load()
+    migrate(cfg)
+    with connect(cfg) as connection:
+        owner = sole_owner(connection)
+        if owner is None:
+            typer.secho("nao ha dono; defina OWNER_EMAIL e OWNER_PASSWORD e suba o servidor", fg=typer.colors.RED)
+            raise typer.Exit(code=1)
+        token, _ = create_invite(connection, owner, note)
+    typer.echo(invite_link(token))
+    typer.secho(f"vale uma vez, por {INVITE_DAYS} dias. O link nao aparece de novo.", fg=typer.colors.GREEN)
 
 
 @app.command(name="reset-login")
